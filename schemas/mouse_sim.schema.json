@@ -1,0 +1,318 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gaming-mouse-engine.local/schema/project-document-1.json",
+  "title": "mouse_sim project document",
+  "description": "Versioned, reference-based project and analysis data.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_id",
+    "schema_version",
+    "project",
+    "geometry_assets",
+    "components",
+    "material_definitions",
+    "material_assignments",
+    "reference_frames",
+    "load_cases",
+    "fixtures",
+    "requirements",
+    "methods",
+    "correlation_records",
+    "analysis_runs",
+    "validation_issues",
+    "reports",
+    "run_manifests",
+    "review_records"
+  ],
+  "properties": {
+    "schema_id": {
+      "const": "gms.project-document"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "project": {
+      "$ref": "#/$defs/project"
+    },
+    "geometry_assets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/geometry_asset"
+      }
+    },
+    "components": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/component"
+      }
+    },
+    "material_definitions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/material_definition"
+      }
+    },
+    "material_assignments": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/material_assignment"
+      }
+    },
+    "reference_frames": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/reference_frame"
+      }
+    },
+    "load_cases": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/load_case"
+      }
+    },
+    "fixtures": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/fixture"
+      }
+    },
+    "requirements": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/requirement"
+      }
+    },
+    "methods": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/analysis_method"
+      }
+    },
+    "correlation_records": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/correlation_record"
+      }
+    },
+    "analysis_runs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/analysis_run"
+      }
+    },
+    "validation_issues": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/validation_issue"
+      }
+    },
+    "reports": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/report"
+      }
+    },
+    "run_manifests": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/run_manifest"
+      }
+    },
+    "review_records": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/review_record"
+      }
+    }
+  },
+  "$defs": {
+    "entity_meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entity_type",
+        "schema_version",
+        "id",
+        "revision",
+        "created_at",
+        "content_hash"
+      ],
+      "properties": {
+        "entity_type": {
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "content_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "entity_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "content_hash"],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "content_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "artifact_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "media_type", "byte_length", "relative_path"],
+      "properties": {
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "media_type": {
+          "type": "string"
+        },
+        "byte_length": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "relative_path": {
+          "type": ["string", "null"]
+        }
+      }
+    },
+    "quantity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value_si", "unit"],
+      "properties": {
+        "value_si": {
+          "type": "number"
+        },
+        "unit": {
+          "type": "string"
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "source_type": {"type": "string"},
+        "source_id": {"type": ["string", "null"]},
+        "citation": {"type": ["string", "null"]},
+        "condition": {"type": ["string", "null"]},
+        "temperature_k": {"type": ["number", "null"]},
+        "moisture_condition": {"type": ["string", "null"]},
+        "strain_rate_s": {"type": ["number", "null"]},
+        "confidence": {"type": "string"}
+      }
+    },
+    "validity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": {"enum": ["valid", "approximate", "inconclusive", "failed"]},
+        "reasons": {"type": "array", "items": {"type": "string"}},
+        "assumptions": {"type": "array", "items": {"type": "string"}},
+        "unsupported_failure_modes": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "string"}
+      }
+    },
+    "unit_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "internal_system": {"type": "string"},
+        "display_length_unit": {"type": "string"},
+        "display_mass_unit": {"type": "string"},
+        "display_force_unit": {"type": "string"},
+        "display_pressure_unit": {"type": "string"},
+        "absolute_length_tolerance_m": {"type": "number"},
+        "relative_tolerance": {"type": "number"}
+      }
+    },
+    "tolerance_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {"type": "string"},
+        "process_profile": {"type": "string"},
+        "bilateral_dimensions_m": {"type": "array", "items": {"type": "number"}},
+        "clearance_margin_m": {"type": "number"},
+        "assembly_stackup_enabled": {"type": "boolean"},
+        "statistical_analysis_enabled": {"type": "boolean"}
+      }
+    },
+    "model_entity": {
+      "type": "object",
+      "required": ["meta"],
+      "properties": {
+        "meta": {"$ref": "#/$defs/entity_meta"}
+      }
+    },
+    "project": {
+      "$ref": "#/$defs/model_entity"
+    },
+    "geometry_asset": {
+      "$ref": "#/$defs/model_entity"
+    },
+    "component": {
+      "$ref": "#/$defs/model_entity"
+    },
+    "material_definition": {
+      "$ref": "#/$defs/model_entity"
+    },
+    "material_assignment": {
+      "$ref": "#/$defs/model_entity"
+    },
+    "reference_frame": {
+      "$ref": "#/$defs/model_entity"
+    },
+    "load_case": {
+      "$ref": "#/$defs/model_entity"
+    },
+    "fixture": {
+      "$ref": "#/$defs/model_entity"
+    },
+    "requirement": {
+      "$ref": "#/$defs/model_entity"
+    },
+    "analysis_method": {
+      "$ref": "#/$defs/model_entity"
+    },
+    "correlation_record": {
+      "$ref": "#/$defs/model_entity"
+    },
+    "analysis_run": {
+      "$ref": "#/$defs/model_entity"
+    },
+    "validation_issue": {
+      "$ref": "#/$defs/model_entity"
+    },
+    "report": {
+      "$ref": "#/$defs/model_entity"
+    },
+    "run_manifest": {
+      "$ref": "#/$defs/model_entity"
+    },
+    "review_record": {
+      "$ref": "#/$defs/model_entity"
+    }
+  }
+}

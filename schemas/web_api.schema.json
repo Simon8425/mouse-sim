@@ -1,0 +1,325 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gaming-mouse-engine.local/schema/web-api-1.json",
+  "title": "mouse_sim web API",
+  "description": "Versioned HTTP contract for the mouse_sim deterministic web API. The Python adapter implements matching validation by hand; this document is the versioned contract reference.",
+  "type": "object",
+  "oneOf": [
+    { "$ref": "#/$defs/web_error" },
+    { "$ref": "#/$defs/web_health" },
+    { "$ref": "#/$defs/web_baseline" },
+    { "$ref": "#/$defs/material_catalog" },
+    { "$ref": "#/$defs/geometry_preview" },
+    { "$ref": "#/$defs/web_analysis_request" },
+    { "$ref": "#/$defs/web_analysis_response" }
+  ],
+  "$defs": {
+    "web_error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_id", "status", "error"],
+      "properties": {
+        "schema_id": { "const": "gms.web-error/1" },
+        "status": { "type": "integer" },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "severity", "phase", "message"],
+          "properties": {
+            "code": { "type": "string" },
+            "severity": { "type": "string" },
+            "phase": { "const": "web" },
+            "message": { "type": "string" },
+            "details": { "type": "object" }
+          }
+        }
+      }
+    },
+    "web_health": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_id",
+        "engine_version",
+        "api_version",
+        "supported_formats",
+        "solver_capabilities",
+        "cache_active",
+        "max_json_bytes",
+        "max_geometry_bytes",
+        "deterministic"
+      ],
+      "properties": {
+        "schema_id": { "const": "gms.web-health/1" },
+        "engine_version": { "type": "string" },
+        "api_version": { "const": "1" },
+        "supported_formats": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "solver_capabilities": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "cache_active": { "type": "boolean" },
+        "max_json_bytes": { "type": "integer" },
+        "max_geometry_bytes": { "type": "integer" },
+        "deterministic": { "const": true }
+      }
+    },
+    "web_baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_id", "source", "project"],
+      "properties": {
+        "schema_id": { "const": "gms.web-baseline/1" },
+        "source": { "type": "string" },
+        "project": { "type": "object" }
+      }
+    },
+    "material_catalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_id", "catalog_source", "materials"],
+      "properties": {
+        "schema_id": { "const": "gms.web-material-catalog/1" },
+        "catalog_source": { "const": "builtin" },
+        "materials": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/material_entry" }
+        }
+      }
+    },
+    "material_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "name",
+        "family",
+        "density_kg_m3",
+        "young_modulus_pa",
+        "approval_state",
+        "confidence",
+        "source_type"
+      ],
+      "properties": {
+        "key": { "type": "string" },
+        "name": { "type": "string" },
+        "family": { "type": ["string", "null"] },
+        "density_kg_m3": { "type": ["number", "null"] },
+        "young_modulus_pa": { "type": ["number", "null"] },
+        "approval_state": { "type": "string" },
+        "confidence": { "type": "string" },
+        "source_type": { "type": "string" }
+      }
+    },
+    "geometry_preview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_id",
+        "supported",
+        "format",
+        "source_units",
+        "geometry",
+        "diagnostics",
+        "source_name"
+      ],
+      "properties": {
+        "schema_id": { "const": "gms.geometry-preview/1" },
+        "supported": { "type": "boolean" },
+        "format": { "type": "string" },
+        "source_units": { "type": ["string", "null"] },
+        "geometry": { "type": ["object", "null"] },
+        "diagnostics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["code", "severity", "message", "details"],
+            "properties": {
+              "code": { "type": "string" },
+              "severity": { "type": "string" },
+              "message": { "type": "string" },
+              "details": { "type": "object" }
+            }
+          }
+        },
+        "source_name": { "type": ["string", "null"] }
+      }
+    },
+    "web_analysis_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_id", "request"],
+      "properties": {
+        "schema_id": { "const": "gms.web-analysis-request/1" },
+        "request": { "type": "object" },
+        "options": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "strict": { "type": "boolean" },
+            "use_cache": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "web_analysis_response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_id", "run_id", "engine_version", "result", "materials"],
+      "properties": {
+        "schema_id": { "const": "gms.web-analysis-response/1" },
+        "run_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "engine_version": { "type": "string" },
+        "result": { "type": "object" },
+        "materials": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/material_entry" }
+        }
+      }
+    },
+    "rigid_transform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rotation", "translation", "units"],
+      "properties": {
+        "rotation": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": { "type": "number" }
+          }
+        },
+        "translation": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": { "type": "number" }
+        },
+        "units": { "const": "m" }
+      }
+    },
+    "geometry": {
+      "oneOf": [
+        { "$ref": "#/$defs/geometry_box" },
+        { "$ref": "#/$defs/geometry_sphere" },
+        { "$ref": "#/$defs/geometry_cylinder" },
+        { "$ref": "#/$defs/geometry_cone" },
+        { "$ref": "#/$defs/geometry_frustum" },
+        { "$ref": "#/$defs/geometry_mesh" },
+        { "$ref": "#/$defs/geometry_compound" }
+      ]
+    },
+    "geometry_box": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "size", "units", "transform"],
+      "properties": {
+        "type": { "const": "box" },
+        "size": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": { "type": "number" }
+        },
+        "units": { "const": "m" },
+        "transform": { "$ref": "#/$defs/rigid_transform" }
+      }
+    },
+    "geometry_sphere": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "radius", "units", "transform"],
+      "properties": {
+        "type": { "const": "sphere" },
+        "radius": { "type": "number" },
+        "units": { "const": "m" },
+        "transform": { "$ref": "#/$defs/rigid_transform" }
+      }
+    },
+    "geometry_cylinder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "radius", "height", "units", "transform"],
+      "properties": {
+        "type": { "const": "cylinder" },
+        "radius": { "type": "number" },
+        "height": { "type": "number" },
+        "units": { "const": "m" },
+        "transform": { "$ref": "#/$defs/rigid_transform" }
+      }
+    },
+    "geometry_cone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "base_radius", "height", "units", "transform"],
+      "properties": {
+        "type": { "const": "cone" },
+        "base_radius": { "type": "number" },
+        "height": { "type": "number" },
+        "units": { "const": "m" },
+        "transform": { "$ref": "#/$defs/rigid_transform" }
+      }
+    },
+    "geometry_frustum": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "bottom_radius", "top_radius", "height", "units", "transform"],
+      "properties": {
+        "type": { "const": "frustum" },
+        "bottom_radius": { "type": "number" },
+        "top_radius": { "type": "number" },
+        "height": { "type": "number" },
+        "units": { "const": "m" },
+        "transform": { "$ref": "#/$defs/rigid_transform" }
+      }
+    },
+    "geometry_mesh": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "vertices", "triangles", "units", "transform"],
+      "properties": {
+        "type": { "const": "mesh" },
+        "vertices": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": { "type": "number" }
+          }
+        },
+        "triangles": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": { "type": "integer" }
+          }
+        },
+        "units": { "const": "m" },
+        "transform": { "$ref": "#/$defs/rigid_transform" }
+      }
+    },
+    "geometry_compound": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "children", "transform"],
+      "properties": {
+        "type": { "const": "compound" },
+        "children": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/geometry" }
+        },
+        "transform": { "$ref": "#/$defs/rigid_transform" }
+      }
+    }
+  }
+}

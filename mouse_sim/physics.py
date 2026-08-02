@@ -1,0 +1,654 @@
+"""Closed-form structural screening estimates for mouse-scale parts.
+
+Surrogate closed-form solvers: Navier simply-supported thin plate response,
+elementary Euler-Bernoulli beam response, load-case dispatch, preflight
+issue reporting, and the shared load template catalog.  Pure stdlib, SI
+values, deterministic.
+"""
+
+from dataclasses import dataclass, field, replace
+import math
+from typing import Any, Mapping, Optional, Tuple
+
+from .model import MaterialDefinition, MaterialProperties
+from .units import to_si
+
+SERIES_NOT_CONVERGED = "SERIES_NOT_CONVERGED"
+THIN_SHELL_OUT_OF_RANGE = "THIN_SHELL_OUT_OF_RANGE"
+POINT_LOAD_SINGULARITY = "POINT_LOAD_SINGULARITY"
+UNSUPPORTED_STIFFNESS_REDUCTION = "UNSUPPORTED_STIFFNESS_REDUCTION"
+UNDERCONSTRAINED_REACTIONS = "UNDERCONSTRAINED_REACTIONS"
+
+SHELL_PANEL_METHOD = "shell_navier_v1"
+BEAM_METHOD = "beam_closed_form_v1"
+CLOSED_FORM_METHOD = "closed_form_v1"
+
+SHELL_PANEL_ASSUMPTIONS = (
+    "simply supported thin plate, linear elastic isotropic material",
+    "Navier double-sine series with odd terms m,n = 1,3,5,...",
+    "small-deflection linear plate theory; stresses from moment resultants",
+    "uniform pressure over the full panel",
+    "response evaluated on a fixed 5x5 grid",
+)
+BEAM_ASSUMPTIONS = (
+    "Euler-Bernoulli beam, small-deflection linear theory",
+    "closed-form end reactions and maximum moment",
+    "shear stress approximated as tau = 1.5*V/A",
+)
+SHELL_UNSUPPORTED_FAILURE_MODES = (
+    "UNSUPPORTED_BUCKLING",
+    "UNSUPPORTED_YIELD_LOCALIZATION",
+    "UNSUPPORTED_CRACK_PROPAGATION",
+    "UNSUPPORTED_SNAP_THROUGH",
+    "UNSUPPORTED_VIBRATION_FATIGUE",
+)
+BEAM_UNSUPPORTED_FAILURE_MODES = (
+    "UNSUPPORTED_BUCKLING",
+    "UNSUPPORTED_FATIGUE_CRACK",
+    "UNSUPPORTED_JOINT_FAILURE",
+    "UNSUPPORTED_TORSION_BUCKLING",
+)
+Vector3 = Tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class StructuralResponse:
+    """Immutable result of a closed-form structural screening estimate."""
+
+    method_id: str
+    max_displacement_m: Optional[float] = None
+    max_displacement_location: Optional[Vector3] = None
+    max_stress_pa: Optional[float] = None
+    max_stress_filtered_pa: Optional[float] = None
+    filtered_location: Optional[Vector3] = None
+    safety_factor: Optional[float] = None
+    safety_factor_status: str = "not_available"
+    reactions: Mapping[str, float] = field(default_factory=dict)
+    force_residual_n: Optional[float] = None
+    moment_residual_n_m: Optional[float] = None
+    flags: Tuple[str, ...] = ()
+    assumptions: Tuple[str, ...] = ()
+    unsupported_failure_modes: Tuple[str, ...] = ()
+    validity: str = "valid"
+
+    def to_dict(self):
+        location = None if self.max_displacement_location is None else list(self.max_displacement_location)
+        filtered = None if self.filtered_location is None else list(self.filtered_location)
+        return {
+            "method_id": self.method_id,
+            "max_displacement_m": self.max_displacement_m,
+            "max_displacement_location": location,
+            "max_stress_pa": self.max_stress_pa,
+            "max_stress_filtered_pa": self.max_stress_filtered_pa,
+            "filtered_location": filtered,
+            "safety_factor": self.safety_factor,
+            "safety_factor_status": self.safety_factor_status,
+            "reactions": dict(self.reactions),
+            "force_residual_n": self.force_residual_n,
+            "moment_residual_n_m": self.moment_residual_n_m,
+            "flags": list(self.flags),
+            "assumptions": list(self.assumptions),
+            "unsupported_failure_modes": list(self.unsupported_failure_modes),
+            "validity": self.validity,
+        }
+
+
+@dataclass(frozen=True)
+class SolverCapabilities:
+    """Declared capabilities of the surrogate closed-form solver backend."""
+
+    backend: str = "surrogate_closed_form"
+    version: str = "0.1.0"
+    capability_keys: Tuple[str, ...] = (
+        "shell_panel_response",
+        "beam_response",
+        "solve_load_case",
+        "preflight_structural_case",
+        "MOUSE_LOAD_TEMPLATES",
+    )
+    deterministic: bool = True
+
+    def to_dict(self):
+        return {
+            "backend": self.backend,
+            "version": self.version,
+            "capability_keys": list(self.capability_keys),
+            "deterministic": self.deterministic,
+        }
+
+
+SOLVER_CAPABILITIES = SolverCapabilities()
+
+
+def _finite(value, label):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("{} must be numeric".format(label))
+    if not math.isfinite(number):
+        raise ValueError("{} must be finite".format(label))
+    return number
+
+
+def _positive(value, label):
+    number = _finite(value, label)
+    if number <= 0.0:
+        raise ValueError("{} must be positive; got {!r}".format(label, value))
+    return number
+
+
+def _vm(sx, sy, txy):
+    return math.sqrt(max(0.0, sx * sx + sy * sy - sx * sy + 3.0 * txy * txy))
+
+
+def _safety(allowable, stress):
+    if allowable is None or stress is None or stress <= 0.0:
+        return None, "not_available"
+    factor = allowable / stress
+    return factor, ("pass" if factor >= 1.0 else "warn")
+
+
+def _blank_response(flags, assumptions, validity="inconclusive", method_id=CLOSED_FORM_METHOD):
+    return StructuralResponse(
+        method_id=method_id,
+        flags=tuple(flags),
+        assumptions=tuple(assumptions),
+        validity=validity,
+    )
+
+
+def _shell_dims(structure):
+    a = structure.get("a_m", structure.get("length_m"))
+    b = structure.get("b_m", structure.get("width_m"))
+    t = structure.get("t_m", structure.get("thickness_m"))
+    return a, b, t
+
+
+def _beam_dims(structure):
+    L = structure.get("L_m", structure.get("length_m"))
+    I = structure.get("I_m4")
+    A = structure.get("A_m2")
+    Z = structure.get("section_modulus_m3")
+    return L, I, A, Z
+
+
+def _material_props(material):
+    if isinstance(material, MaterialDefinition):
+        material = material.properties
+    if isinstance(material, MaterialProperties):
+        E = material.young_modulus.value_si if material.young_modulus is not None else None
+        nu = material.poissons_ratio
+        allowable = material.tensile_allowable.value_si if material.tensile_allowable is not None else None
+        return E, nu, allowable
+    E = material.get("young_modulus_pa")
+    if E is None:
+        E = material.get("youngs_modulus_pa")
+    return E, material.get("poissons_ratio"), material.get("tensile_allowable_pa")
+
+
+def _load_magnitude(load, key):
+    value = load.get(key)
+    if isinstance(value, Mapping):
+        if "unit" in value:
+            return to_si(value.get("value", 0.0), value["unit"])
+        value = value.get("value")
+    return value
+
+
+def _shell_fields(a, b, t, E, nu, wmn, series_order):
+    D = E * t ** 3 / (12.0 * (1.0 - nu * nu))
+    terms = tuple(range(1, max(int(series_order), 1) + 2, 2))
+    xs = [a * i / 4.0 for i in range(5)]
+    ys = [b * j / 4.0 for j in range(5)]
+    w = [[0.0] * 5 for _ in range(5)]
+    mxx = [[0.0] * 5 for _ in range(5)]
+    myy = [[0.0] * 5 for _ in range(5)]
+    mxy = [[0.0] * 5 for _ in range(5)]
+    for m in terms:
+        alpha = math.pi * m / a
+        alpha2 = alpha * alpha
+        for n in terms:
+            beta = math.pi * n / b
+            beta2 = beta * beta
+            coeff = wmn(m, n)
+            for j, y in enumerate(ys):
+                siny = math.sin(beta * y)
+                cosy = math.cos(beta * y)
+                for i, x in enumerate(xs):
+                    sinx = math.sin(alpha * x)
+                    s = sinx * siny
+                    w[j][i] += coeff * s
+                    mxx[j][i] += coeff * alpha2 * s
+                    myy[j][i] += coeff * beta2 * s
+                    mxy[j][i] += coeff * alpha * beta * math.cos(alpha * x) * cosy
+    factor = 6.0 / (t * t)
+    stress = [[[0.0] * 5 for _ in range(5)] for _ in range(2)]
+    for j in range(5):
+        for i in range(5):
+            mx = -D * (mxx[j][i] + nu * myy[j][i])
+            my = -D * (myy[j][i] + nu * mxx[j][i])
+            txy = D * (1.0 - nu) * mxy[j][i]
+            stress[0][j][i] = _vm(mx * factor, my * factor, txy * factor)
+            stress[1][j][i] = _vm(-mx * factor, -my * factor, -txy * factor)
+    return w, stress
+
+
+def _grid_max(w):
+    best = None
+    location = (0.0, 0.0)
+    for j in range(5):
+        for i in range(5):
+            value = w[j][i]
+            if best is None or abs(value) > abs(best):
+                best = value
+                location = (i / 4.0, j / 4.0)
+    return (0.0 if best is None else best), location
+
+
+def _box_filter(field):
+    filtered = [[0.0] * 5 for _ in range(5)]
+    for j in range(5):
+        for i in range(5):
+            total = 0.0
+            for dj in (-1, 0, 1):
+                jj = min(4, max(0, j + dj))
+                for di in (-1, 0, 1):
+                    ii = min(4, max(0, i + di))
+                    total += field[jj][ii]
+            filtered[j][i] = total / 9.0
+    return filtered
+
+
+def _stress_peak(fields, t):
+    best = -1.0
+    location = (0.0, 0.0, 0.0)
+    for z in (0, 1):
+        z_loc = t / 2.0 if z else -t / 2.0
+        for j in range(5):
+            for i in range(5):
+                value = fields[z][j][i]
+                if value > best:
+                    best = value
+                    location = (i / 4.0, j / 4.0, z_loc)
+    return best, location
+
+
+def _shell_response(method_id, a, b, t, E, nu, w, stress, flags, assumptions,
+                    validity, allowable_pa, reactions, force_residual,
+                    moment_residual, unsupported):
+    w_max, (gx, gy) = _grid_max(w)
+    raw, _ = _stress_peak(stress, t)
+    smoothed = [_box_filter(stress[z]) for z in (0, 1)]
+    filtered, filtered_loc = _stress_peak(smoothed, t)
+    factor, status = _safety(allowable_pa, filtered)
+    return StructuralResponse(
+        method_id=method_id,
+        max_displacement_m=w_max,
+        max_displacement_location=(a * gx, b * gy, 0.0),
+        max_stress_pa=raw,
+        max_stress_filtered_pa=filtered,
+        filtered_location=filtered_loc,
+        safety_factor=factor,
+        safety_factor_status=status,
+        reactions=reactions,
+        force_residual_n=force_residual,
+        moment_residual_n_m=moment_residual,
+        flags=tuple(flags),
+        assumptions=tuple(assumptions),
+        unsupported_failure_modes=unsupported,
+        validity=validity,
+    )
+
+
+def shell_panel_response(a_m, b_m, t_m, E_pa, nu, pressure_pa, series_order=9, allowable_pa=None):
+    """Simply supported thin plate under uniform pressure (Navier series)."""
+    a = _positive(a_m, "a_m")
+    b = _positive(b_m, "b_m")
+    t = _positive(t_m, "t_m")
+    E = _positive(E_pa, "E_pa")
+    p = _finite(pressure_pa, "pressure_pa")
+    nu = _finite(nu, "nu")
+    order = max(1, int(series_order))
+    if order % 2 == 0:
+        order -= 1
+    D = E * t ** 3 / (12.0 * (1.0 - nu * nu))
+
+    def wmn(m, n):
+        return 16.0 * p / (D * math.pi ** 6 * m * n * (m * m / (a * a) + n * n / (b * b)) ** 2)
+
+    w, stress = _shell_fields(a, b, t, E, nu, wmn, order)
+    flags = []
+    validity = "valid"
+    ratio = t / min(a, b)
+    if ratio > 0.1:
+        flags.append(THIN_SHELL_OUT_OF_RANGE)
+        validity = "approximate" if ratio <= 0.25 else "inconclusive"
+    order_low = order - 4
+    if order_low >= 1:
+        w_low, _ = _shell_fields(a, b, t, E, nu, wmn, order_low)
+        w_high = _grid_max(w)[0]
+        w_low_max = _grid_max(w_low)[0]
+        if abs(w_high - w_low_max) / max(w_high, 1e-30) > 0.05:
+            flags.append(SERIES_NOT_CONVERGED)
+            if validity == "valid":
+                validity = "approximate"
+    total = p * a * b
+    corner = total / 4.0
+    reactions = {"R1": corner, "R2": corner, "R3": corner, "R4": corner}
+    force_residual = total - sum(reactions.values())
+    rx = total * b / 2.0 - (reactions["R3"] * b + reactions["R4"] * b)
+    ry = total * a / 2.0 - (reactions["R2"] * a + reactions["R4"] * a)
+    moment_residual = math.hypot(rx, ry)
+    assumptions = SHELL_PANEL_ASSUMPTIONS + (
+        "series order {} (odd terms); convergence checked at order {}".format(order, order_low if order_low >= 1 else order),
+        "equilibrium residual from four-corner reaction distribution",
+    )
+    return _shell_response(
+        SHELL_PANEL_METHOD, a, b, t, E, nu, w, stress, flags, assumptions,
+        validity, allowable_pa, reactions, force_residual, moment_residual,
+        SHELL_UNSUPPORTED_FAILURE_MODES,
+    )
+
+
+def _shell_point_load_response(a, b, t, E, nu, force_n, location, allowable_pa=None, series_order=9):
+    D = E * t ** 3 / (12.0 * (1.0 - nu * nu))
+    x0 = _finite(location[0], "location[0]")
+    y0 = _finite(location[1], "location[1]")
+    order = max(1, int(series_order))
+    if order % 2 == 0:
+        order -= 1
+
+    def wmn(m, n):
+        den = (m * m / (a * a) + n * n / (b * b)) ** 2
+        return (4.0 * force_n * math.sin(m * math.pi * x0 / a)
+                * math.sin(n * math.pi * y0 / b)) / (D * a * b * math.pi ** 4 * den)
+
+    w, stress = _shell_fields(a, b, t, E, nu, wmn, order)
+    corner = force_n / 4.0
+    reactions = {"R1": corner, "R2": corner, "R3": corner, "R4": corner}
+    force_residual = force_n - sum(reactions.values())
+    moment_residual = math.hypot(force_n * (y0 - b / 2.0), force_n * (x0 - a / 2.0))
+    assumptions = SHELL_PANEL_ASSUMPTIONS + (
+        "point load applied at ({:.6g}, {:.6g}) via Navier point-load series".format(x0, y0),
+        "point-load series converges slowly; stresses are screening-quality only",
+    )
+    return _shell_response(
+        SHELL_PANEL_METHOD, a, b, t, E, nu, w, stress, (),
+        assumptions, "approximate", allowable_pa, reactions, force_residual,
+        moment_residual, SHELL_UNSUPPORTED_FAILURE_MODES,
+    )
+
+
+def beam_response(load_type, L_m, E_pa, I_m4, A_m2, nu, force_n=None,
+                  q_n_per_m=None, section_modulus_m3=None, allowable_pa=None):
+    """Closed-form Euler-Bernoulli beam response for four load cases."""
+    L = _positive(L_m, "L_m")
+    E = _positive(E_pa, "E_pa")
+    I = _positive(I_m4, "I_m4")
+    A = _positive(A_m2, "A_m2")
+    nu = _finite(nu, "nu")
+    specs = {
+        "cantilever_point": ("point", "cantilever"),
+        "cantilever_uniform": ("uniform", "cantilever"),
+        "simply_supported_point": ("point", "simple"),
+        "simply_supported_uniform": ("uniform", "simple"),
+    }
+    if load_type not in specs:
+        raise ValueError("unknown load_type {!r}".format(load_type))
+    shape, support = specs[load_type]
+    cantilever = support == "cantilever"
+    if shape == "point":
+        if force_n is None:
+            raise ValueError("force_n required for a point load")
+        P = _finite(force_n, "force_n")
+        deflection = P * L ** 3 / (3.0 * E * I) if cantilever else P * L ** 3 / (48.0 * E * I)
+        moment = P * L if cantilever else P * L / 4.0
+        shear = P if cantilever else P / 2.0
+        reactions = {"R1": P, "R2": 0.0} if cantilever else {"R1": P / 2.0, "R2": P / 2.0}
+        applied = P
+        formula = "w = P*L^3/(3*E*I), Mmax = P*L" if cantilever else "w = P*L^3/(48*E*I), Mmax = P*L/4"
+    else:
+        if q_n_per_m is None:
+            raise ValueError("q_n_per_m required for a uniform load")
+        q = _finite(q_n_per_m, "q_n_per_m")
+        deflection = q * L ** 4 / (8.0 * E * I) if cantilever else 5.0 * q * L ** 4 / (384.0 * E * I)
+        moment = q * L * L / 2.0 if cantilever else q * L * L / 8.0
+        shear = q * L if cantilever else q * L / 2.0
+        reactions = {"R1": q * L, "R2": 0.0} if cantilever else {"R1": q * L / 2.0, "R2": q * L / 2.0}
+        applied = q * L
+        formula = "w = q*L^4/(8*E*I), Mmax = q*L^2/2" if cantilever else "w = 5*q*L^4/(384*E*I), Mmax = q*L^2/8"
+    if cantilever:
+        reactions["M1"] = -moment
+    stress = moment / section_modulus_m3 if section_modulus_m3 else None
+    tau = 1.5 * shear / A
+    vm = math.sqrt(stress * stress + 3.0 * tau * tau) if stress is not None else None
+    factor, status = _safety(allowable_pa, vm)
+    peak_loc = (0.0, 0.0, 0.0) if cantilever else (L / 2.0, 0.0, 0.0)
+    tip_loc = (L, 0.0, 0.0) if cantilever else (L / 2.0, 0.0, 0.0)
+    assumptions = BEAM_ASSUMPTIONS + (
+        formula,
+        "force balance via reactions: sum(R) = {:.6g} N; moment residual zero by statics".format(applied),
+    )
+    return StructuralResponse(
+        method_id=BEAM_METHOD,
+        max_displacement_m=deflection,
+        max_displacement_location=tip_loc,
+        max_stress_pa=vm,
+        max_stress_filtered_pa=vm,
+        filtered_location=peak_loc,
+        safety_factor=factor,
+        safety_factor_status=status,
+        reactions=reactions,
+        force_residual_n=applied - (reactions["R1"] + reactions["R2"]),
+        moment_residual_n_m=0.0,
+        flags=(),
+        assumptions=assumptions,
+        unsupported_failure_modes=BEAM_UNSUPPORTED_FAILURE_MODES,
+        validity="valid",
+    )
+
+
+def solve_load_case(load_case_dict, structure_dict, material_dict, fixtures=None, solver=None):
+    """Dispatch a load case to the appropriate closed-form surrogate."""
+    load = load_case_dict if isinstance(load_case_dict, Mapping) else {}
+    structure = structure_dict if isinstance(structure_dict, Mapping) else {}
+    material = material_dict if isinstance(material_dict, (Mapping, MaterialProperties, MaterialDefinition)) else {}
+    E, nu, allowable = _material_props(material)
+    flags = []
+    assumptions = []
+    if E is None:
+        flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
+        assumptions.append("young modulus unavailable; stiffness cannot be computed")
+        return _blank_response(flags, assumptions)
+    s_type = structure.get("type")
+    if s_type not in ("shell_panel", "beam"):
+        flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
+        assumptions.append("structure_dict must have type shell_panel or beam")
+        return _blank_response(flags, assumptions)
+    kind = load.get("kind")
+    if kind is None:
+        flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
+        return _blank_response(flags, assumptions + ("load_case_dict missing kind",))
+    if kind == "pressure":
+        p = _load_magnitude(load, "magnitude_pa")
+        if p is None:
+            flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
+            return _blank_response(flags, assumptions + ("pressure load requires magnitude_pa",))
+        if s_type == "shell_panel":
+            a, b, t = _shell_dims(structure)
+            result = shell_panel_response(a, b, t, E, nu, p, allowable_pa=allowable)
+        else:
+            L, I, A, Z = _beam_dims(structure)
+            width = structure.get("width_m")
+            if not width:
+                flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
+                return _blank_response(flags, assumptions + ("beam pressure load requires width_m",))
+            q = p * _positive(width, "width_m")
+            support = structure.get("support", "cantilever")
+            beam_type = "cantilever_uniform" if support == "cantilever" else "simply_supported_uniform"
+            result = beam_response(beam_type, L, E, I, A, nu, q_n_per_m=q,
+                                   section_modulus_m3=Z, allowable_pa=allowable)
+        return _merged(result, flags, assumptions)
+    if kind == "force":
+        F = _load_magnitude(load, "force_n")
+        if F is None:
+            flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
+            return _blank_response(flags, assumptions + ("force load requires force_n",))
+        point = bool(load.get("point_load", False))
+        if point:
+            flags.append(POINT_LOAD_SINGULARITY)
+            assumptions.append("point load singularity: local contact stress not resolved")
+        if s_type == "shell_panel":
+            a, b, t = _shell_dims(structure)
+            location = load.get("location", (a / 2.0, b / 2.0))
+            result = _shell_point_load_response(a, b, t, E, nu, F, tuple(location),
+                                                allowable_pa=allowable)
+        else:
+            L, I, A, Z = _beam_dims(structure)
+            support = structure.get("support", "cantilever")
+            beam_type = "cantilever_point" if support == "cantilever" else "simply_supported_point"
+            result = beam_response(beam_type, L, E, I, A, nu, force_n=F,
+                                   section_modulus_m3=Z, allowable_pa=allowable)
+        if point:
+            result = replace(result, validity="approximate")
+        return _merged(result, flags, assumptions)
+    if kind == "gravity":
+        if not fixtures:
+            flags.append(UNDERCONSTRAINED_REACTIONS)
+            assumptions.append("gravity load requires fixtures; none supplied")
+            return _blank_response(flags, assumptions, validity="approximate")
+        flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
+        assumptions.append("gravity load needs a mass model; not supported by closed-form surrogate")
+        return _blank_response(flags, assumptions, validity="approximate")
+    if kind == "torque":
+        flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
+        assumptions.append("torque loads not supported by closed-form surrogate")
+        return _blank_response(flags, assumptions, validity="inconclusive")
+    flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
+    return _blank_response(flags, assumptions + ("unknown load kind {!r}".format(kind),))
+
+
+def _merged(result, flags, assumptions):
+    if not flags and not assumptions:
+        return result
+    return replace(
+        result,
+        flags=tuple(flags) + result.flags,
+        assumptions=result.assumptions + tuple(assumptions),
+    )
+
+
+def preflight_structural_case(load_case_dict, structure_dict, material_dict, fixtures=None):
+    """Return preflight issues as (code, severity, message) dicts."""
+    issues = []
+    load = load_case_dict if isinstance(load_case_dict, Mapping) else {}
+    structure = structure_dict if isinstance(structure_dict, Mapping) else {}
+    material = material_dict if isinstance(material_dict, (Mapping, MaterialProperties, MaterialDefinition)) else {}
+    s_type = structure.get("type")
+    if s_type not in ("shell_panel", "beam"):
+        issues.append({
+            "code": "UNSUPPORTED_STRUCTURE_TYPE",
+            "severity": "error",
+            "message": "structure_dict type must be shell_panel or beam",
+        })
+    elif s_type == "shell_panel":
+        a, b, t = _shell_dims(structure)
+        if t and a and t / min(a, b) > 0.1:
+            issues.append({
+                "code": THIN_SHELL_OUT_OF_RANGE,
+                "severity": "warning",
+                "message": "panel thickness exceeds 10% of span; thin-plate theory approximate",
+            })
+    E, _, _ = _material_props(material)
+    if E is None:
+        issues.append({
+            "code": UNSUPPORTED_STIFFNESS_REDUCTION,
+            "severity": "error",
+            "message": "young_modulus_pa missing; stiffness cannot be computed",
+        })
+    kind = load.get("kind")
+    if kind == "pressure" and load.get("magnitude_pa") is None:
+        issues.append({"code": "MISSING_LOAD_MAGNITUDE", "severity": "error",
+                       "message": "pressure load requires magnitude_pa"})
+    if kind == "force" and load.get("force_n") is None:
+        issues.append({"code": "MISSING_LOAD_MAGNITUDE", "severity": "error",
+                       "message": "force load requires force_n"})
+    if load.get("point_load"):
+        issues.append({
+            "code": POINT_LOAD_SINGULARITY,
+            "severity": "warning",
+            "message": "point loads produce singular stress fields; treat results as approximate",
+        })
+    if not fixtures and kind in ("gravity", "torque"):
+        issues.append({
+            "code": UNDERCONSTRAINED_REACTIONS,
+            "severity": "warning",
+            "message": "no fixtures supplied; reactions underdetermined",
+        })
+    return tuple(issues)
+
+
+MOUSE_LOAD_TEMPLATES = {
+    "shell_flex": {
+        "name": "Shell flex",
+        "description": "Uniform pressure flexing the bottom shell panel.",
+        "default_loads": {"kind": "pressure", "magnitude_pa": 1000.0,
+                          "distribution": "uniform", "direction": (0, 0, -1)},
+        "fixture_assumptions": "panel simply supported on all four edges",
+        "acceptance_notes": "accept when safety_factor >= 1.0 against tensile_allowable; recheck edge stress with a detailed model",
+    },
+    "side_grip": {
+        "name": "Side grip squeeze",
+        "description": "Lateral squeeze force applied to the side walls.",
+        "default_loads": {"kind": "force", "force_n": 8.0, "point_load": False,
+                          "distribution": "uniform", "direction": (1, 0, 0)},
+        "fixture_assumptions": "side walls fixed along the bottom edge",
+        "acceptance_notes": "watch combined bending plus shear; keep safety_factor >= 1.0",
+    },
+    "button_press": {
+        "name": "Button press",
+        "description": "Point press on a mouse button actuator.",
+        "default_loads": {"kind": "force", "force_n": 5.0, "point_load": True,
+                          "direction": (0, 0, -1)},
+        "fixture_assumptions": "button pivot modeled as a simply supported edge",
+        "acceptance_notes": "flagged POINT_LOAD_SINGULARITY; verify local contact with a dedicated model",
+    },
+    "torsion": {
+        "name": "Torsion twist",
+        "description": "Twisting torque applied between shell halves.",
+        "default_loads": {"kind": "torque", "torque_n_m": 0.05, "direction": (0, 0, 1)},
+        "fixture_assumptions": "one half held fixed, torque applied to the other",
+        "acceptance_notes": "closed-form surrogate does not support torque; requires FE or a dedicated method",
+    },
+    "localized_pressure": {
+        "name": "Localized pressure",
+        "description": "High pressure over a small region (e.g., thumb rest).",
+        "default_loads": {"kind": "pressure", "magnitude_pa": 5000.0,
+                          "distribution": "localized", "direction": (0, 0, -1)},
+        "fixture_assumptions": "panel simply supported on all four edges",
+        "acceptance_notes": "localized pressure approaches point-load behavior; check the singularity flag",
+    },
+}
+
+
+__all__ = [
+    "BEAM_METHOD",
+    "BEAM_UNSUPPORTED_FAILURE_MODES",
+    "CLOSED_FORM_METHOD",
+    "MOUSE_LOAD_TEMPLATES",
+    "POINT_LOAD_SINGULARITY",
+    "SERIES_NOT_CONVERGED",
+    "SHELL_PANEL_ASSUMPTIONS",
+    "SHELL_PANEL_METHOD",
+    "SHELL_UNSUPPORTED_FAILURE_MODES",
+    "SOLVER_CAPABILITIES",
+    "SolverCapabilities",
+    "StructuralResponse",
+    "THIN_SHELL_OUT_OF_RANGE",
+    "UNDERCONSTRAINED_REACTIONS",
+    "UNSUPPORTED_STIFFNESS_REDUCTION",
+    "beam_response",
+    "preflight_structural_case",
+    "shell_panel_response",
+    "solve_load_case",
+]

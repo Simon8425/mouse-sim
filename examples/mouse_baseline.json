@@ -1,0 +1,97 @@
+{
+  "schema_id": "gms.project/1",
+  "mode": "exploration",
+  "units": "mm",
+  "objects": [
+    {
+      "id": "shell_top",
+      "geometry": {"type": "box", "size": [110, 65, 2.5]},
+      "material": "ABS",
+      "structural_behavior": "shell",
+      "classification": {"component_type": "shell_top", "source": "cad", "confidence": "high"}
+    },
+    {
+      "id": "shell_bottom",
+      "geometry": {"type": "box", "size": [110, 65, 1.2]},
+      "material": "PC/ABS",
+      "structural_behavior": "shell",
+      "classification": {"component_type": "shell_bottom", "source": "cad", "confidence": "high"}
+    },
+    {
+      "id": "pcb",
+      "geometry": {"type": "box", "size": [60, 40, 1.6]},
+      "material": "FR4",
+      "structural_behavior": "rigid",
+      "classification": {"component_type": "pcb", "source": "cad", "confidence": "high"}
+    },
+    {
+      "id": "battery",
+      "geometry": {"type": "box", "size": [50, 30, 8]},
+      "material": "LiPo",
+      "structural_behavior": "rigid",
+      "classification": {"component_type": "battery", "source": "supplier", "confidence": "medium"}
+    },
+    {
+      "id": "wheel",
+      "geometry": {"type": "cylinder", "radius": 6, "height": 20},
+      "material": "POM",
+      "structural_behavior": "rigid",
+      "classification": {"component_type": "wheel", "source": "cad", "confidence": "high"}
+    },
+    {
+      "id": "skate_left",
+      "geometry": {"type": "box", "size": [12, 6, 1]},
+      "material": "PTFE",
+      "structural_behavior": "rigid",
+      "classification": {"component_type": "skate", "source": "supplier", "confidence": "medium"}
+    },
+    {
+      "id": "skate_right",
+      "geometry": {"type": "box", "size": [12, 6, 1]},
+      "material": "PTFE",
+      "structural_behavior": "rigid",
+      "classification": {"component_type": "skate", "source": "supplier", "confidence": "medium"}
+    },
+    {
+      "id": "screw_front",
+      "geometry": {"type": "cylinder", "radius": 1.5, "height": 6},
+      "material": "steel",
+      "mass_override": 0.0002,
+      "structural_behavior": "rigid",
+      "classification": {"component_type": "screw", "source": "supplier", "confidence": "medium"}
+    },
+    {
+      "id": "screw_rear",
+      "geometry": {"type": "cylinder", "radius": 1.5, "height": 6},
+      "material": "steel",
+      "mass_override": 0.0002,
+      "structural_behavior": "rigid",
+      "classification": {"component_type": "screw", "source": "supplier", "confidence": "medium"}
+    }
+  ],
+  "load_case": {
+    "name": "shell_flex",
+    "kind": "pressure",
+    "magnitude": {"value": 5, "unit": "kPa"}
+  },
+  "structure": {
+    "type": "shell_panel",
+    "a_m": 0.11,
+    "b_m": 0.065,
+    "t_m": 0.002,
+    "material": "ABS"
+  },
+  "tolerance_profile": {
+    "name": "injection_molding",
+    "process_profile": "molding",
+    "bilateral_dimensions_m": [0.0001],
+    "clearance_margin_m": 0.0002,
+    "assembly_stackup_enabled": true,
+    "statistical_analysis_enabled": false
+  },
+  "impact": {
+    "fall_height_m": 0.75,
+    "restitution": 0.3,
+    "contact_stiffness_n_per_m": 1e5
+  }
+}
