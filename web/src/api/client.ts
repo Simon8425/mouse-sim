@@ -8,7 +8,13 @@ import type {
   WebAnalysisResponse,
 } from './contracts';
 import { isRecord } from './contracts';
-import { ApiError, ApiNetworkError, isAbortError, parseWebErrorBody } from './errors';
+import {
+  ApiError,
+  ApiNetworkError,
+  isAbortError,
+  isGeometryPreviewEnvelope,
+  parseWebErrorBody,
+} from './errors';
 
 export interface NormalizeInput {
   format: string;
@@ -24,6 +30,7 @@ export class ApiClient {
     path: string,
     options?: RequestInit,
     accept422 = false,
+    isValidBody?: (body: unknown) => boolean,
   ): Promise<T> {
     const url = `${this.baseUrl}${path}`;
     let response: Response;
@@ -44,19 +51,23 @@ export class ApiClient {
       }
     }
 
-    if (response.ok || (accept422 && response.status === 422)) {
-      if (isRecord(body)) {
-        return body as T;
+    const acceptedStatus = response.ok || (accept422 && response.status === 422);
+    if (acceptedStatus && (isValidBody ? isValidBody(body) : isRecord(body))) {
+      return body as T;
+    }
+
+    if (!response.ok) {
+      const apiErr = parseWebErrorBody(body, response.status);
+      if (apiErr) {
+        throw apiErr;
       }
-      throw new ApiError(`Invalid response format from ${path}`, { status: response.status });
+
+      throw new ApiError(`HTTP ${response.status}: ${response.statusText}`, {
+        status: response.status,
+      });
     }
 
-    const apiErr = parseWebErrorBody(body, response.status);
-    if (apiErr) {
-      throw apiErr;
-    }
-
-    throw new ApiError(`HTTP ${response.status}: ${response.statusText}`, {
+    throw new ApiError(`Invalid response format from ${path}`, {
       status: response.status,
     });
   }
@@ -108,6 +119,7 @@ export class ApiClient {
         signal,
       },
       true, // Accept 422 as valid envelope carrying geometry preview error diagnostics
+      isGeometryPreviewEnvelope,
     );
   }
 

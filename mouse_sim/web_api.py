@@ -3,7 +3,8 @@
 The adapter exposes the deterministic analysis engine over HTTP: health,
 baseline project, material catalog, geometry normalization, and analysis
 endpoints.  All responses are JSON; failures use the ``gms.web-error/1``
-envelope and pipeline results are passed through unchanged.
+envelope and pipeline failures are surfaced as web errors instead of a
+successful ``200`` pass-through.
 """
 
 import json
@@ -393,6 +394,34 @@ def _validate_analysis_envelope(payload):
     return None
 
 
+def _result_error_response(result):
+    """Return a web-error pair for a failed pipeline result, or None when successful."""
+    errors = result.get("errors") or []
+    internal = any(
+        isinstance(item, dict) and str(item.get("code", "")) == "PIPELINE_INTERNAL"
+        for item in errors
+    )
+    if internal:
+        message = "pipeline encountered an internal error"
+        for item in errors:
+            if isinstance(item, dict) and str(item.get("code", "")) == "PIPELINE_INTERNAL":
+                message = str(item.get("message", "")) or message
+        return make_web_error(500, "E_INTERNAL", message)
+    if errors:
+        first = errors[0] if isinstance(errors[0], dict) else {}
+        code = str(first.get("code", "E_INVALID_INPUT"))
+        message = str(first.get("message", "")) or "pipeline reported input errors"
+        return make_web_error(422, code, message)
+    validation = result.get("validation")
+    if isinstance(validation, dict) and validation.get("status") == "fail":
+        return make_web_error(
+            422,
+            "E_VALIDATION",
+            "validation failed for the submitted geometry and material inputs",
+        )
+    return None
+
+
 def handle_analyze(config, cache, payload):
     """Validate the analysis envelope and execute the pipeline."""
     from .pipeline import ENGINE_VERSION, run_pipeline
@@ -407,12 +436,18 @@ def handle_analyze(config, cache, payload):
     use_cache = True
     if options is not None:
         use_cache = bool(options.get("use_cache", True))
-        pipeline_request["options"] = {"strict": bool(options.get("strict", False))}
+        request_options = pipeline_request.get("options")
+        pipeline_options = dict(request_options) if isinstance(request_options, dict) else {}
+        pipeline_options["strict"] = bool(options.get("strict", False))
+        pipeline_request["options"] = pipeline_options
     if cache is None and config.cache_dir is not None:
         from .cache import ArtifactCache
 
         cache = ArtifactCache(config.cache_dir)
     result = run_pipeline(pipeline_request, cache=cache, use_cache=use_cache)
+    error_response = _result_error_response(result)
+    if error_response is not None:
+        return error_response
     catalog = builtin_materials()
     raw_materials = request.get("materials")
     if raw_materials is not None:

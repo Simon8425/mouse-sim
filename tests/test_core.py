@@ -234,6 +234,16 @@ class TemperatureAndQuantityTests(unittest.TestCase):
         with self.assertRaises(UnitError):
             Quantity.from_value(1, "mm").as_unit("kg")
 
+    def test_force_value_rejected_as_pressure_dimension(self):
+        with self.assertRaises(UnitError):
+            to_si(1, "N", expected_dimension="pressure")
+        with self.assertRaises(UnitError):
+            to_si(1, "kN", expected_dimension="pressure")
+        self.assertAlmostEqual(to_si(1, "N", expected_dimension="force"), 1.0)
+        self.assertAlmostEqual(to_si(1, "kPa", expected_dimension="pressure"), 1000.0)
+        with self.assertRaises(UnitError):
+            to_si(1, "Pa", expected_dimension="force")
+
     def test_quantity_normalizes_to_canonical_si_spelling(self):
         self.assertEqual(Quantity.from_value(25, "mm").unit, "m")
         self.assertEqual(Quantity.from_value(2, "g").unit, "kg")

@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 from urllib.parse import quote, urlsplit
 
 from mouse_sim.canonical import canonical_json
@@ -295,6 +296,120 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(response.status, 422)
         payload = json.loads(data)
         self.assertEqual(payload["error"]["code"], "E_INVALID_ENVELOPE")
+
+    def test_analyze_preserves_existing_request_options(self):
+        document = self.load_baseline()
+        options = {"min_thickness_m": 0.0005, "max_thickness_m": 0.05, "debug": True}
+        request_doc = dict(document, options=dict(options))
+        envelope = {
+            "schema_id": "gms.web-analysis-request/1",
+            "request": request_doc,
+            "options": {"strict": False, "use_cache": False},
+        }
+        server, base_url = self.start_server()
+        response, data = self.post_json(base_url, "/api/analyze", envelope)
+        self.assertEqual(response.status, 200, data.decode("utf-8"))
+        payload = json.loads(data)
+        direct = run_pipeline(
+            dict(request_doc, options={"min_thickness_m": 0.0005, "max_thickness_m": 0.05, "debug": True, "strict": False})
+        )
+        self.assertEqual(payload["run_id"], direct["run_id"])
+        self.assertEqual(canonical_json(payload["result"]), canonical_json(direct))
+
+    def test_analyze_pipeline_validation_fail_returns_422(self):
+        document = self.load_baseline()
+        envelope = {
+            "schema_id": "gms.web-analysis-request/1",
+            "request": dict(document),
+            "options": {"strict": True, "use_cache": False},
+        }
+        server, base_url = self.start_server()
+        response, data = self.post_json(base_url, "/api/analyze", envelope)
+        self.assertEqual(response.status, 422, data.decode("utf-8"))
+        payload = json.loads(data)
+        self.assertEqual(payload["schema_id"], "gms.web-error/1")
+        self.assertEqual(payload["error"]["code"], "E_VALIDATION")
+        self.assertNotIn("result", payload)
+
+    def test_analyze_qualification_integrity_gates_surface(self):
+        document = self.load_baseline()
+        request_doc = dict(
+            document,
+            mode="qualification",
+            load_case={
+                "kind": "torque",
+                "reviewed": True,
+                "acceptance_requirement_refs": [{"id": "req-1"}],
+            },
+        )
+        envelope = {
+            "schema_id": "gms.web-analysis-request/1",
+            "request": request_doc,
+            "options": {"strict": False, "use_cache": False},
+        }
+        server, base_url = self.start_server()
+        response, data = self.post_json(base_url, "/api/analyze", envelope)
+        self.assertEqual(response.status, 200, data.decode("utf-8"))
+        payload = json.loads(data)
+        qualification = payload["result"]["qualification"]
+        self.assertEqual(qualification["evidence_disposition"], "qualification_blocked")
+        self.assertIn("ANALYSIS_VALIDITY", qualification["blocking_keys"])
+        for key in (
+            "integrity_gates",
+            "requirement_evaluations",
+            "convergence_evidence",
+            "force_balance",
+            "structural_validity",
+        ):
+            self.assertIn(key, qualification)
+        gate_keys = {gate["key"] for gate in qualification["integrity_gates"]}
+        self.assertEqual(
+            gate_keys,
+            {
+                "ANALYSIS_VALIDITY",
+                "IMPACT_VALIDITY",
+                "CORRELATION_ERROR",
+                "REQUIREMENT_EVALUATION",
+                "CONVERGENCE_EVIDENCE",
+            },
+        )
+
+    def test_analyze_pipeline_geometry_error_returns_422_envelope(self):
+        document = self.load_baseline()
+        bad_objects = dict(document, objects=[{"id": "x", "geometry": {"type": "torus", "radius": 5}, "material": "ABS"}])
+        envelope = {
+            "schema_id": "gms.web-analysis-request/1",
+            "request": bad_objects,
+            "options": {"strict": False, "use_cache": True},
+        }
+        server, base_url = self.start_server()
+        response, data = self.post_json(base_url, "/api/analyze", envelope)
+        self.assertEqual(response.status, 422, data.decode("utf-8"))
+        payload = json.loads(data)
+        self.assertEqual(payload["schema_id"], "gms.web-error/1")
+        self.assertEqual(payload["error"]["code"], "GEOMETRY_PARSE_FAILED")
+        self.assertFalse(any("result" in payload for key in payload))
+
+    def test_analyze_pipeline_internal_error_returns_500_envelope(self):
+        document = self.load_baseline()
+        envelope = {
+            "schema_id": "gms.web-analysis-request/1",
+            "request": dict(document),
+            "options": {"strict": False, "use_cache": True},
+        }
+        server, base_url = self.start_server()
+        failed = {
+            "run_id": "run-failed",
+            "errors": [{"code": "PIPELINE_INTERNAL", "message": "boom"}],
+        }
+        with mock.patch("mouse_sim.pipeline.run_pipeline", return_value=failed):
+            response, data = self.post_json(base_url, "/api/analyze", envelope)
+        self.assertEqual(response.status, 500, data.decode("utf-8"))
+        payload = json.loads(data)
+        self.assertEqual(payload["schema_id"], "gms.web-error/1")
+        self.assertEqual(payload["error"]["code"], "E_INTERNAL")
+        self.assertIn("boom", payload["error"]["message"])
+        self.assertNotIn("result", payload)
 
     def test_normalize_obj_with_units(self):
         server, base_url = self.start_server()

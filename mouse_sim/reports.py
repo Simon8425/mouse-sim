@@ -13,6 +13,8 @@ from .errors import CanonicalizationError
 REPORT_SCHEMA_ID = "gms.report/1"
 EVIDENCE_SCHEMA_ID = "gms.evidence/1"
 
+_ACCEPTED_DISPOSITIONS = frozenset(("qualification_accepted", "accepted"))
+
 
 def _qualification(bundle):
     value = bundle.get("qualification")
@@ -24,9 +26,15 @@ def _manifest(bundle):
     return value if isinstance(value, dict) else {}
 
 
+def _manifest_inputs(manifest):
+    value = manifest.get("inputs")
+    return value if isinstance(value, dict) else {}
+
+
 def _decision(bundle):
     qualification = _qualification(bundle)
-    if qualification.get("qualified") is True:
+    disposition = _evidence_disposition(bundle)
+    if qualification.get("qualified") is True and disposition in _ACCEPTED_DISPOSITIONS:
         return "qualified"
     if qualification:
         return "not_qualified"
@@ -76,6 +84,8 @@ def _materials(bundle):
         qualification = _qualification(bundle)
         inputs = qualification.get("inputs")
         value = inputs.get("materials") if isinstance(inputs, dict) else None
+    if value is None:
+        value = _manifest_inputs(_manifest(bundle)).get("materials")
     return value if value is not None else {}
 
 
@@ -84,19 +94,46 @@ def _requirements(bundle):
     inputs = qualification.get("inputs")
     if isinstance(inputs, dict) and isinstance(inputs.get("requirements"), (list, tuple)):
         return list(inputs["requirements"])
-    value = bundle.get("requirements", [])
+    if "requirements" in bundle:
+        value = bundle.get("requirements", [])
+        return list(value) if isinstance(value, (list, tuple)) else []
+    value = _manifest_inputs(_manifest(bundle)).get("requirements")
     return list(value) if isinstance(value, (list, tuple)) else []
+
+
+def _collect_subtree_failure_modes(node, modes):
+    if isinstance(node, dict):
+        value = node.get("unsupported_failure_modes")
+        if isinstance(value, (list, tuple)):
+            modes.extend(str(item) for item in value)
+        for child in node.values():
+            if isinstance(child, (dict, list, tuple)):
+                _collect_subtree_failure_modes(child, modes)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            if isinstance(item, (dict, list, tuple)):
+                _collect_subtree_failure_modes(item, modes)
+
+
+def _collect_failure_modes(node, modes):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ("structural", "impact"):
+                if isinstance(value, dict):
+                    _collect_subtree_failure_modes(value, modes)
+                else:
+                    _collect_failure_modes(value, modes)
+            else:
+                _collect_failure_modes(value, modes)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            if isinstance(item, (dict, list, tuple)):
+                _collect_failure_modes(item, modes)
 
 
 def _unsupported_failure_modes(bundle):
     modes = []
-    for key in ("structural", "impact"):
-        section = bundle.get(key)
-        if not isinstance(section, dict):
-            continue
-        value = section.get("unsupported_failure_modes")
-        if isinstance(value, (list, tuple)):
-            modes.extend(str(item) for item in value)
+    _collect_failure_modes(bundle, modes)
     return sorted(set(modes))
 
 
@@ -145,7 +182,9 @@ def render_evidence_package(bundle, include_internal=False):
     if not isinstance(raw, (list, tuple)):
         raw = bundle.get("evidence")
     if not isinstance(raw, (list, tuple)):
-        raw = bundle.get("requirements", [])
+        raw = bundle.get("requirements")
+    if not isinstance(raw, (list, tuple)):
+        raw = _manifest_inputs(_manifest(bundle)).get("requirements")
     entries = []
     for item in raw if isinstance(raw, (list, tuple)) else []:
         if not isinstance(item, dict):
@@ -197,6 +236,14 @@ def _pairs(mapping):
         else:
             rows.append((key, value))
     return rows, values
+
+
+def _items(value):
+    if isinstance(value, dict):
+        return _pairs(value)
+    if isinstance(value, (list, tuple)):
+        return [], list(value)
+    return [], []
 
 
 def _section(title, rows=(), values=()):
@@ -260,6 +307,7 @@ def render_html_report(bundle):
     validation_rows, validation_values = _pairs(validation)
     structural_rows, structural_values = _pairs(structural)
     impact_rows, impact_values = _pairs(impact)
+    materials_rows, materials_values = _items(_materials(bundle))
     provenance = _provenance(bundle)
     provenance_rows, provenance_values = _pairs(provenance)
     mode = bundle.get("mode", "exploration")
@@ -294,6 +342,7 @@ def render_html_report(bundle):
         _section("Validation", rows=validation_rows, values=validation_values),
         _section("Analysis", rows=structural_rows, values=structural_values),
         _section("Impact", rows=impact_rows, values=impact_values),
+        _section("Materials", rows=materials_rows, values=materials_values),
         _section(
             "Qualification Gates",
             rows=[

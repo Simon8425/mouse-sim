@@ -11,9 +11,17 @@ export interface GeometryGuideCardProps {
 export function GeometryGuideCard({ onUpload }: GeometryGuideCardProps): React.ReactElement {
   const { state } = useProjectStore();
   const working = state.previewStatus === 'working';
+  const baselineLoading = state.sourceStatus === 'loading';
+  const baselineText =
+    state.sourceStatus === 'ready'
+      ? `Baseline available: ${state.projectName || 'server source'}`
+      : state.sourceStatus === 'error'
+        ? 'Baseline unavailable — upload a part to continue'
+        : 'Baseline loads automatically when the engine is connected';
 
   return (
     <div className="guide-card" role="dialog" aria-label="Geometry upload guide">
+      <span className="guide-card__kicker">Geometry</span>
       <svg className="guide-card__art" viewBox="0 0 120 64" aria-hidden="true" focusable="false">
         <rect x="18" y="14" width="84" height="36" rx="8" fill="none" stroke="currentColor" strokeWidth="3" />
         <line x1="18" y1="22" x2="102" y2="22" stroke="currentColor" strokeWidth="3" />
@@ -21,25 +29,21 @@ export function GeometryGuideCard({ onUpload }: GeometryGuideCardProps): React.R
       </svg>
       <h2>Upload geometry to analyze</h2>
       <p className="guide-card__body">
-        Provide the mouse assembly (or a single part) as one of these formats:
+        Load the server baseline or import a part. Analysis runs on normalized geometry only.
       </p>
+      <div className={`guide-card__baseline${baselineLoading ? ' guide-card__baseline--loading' : ''}`}>
+        {baselineText}
+      </div>
       <ul className="guide-card__list">
         <li>
-          <strong>JSON</strong> — analytic primitives: box, sphere, cylinder, cone, frustum, mesh,
-          or compound. Each object needs an <code>id</code> and a <code>geometry</code> entry with
-          its type and dimensions (e.g. <code>{'{ "type": "box", "size": [40, 20, 4] }'}</code>);
-          optionally add <code>material</code>, <code>structural_behavior</code>, and{' '}
-          <code>classification</code>. A project document may add <code>load_case</code>,{' '}
-          <code>structure</code>, <code>fixtures</code>, <code>impact</code>, and{' '}
-          <code>tolerance_profile</code>.
+          <strong>JSON</strong> — analytic primitives or a project document with explicit geometry,
+          materials, and study inputs.
         </li>
         <li>
-          <strong>OBJ / STL</strong> — triangle meshes. You will be asked to pick the input units.
-          Use closed, watertight meshes so volume, mass, and structural results are reliable.
+          <strong>OBJ / STL</strong> — triangle meshes. Units are requested on import.
         </li>
         <li>
-          <strong>STEP / STP</strong> — not supported yet; requires the server CAD converter
-          plugin.
+          <strong>STEP / STP</strong> — requires the server CAD converter plugin.
         </li>
       </ul>
       <div className="guide-card__actions">

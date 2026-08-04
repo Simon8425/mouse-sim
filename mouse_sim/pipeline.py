@@ -15,6 +15,7 @@ from mouse_sim import (
     canonical,
     canonical_bytes,
     canonical_value,
+    collision,
     classify_objects,
     sha256_bytes,
 )
@@ -47,6 +48,12 @@ _IMPACT_KWARGS = (
     "allowable_pa",
     "orientation",
     "g",
+    "effective_modulus_pa",
+    "contact_radius_m",
+    "total_mass_kg",
+    "inertia_tensor_kg_m2",
+    "contact_location_m",
+    "center_of_mass_m",
 )
 
 
@@ -81,10 +88,20 @@ def _new_result(mode):
         },
         "issues": [],
         "geometry_summary": {"objects": [], "parse_errors": []},
+        "materials": {},
+        "requirements": [],
         "mass": None,
         "validation": None,
         "structural": None,
         "impact": None,
+        "collision": {
+            "status": "skipped",
+            "configured": False,
+            "reason": "collision pairs are not configured",
+            "pairs": [],
+            "count": 0,
+            "flags": [],
+        },
         "qualification": None,
         "manifest": None,
         "errors": [],
@@ -117,20 +134,32 @@ def _normalize_load(load):
 
 
 def _object_entries(request):
-    raw_objects = request.get("objects") or []
+    if "objects" not in request:
+        return ()
+    raw_objects = request.get("objects")
+    if raw_objects is None:
+        raise ValueError("objects must be an object or array")
     if isinstance(raw_objects, Mapping):
+        entries = []
         for key, value in raw_objects.items():
-            if isinstance(value, Mapping):
-                yield str(key), dict(value)
-            else:
-                yield str(key), {"id": str(key), "geometry": value}
-    else:
-        for index, value in enumerate(raw_objects):
-            if isinstance(value, Mapping):
-                identifier = value.get("id", value.get("name", "object-{}".format(index)))
-                yield str(identifier), dict(value)
-            else:
-                yield "object-{}".format(index), {"geometry": value}
+            if not isinstance(value, Mapping):
+                raise ValueError("objects entry {!r} must be an object".format(key))
+            entries.append((str(key), dict(value)))
+        return tuple(entries)
+    if not isinstance(raw_objects, (list, tuple)):
+        raise ValueError("objects must be an object or array")
+    entries = []
+    for index, value in enumerate(raw_objects):
+        if not isinstance(value, Mapping):
+            raise ValueError("objects[{}] must be an object".format(index))
+        identifier = value.get("id", value.get("name"))
+        entries.append((identifier, dict(value)))
+    return tuple(entries)
+
+
+def _pipeline_error(result, code, message):
+    result["issues"].append(_issue(code, "error", "pipeline", message, evidence_blocking=True))
+    result["errors"].append({"code": code, "message": message})
 
 
 def _material_catalog(request, result):
@@ -154,7 +183,24 @@ def _parse_objects(request, catalog, result, units):
     density_by_object = {}
     overrides = {}
     behaviors = {}
-    for object_id, raw in _object_entries(request):
+    if "objects" in request and not isinstance(request.get("objects"), (Mapping, list, tuple)):
+        _pipeline_error(result, "INVALID_OBJECTS", "objects must be an object or array")
+        return geometry_objs, materials_by_object, density_by_object, overrides, behaviors
+    try:
+        entries = _object_entries(request)
+    except (TypeError, ValueError) as exc:
+        _pipeline_error(result, "INVALID_OBJECTS", str(exc))
+        return geometry_objs, materials_by_object, density_by_object, overrides, behaviors
+    seen_ids = set()
+    for raw_object_id, raw in entries:
+        object_id = "" if raw_object_id is None else str(raw_object_id).strip()
+        if not object_id:
+            _pipeline_error(result, "INVALID_OBJECT_ID", "object id must not be blank")
+            continue
+        if object_id in seen_ids:
+            _pipeline_error(result, "DUPLICATE_OBJECT_ID", "duplicate object id {!r}".format(object_id))
+            continue
+        seen_ids.add(object_id)
         geometry_data = raw.get("geometry", raw.get("shape"))
         geometry = None
         parse_message = None
@@ -167,7 +213,7 @@ def _parse_objects(request, catalog, result, units):
         else:
             try:
                 geometry = importers.geometry_from_dict(geometry_data, units=units)
-            except (TypeError, ValueError) as exc:
+            except Exception as exc:
                 parse_message = "object {!r}: {}".format(object_id, exc)
                 result["issues"].append(
                     _issue("GEOMETRY_PARSE_FAILED", "error", "geometry", parse_message, evidence_blocking=True)
@@ -226,47 +272,415 @@ def _first_material(catalog):
     return None
 
 
+def _material_evidence(catalog, materials_by_object, result):
+    assignments = {}
+    for entry in result["geometry_summary"]["objects"]:
+        material = entry.get("material")
+        if material is not None:
+            assignments[entry["object_id"]] = str(material)
+    keys_by_ref = {}
+    if isinstance(catalog, Mapping):
+        for key, material in catalog.items():
+            keys_by_ref[str(material.meta.id).casefold()] = str(key)
+            keys_by_ref[str(material.name).strip().casefold()] = str(key)
+    definitions = {}
+    for material in dict.fromkeys(materials_by_object.values()):
+        key = keys_by_ref.get(str(material.meta.id).casefold())
+        if key is None:
+            key = keys_by_ref.get(str(material.name).strip().casefold())
+        if key is None:
+            key = material.meta.id
+        definitions[str(key)] = canonical_value(material)
+    return {
+        "assignments": assignments,
+        "definitions": definitions,
+    }
+
+
+_VALIDITY_RANK = {"valid": 0, "approximate": 1, "inconclusive": 2, "failed": 3}
+
+
+def _state(value):
+    value = str(value or "").strip().casefold()
+    if value in ("failed", "fail", "error", "invalid"):
+        return "failed"
+    if value in ("inconclusive", "unknown", "not_available"):
+        return "inconclusive"
+    if value in ("approximate", "warn", "warning", "estimate"):
+        return "approximate"
+    if value in ("valid", "pass", "clear", "completed", "no_impact", ""):
+        return "valid"
+    return "inconclusive"
+
+
+def _flag_state(flag):
+    text = str(flag or "").casefold()
+    if any(token in text for token in ("invalid", "failed", "failure", "error")):
+        return "failed"
+    if any(token in text for token in ("unsupported", "not_certified", "unknown", "missing")):
+        return "inconclusive"
+    if any(token in text for token in ("not_converged", "singularity", "underconstrained", "approx", "estimate")):
+        return "approximate"
+    return "valid"
+
+
+def _add_state(states, value):
+    states.append(_state(value))
+
+
+def _add_flag_states(states, flags):
+    for flag in flags or ():
+        states.append(_flag_state(flag))
+
+
+def _collect_unsupported(node, output):
+    if isinstance(node, Mapping):
+        for key, value in node.items():
+            if key == "unsupported_failure_modes" and isinstance(value, (list, tuple, set)):
+                output.extend(str(item) for item in value)
+            elif isinstance(value, (Mapping, list, tuple, set)):
+                _collect_unsupported(value, output)
+    elif isinstance(node, (list, tuple, set)):
+        for value in node:
+            if isinstance(value, (Mapping, list, tuple, set)):
+                _collect_unsupported(value, output)
+
+
 def _validity(result):
+    states = []
+    reasons = []
+    assumptions = []
+    unsupported = []
     validation_report = result["validation"] or {}
     findings = validation_report.get("findings") or []
-    reasons = [
+    reasons.extend(
         item["message"]
         for item in findings
         if item.get("severity") in ("warning", "error", "blocker")
-    ]
-    assumptions = []
-    unsupported = []
+    )
+    _add_state(states, validation_report.get("validity_state"))
+    if validation_report.get("status") == "fail":
+        states.append("failed")
+    elif validation_report.get("status") == "warn":
+        states.append("approximate")
     structural = result["structural"]
     if structural is not None:
+        for item in structural.get("preflight") or ():
+            severity = str(item.get("severity", "info")).casefold()
+            if severity in ("error", "blocker"):
+                states.append("failed")
+                reasons.append(item.get("message", item.get("code", "structural preflight failed")))
+            elif severity == "warning":
+                states.append("approximate")
+                reasons.append(item.get("message", item.get("code", "structural preflight warning")))
         response = structural.get("response") or {}
         assumptions.extend(response.get("assumptions") or [])
+        _add_state(states, response.get("validity"))
+        _add_flag_states(states, response.get("flags"))
+        _collect_unsupported(response, unsupported)
     impact_section = result["impact"]
     if impact_section is not None:
-        impact_result = impact_section.get("result") or {}
-        assumptions.extend(impact_result.get("assumptions") or [])
-        unsupported.extend(impact_section.get("unsupported_failure_modes") or [])
-    status = validation_report.get("status")
-    if status == "pass":
-        confidence = "high"
-    elif status == "warn":
-        confidence = "medium"
-    else:
-        confidence = "low"
+        impact_result = impact_section.get("result")
+        if impact_result is None:
+            states.append("failed")
+            reasons.append(impact_section.get("reason") or "impact result is missing")
+        else:
+            assumptions.extend(impact_result.get("assumptions") or [])
+            _add_state(states, impact_result.get("validity"))
+            _add_flag_states(states, impact_result.get("flags"))
+            _collect_unsupported(impact_result, unsupported)
+        _collect_unsupported(impact_section, unsupported)
+        _add_flag_states(states, impact_section.get("flags"))
+        if impact_section.get("reason"):
+            states.append("inconclusive")
+            reasons.append(str(impact_section["reason"]))
+    collision_result = result.get("collision")
+    if collision_result is not None:
+        collision_status = str(collision_result.get("status", "")).casefold()
+        if collision_status == "failed":
+            states.append("failed")
+            if collision_result.get("reason"):
+                reasons.append(str(collision_result["reason"]))
+        elif collision_status in ("skipped", "valid", "evaluated", "clear", ""):
+            states.append("valid")
+        else:
+            _add_state(states, collision_status)
+        for pair in collision_result.get("pairs") or ():
+            pair_status = str(pair.get("status", "")).casefold()
+            pair_names = "/".join(str(item) for item in pair.get("pair", ()))
+            if pair_status == "interference" or pair.get("interference"):
+                states.append("failed")
+                reasons.append("collision interference for {}".format(pair_names))
+            elif pair_status == "unknown":
+                states.append("inconclusive")
+                reasons.append("collision clearance unknown for {}".format(pair_names))
+            elif pair_status in ("contact", "estimate"):
+                states.append("approximate")
+            _add_flag_states(states, pair.get("flags"))
+    unsupported = sorted(set(unsupported))
+    if unsupported:
+        states.append("inconclusive")
+        reasons.append("unsupported failure modes: {}".format(", ".join(unsupported)))
+    if result.get("errors"):
+        states.append("failed")
+    state = max(states, key=lambda value: _VALIDITY_RANK.get(value, 2)) if states else "valid"
+    confidence = "high" if state == "valid" else "low"
     return {
-        "state": validation_report.get("validity_state") or "valid",
+        "state": state,
         "reasons": reasons,
         "assumptions": assumptions,
-        "unsupported_failure_modes": sorted(set(unsupported)),
+        "unsupported_failure_modes": unsupported,
         "confidence": confidence,
+    }
+
+
+_COLLISION_PAIR_KEYS = ("collision_pairs", "clearance_pairs")
+_COLLISION_TOLERANCE_KEYS = ("collision_tolerance_m", "clearance_tolerance_m")
+_COLLISION_RULE_KEYS = ("collision_pair_rules", "clearance_pair_rules", "pair_rules")
+
+
+def _first_option(options, keys):
+    for key in keys:
+        if key in options:
+            value = options.get(key)
+            if value is not None:
+                return value
+    return None
+
+
+def _clearance_margin_m(request):
+    profile = request.get("tolerance_profile")
+    if isinstance(profile, Mapping):
+        value = profile.get("clearance_margin_m")
+        if value is None:
+            value = profile.get("clearance_margin")
+    elif hasattr(profile, "clearance_margin_m"):
+        value = getattr(profile, "clearance_margin_m", None)
+    else:
+        value = None
+    if value is None:
+        return None
+    try:
+        if isinstance(value, Mapping):
+            if "unit" in value:
+                return to_si(value.get("value", 0.0), value["unit"], expected_dimension="length")
+            return float(value.get("value", value.get("value_si", 0.0)))
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _with_clearance_margin(request, config):
+    if not isinstance(config, Mapping):
+        return config
+    config = dict(config)
+    if (
+        "tolerance_m" not in config
+        and "tolerance_a_m" not in config
+        and "tolerance_b_m" not in config
+    ):
+        margin = _clearance_margin_m(request)
+        if margin is not None:
+            config["tolerance_m"] = margin
+    return config
+
+
+def _collision_config(request, options):
+    options = options if isinstance(options, Mapping) else {}
+    for key in ("collision", "clearance"):
+        if key not in request:
+            continue
+        raw = request.get(key)
+        if not isinstance(raw, Mapping):
+            return raw
+        config = dict(raw)
+        if config.get("pairs") is None:
+            pairs = _first_option(options, _COLLISION_PAIR_KEYS)
+            if pairs is not None:
+                config["pairs"] = pairs
+        if config.get("tolerance_m") is None:
+            tolerance = _first_option(options, _COLLISION_TOLERANCE_KEYS)
+            if tolerance is not None:
+                config["tolerance_m"] = tolerance
+        if config.get("pair_rules") is None:
+            rules = _first_option(options, _COLLISION_RULE_KEYS)
+            if rules is not None:
+                config["pair_rules"] = rules
+        return _with_clearance_margin(request, config)
+    config = {}
+    for request_key, target in (
+        ("collision_pairs", "pairs"),
+        ("collision_tolerance_m", "tolerance_m"),
+        ("collision_pair_rules", "pair_rules"),
+    ):
+        if request_key in request:
+            config[target] = request[request_key]
+    for option_keys, target in (
+        (_COLLISION_PAIR_KEYS, "pairs"),
+        (_COLLISION_TOLERANCE_KEYS, "tolerance_m"),
+        (_COLLISION_RULE_KEYS, "pair_rules"),
+    ):
+        if config.get(target) is None:
+            value = _first_option(options, option_keys)
+            if value is not None:
+                config[target] = value
+    return _with_clearance_margin(request, config) or None
+
+
+def _collision_pair(spec):
+    if isinstance(spec, Mapping):
+        pair = spec.get("pair")
+        if pair is None and spec.get("a") is not None and spec.get("b") is not None:
+            pair = (spec.get("a"), spec.get("b"))
+        rule = spec.get("pair_rule", spec.get("rule"))
+        if pair is None:
+            return None, rule
+        return pair, rule
+    return spec, None
+
+
+def _collision_rule(config, pair, pair_rule):
+    rule = dict(pair_rule or {})
+    if not isinstance(config, Mapping):
+        return rule
+    configured_rules = config.get("pair_rules")
+    if isinstance(configured_rules, Mapping):
+        names = tuple(sorted((str(pair[0]), str(pair[1]))))
+        configured = configured_rules.get(names)
+        if configured is None:
+            configured = configured_rules.get("{}:{}".format(*names))
+        if configured is None:
+            configured = configured_rules.get("{},{}".format(*names))
+        if isinstance(configured, Mapping):
+            merged = dict(configured)
+            merged.update(rule)
+            rule = merged
+    if "tolerance_m" not in rule and "deformation_allowance_m" not in rule:
+        tolerance = config.get("tolerance_m")
+        if tolerance is not None:
+            try:
+                rule["deformation_allowance_m"] = float(tolerance)
+            except (TypeError, ValueError):
+                pass
+    if "tolerance_a_m" not in rule:
+        tolerance_a = config.get("tolerance_a_m")
+        if tolerance_a is not None:
+            try:
+                rule["tolerance_a_m"] = float(tolerance_a)
+            except (TypeError, ValueError):
+                pass
+    if "tolerance_b_m" not in rule:
+        tolerance_b = config.get("tolerance_b_m")
+        if tolerance_b is not None:
+            try:
+                rule["tolerance_b_m"] = float(tolerance_b)
+            except (TypeError, ValueError):
+                pass
+    return rule or None
+
+
+def _run_collision(request, geometry_objs, result):
+    options = request.get("options")
+    if not isinstance(options, Mapping):
+        options = {}
+    config = _collision_config(request, options)
+    skipped = {
+        "status": "skipped",
+        "configured": False,
+        "reason": "collision pairs are not configured",
+        "pairs": [],
+        "count": 0,
+        "flags": [],
+    }
+    if config is None:
+        return skipped
+    if isinstance(config, Mapping):
+        raw_pairs = config.get("pairs")
+        if not raw_pairs:
+            return skipped
+    else:
+        raw_pairs = config
+    if not isinstance(raw_pairs, (list, tuple)):
+        _pipeline_error(result, "COLLISION_CONFIG_INVALID", "collision pairs must be an array")
+        return {
+            "status": "failed",
+            "configured": True,
+            "reason": "collision pairs must be an array",
+            "pairs": [],
+            "count": 0,
+            "flags": [],
+        }
+    configured = []
+    for spec in raw_pairs:
+        pair, pair_rule = _collision_pair(spec)
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            _pipeline_error(result, "COLLISION_PAIR_INVALID", "collision pair must contain two object ids")
+            continue
+        first, second = (str(pair[0]).strip(), str(pair[1]).strip())
+        if not first or not second or first == second or first not in geometry_objs or second not in geometry_objs:
+            _pipeline_error(result, "COLLISION_PAIR_INVALID", "collision pair references unknown or invalid object ids")
+            continue
+        configured.append((first, second, _collision_rule(config, (first, second), pair_rule)))
+    if not configured:
+        return {
+            "status": "failed",
+            "configured": True,
+            "reason": "no valid collision pairs configured",
+            "pairs": [],
+            "count": 0,
+            "flags": [],
+        }
+    involved = {}
+    pair_rules = {}
+    wanted = set()
+    for first, second, rule in configured:
+        involved[first] = geometry_objs[first]
+        involved[second] = geometry_objs[second]
+        key = tuple(sorted((first, second)))
+        wanted.add(key)
+        if rule:
+            pair_rules[key] = rule
+    try:
+        matrix = collision.pair_clearance_matrix(involved, pair_rules=pair_rules)
+    except (TypeError, ValueError) as exc:
+        _pipeline_error(result, "COLLISION_EVALUATION_FAILED", str(exc))
+        return {
+            "status": "failed",
+            "configured": True,
+            "reason": str(exc),
+            "pairs": [],
+            "count": 0,
+            "flags": [],
+        }
+    records = [
+        record
+        for record in matrix.get("pairs") or ()
+        if tuple(record.get("pair", ())) in wanted
+    ]
+    flags = sorted({flag for record in records for flag in record.get("flags") or ()})
+    return {
+        "status": "evaluated" if not result["errors"] or records else "failed",
+        "configured": True,
+        "reason": None,
+        "object_names": list(matrix.get("object_names") or ()),
+        "units": matrix.get("units", "m"),
+        "pairs": records,
+        "count": len(records),
+        "flags": flags,
     }
 
 
 def _execute(request, mode, options, result):
     units = str(request.get("units") or "m")
     catalog = _material_catalog(request, result)
+    raw_requirements = request.get("requirements")
+    if raw_requirements is None and request.get("requirement") is not None:
+        raw_requirements = [request["requirement"]]
+    result["requirements"] = canonical_value(raw_requirements or [])
     geometry_objs, materials_by_object, density_by_object, overrides, behaviors = _parse_objects(
         request, catalog, result, units
     )
+    result["materials"] = _material_evidence(catalog, materials_by_object, result)
 
     mass_result = mass.mass_properties(geometry_objs, density_by_object, overrides)
     result["mass"] = mass_result.to_dict()
@@ -309,6 +723,8 @@ def _execute(request, mode, options, result):
             "response": response.to_dict(),
         }
 
+    result["collision"] = _run_collision(request, geometry_objs, result)
+
     impact_request = request.get("impact")
     result["impact"] = None
     if impact_request is not None:
@@ -345,7 +761,7 @@ def _execute(request, mode, options, result):
         mode=mode,
         method=request.get("method"),
         geometry=request.get("geometry"),
-        materials=list(catalog.values()) if isinstance(catalog, Mapping) else None,
+        materials=list(materials_by_object.values()) if materials_by_object else None,
         load_case=qual_load_case,
         fixtures=request.get("fixtures"),
         tolerance_profile=request.get("tolerance_profile"),
@@ -357,6 +773,9 @@ def _execute(request, mode, options, result):
         force_balance=bool(request.get("force_balance", False)),
         reviewed_flags=request.get("reviewed_flags"),
         structural_response=structural_response.to_dict() if structural_response is not None else None,
+        impact=result["impact"],
+        requirements=result["requirements"],
+        pipeline_result=result,
     )
     result["qualification"] = qualification_result.to_dict()
 

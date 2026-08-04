@@ -55,6 +55,7 @@ def approved_inputs(**overrides):
         "solver": {"capability_keys": ("static", "nonlinear", "modal")},
         "convergence_evidence": True,
         "force_balance": True,
+        "structural_response": {"validity": "valid"},
     }
     data.update(overrides)
     return data
@@ -167,6 +168,329 @@ class ImpactQualificationTests(unittest.TestCase):
         self.assertFalse(method_supports(method, ("static",)))
         self.assertFalse(method_supports(None, ("static",)))
         self.assertTrue(method_supports({}, ("static",)))
+
+
+class AnalysisValidityIntegrityTests(unittest.TestCase):
+    def test_invalid_structural_response_blocks_qualification(self):
+        result = evaluate_qualification("qualification", **approved_inputs(
+            structural_response={"validity": "failed"},
+        ))
+        self.assertFalse(result.qualified)
+        self.assertEqual(result.evidence_disposition, "qualification_blocked")
+        self.assertIn("ANALYSIS_VALIDITY", result.blocking_keys)
+        gate = {item.key: item for item in result.integrity_gates}["ANALYSIS_VALIDITY"]
+        self.assertFalse(gate.passed)
+        self.assertTrue(gate.blocker)
+        self.assertIn("failed", gate.explanation)
+
+    def test_inconclusive_structural_response_never_reaches_pending_review(self):
+        result = evaluate_qualification("qualification", **approved_inputs(
+            structural_response={"validity": "inconclusive"},
+        ))
+        self.assertEqual(result.evidence_disposition, "qualification_blocked")
+        self.assertIn("ANALYSIS_VALIDITY", result.blocking_keys)
+
+    def test_unsupported_failure_modes_block_even_when_validity_valid(self):
+        result = evaluate_qualification("qualification", **approved_inputs(
+            structural_response={
+                "validity": "valid",
+                "unsupported_failure_modes": ["UNSUPPORTED_BUCKLING"],
+            },
+        ))
+        self.assertEqual(result.evidence_disposition, "qualification_blocked")
+        self.assertIn("ANALYSIS_VALIDITY", result.blocking_keys)
+        gate = {item.key: item for item in result.integrity_gates}["ANALYSIS_VALIDITY"]
+        self.assertIn("UNSUPPORTED_BUCKLING", gate.explanation)
+
+    def test_validation_report_status_fail_blocks(self):
+        result = evaluate_qualification("qualification", **approved_inputs(
+            validation_report={"status": "fail", "findings": ()},
+        ))
+        self.assertEqual(result.evidence_disposition, "qualification_blocked")
+        self.assertIn("ANALYSIS_VALIDITY", result.blocking_keys)
+
+    def test_valid_structural_response_allows_pending_review(self):
+        result = evaluate_qualification("qualification", **approved_inputs(
+            structural_response={"validity": "valid"},
+        ))
+        self.assertEqual(result.evidence_disposition, "qualification_pending_review")
+        self.assertNotIn("ANALYSIS_VALIDITY", result.blocking_keys)
+
+    def test_claimed_evidence_without_structural_response_is_blocked(self):
+        result = evaluate_qualification("qualification", **approved_inputs(structural_response=None))
+        self.assertEqual(result.evidence_disposition, "qualification_blocked")
+        gate = {item.key: item for item in result.integrity_gates}["ANALYSIS_VALIDITY"]
+        self.assertTrue(gate.passed)
+        self.assertTrue(gate.explanation.strip())
+        gate = {item.key: item for item in result.integrity_gates}["CONVERGENCE_EVIDENCE"]
+        self.assertFalse(gate.passed)
+        self.assertIn("cannot be substantiated", gate.explanation)
+
+
+class ImpactIntegrityTests(unittest.TestCase):
+    def test_impact_blocked_result_blocks_qualification(self):
+        result = evaluate_qualification("qualification", **approved_inputs(impact={
+            "result": {
+                "qualification_blocked": True,
+                "validity": "valid",
+                "unsupported_failure_modes": [],
+            },
+            "unsupported_failure_modes": [],
+        }))
+        self.assertEqual(result.evidence_disposition, "qualification_blocked")
+        self.assertIn("IMPACT_VALIDITY", result.blocking_keys)
+        gate = {item.key: item for item in result.integrity_gates}["IMPACT_VALIDITY"]
+        self.assertIn("qualification_blocked", gate.explanation)
+
+    def test_impact_unsupported_modes_block_qualification(self):
+        result = evaluate_qualification("qualification", **approved_inputs(impact={
+            "result": {
+                "qualification_blocked": False,
+                "validity": "valid",
+                "unsupported_failure_modes": ["UNSUPPORTED_SHEAROUT"],
+            },
+            "unsupported_failure_modes": [],
+        }))
+        self.assertEqual(result.evidence_disposition, "qualification_blocked")
+        self.assertIn("IMPACT_VALIDITY", result.blocking_keys)
+
+    def test_impact_section_unsupported_modes_block_qualification(self):
+        result = evaluate_qualification("qualification", **approved_inputs(impact={
+            "result": {
+                "qualification_blocked": False,
+                "validity": "valid",
+                "unsupported_failure_modes": [],
+            },
+            "unsupported_failure_modes": ["UNSUPPORTED_BUCKLING"],
+        }))
+        self.assertEqual(result.evidence_disposition, "qualification_blocked")
+        self.assertIn("IMPACT_VALIDITY", result.blocking_keys)
+
+    def test_impact_missing_result_blocks_qualification(self):
+        result = evaluate_qualification("qualification", **approved_inputs(impact={
+            "result": None,
+            "reason": "no mass available for impact estimate",
+            "unsupported_failure_modes": [],
+        }))
+        self.assertEqual(result.evidence_disposition, "qualification_blocked")
+        self.assertIn("IMPACT_VALIDITY", result.blocking_keys)
+
+    def test_no_impact_requested_is_clean(self):
+        result = evaluate_qualification("qualification", **approved_inputs())
+        gate = {item.key: item for item in result.integrity_gates}["IMPACT_VALIDITY"]
+        self.assertTrue(gate.passed)
+        self.assertNotIn("IMPACT_VALIDITY", result.blocking_keys)
+
+    def test_unblocked_clean_impact_allows_pending_review(self):
+        result = evaluate_qualification("qualification", **approved_inputs(impact={
+            "result": {
+                "qualification_blocked": False,
+                "validity": "valid",
+                "unsupported_failure_modes": [],
+            },
+            "unsupported_failure_modes": [],
+        }))
+        self.assertEqual(result.evidence_disposition, "qualification_pending_review")
+
+
+class CorrelationErrorTests(unittest.TestCase):
+    def _inputs(self, **overrides):
+        data = approved_inputs()
+        data["method"] = dict(data["method"])
+        data["method"]["required_correlation_policy"] = {
+            "required": True,
+            "required_record_types": ("static_correlation",),
+            "require_reviewed_records": True,
+            "maximum_error_fraction": 0.1,
+        }
+        data.update(overrides)
+        return data
+
+    def test_error_fraction_exceeding_maximum_blocks(self):
+        records = (
+            {
+                "record_type": "static_correlation",
+                "review_state": "approved",
+                "comparisons": (
+                    {"metric_key": "deflection", "predicted": 1.0, "measured": 1.5, "relative_error": 0.5},
+                ),
+            },
+        )
+        result = evaluate_qualification("qualification", **self._inputs(correlation_records=records))
+        self.assertEqual(result.evidence_disposition, "qualification_blocked")
+        self.assertIn("CORRELATION_ERROR", result.blocking_keys)
+        gate = {item.key: item for item in result.integrity_gates}["CORRELATION_ERROR"]
+        self.assertIn("0.5", gate.explanation)
+        self.assertIn("0.1", gate.explanation)
+
+    def test_error_fraction_within_maximum_passes(self):
+        records = (
+            {
+                "record_type": "static_correlation",
+                "review_state": "approved",
+                "comparisons": (
+                    {"metric_key": "deflection", "predicted": 1.0, "measured": 1.05, "relative_error": 0.05},
+                ),
+            },
+        )
+        result = evaluate_qualification("qualification", **self._inputs(correlation_records=records))
+        self.assertEqual(result.evidence_disposition, "qualification_pending_review")
+        self.assertNotIn("CORRELATION_ERROR", result.blocking_keys)
+
+    def test_error_fraction_computed_from_measured_and_predicted(self):
+        records = (
+            {
+                "record_type": "static_correlation",
+                "review_state": "approved",
+                "comparisons": (
+                    {"metric_key": "deflection", "predicted": 1.0, "measured": 1.2},
+                ),
+            },
+        )
+        result = evaluate_qualification("qualification", **self._inputs(correlation_records=records))
+        self.assertEqual(result.evidence_disposition, "qualification_blocked")
+        self.assertIn("CORRELATION_ERROR", result.blocking_keys)
+
+    def test_no_maximum_configured_does_not_block(self):
+        result = evaluate_qualification("qualification", **approved_inputs())
+        gate = {item.key: item for item in result.integrity_gates}["CORRELATION_ERROR"]
+        self.assertTrue(gate.passed)
+        self.assertNotIn("CORRELATION_ERROR", result.blocking_keys)
+
+    def test_correlation_not_required_does_not_block(self):
+        data = approved_inputs()
+        data["method"] = dict(data["method"])
+        data["method"]["required_correlation_policy"] = {"required": False}
+        result = evaluate_qualification("qualification", **data)
+        gate = {item.key: item for item in result.integrity_gates}["CORRELATION_ERROR"]
+        self.assertTrue(gate.passed)
+
+
+class RequirementEvaluationTests(unittest.TestCase):
+    def test_structured_target_pass_emits_measured_and_margin(self):
+        requirement = {"status": "active", "target": {"metric": "mass_kg", "max": 0.05}}
+        pipeline_result = {"mass": {"mass_kg": 0.04}}
+        result = evaluate_qualification("qualification", **approved_inputs(
+            requirement=requirement, pipeline_result=pipeline_result,
+        ))
+        self.assertEqual(result.evidence_disposition, "qualification_pending_review")
+        evaluation = result.requirement_evaluations[0]
+        self.assertEqual(evaluation["status"], "pass")
+        target = evaluation["targets"][0]
+        self.assertEqual(target["metric"], "mass_kg")
+        self.assertEqual(target["measured"], 0.04)
+        self.assertEqual(target["max"], 0.05)
+        self.assertAlmostEqual(target["margins"]["max"], 0.01)
+
+    def test_structured_target_failure_blocks(self):
+        requirement = {"status": "active", "target": {"metric": "mass_kg", "max": 0.05}}
+        pipeline_result = {"mass": {"mass_kg": 0.06}}
+        result = evaluate_qualification("qualification", **approved_inputs(
+            requirement=requirement, pipeline_result=pipeline_result,
+        ))
+        self.assertEqual(result.evidence_disposition, "qualification_blocked")
+        self.assertIn("REQUIREMENT_EVALUATION", result.blocking_keys)
+        self.assertEqual(result.requirement_evaluations[0]["status"], "fail")
+
+    def test_min_bound_target(self):
+        requirement = {"status": "active", "target": {"metric": "mass_kg", "min": 0.02}}
+        pipeline_result = {"mass": {"mass_kg": 0.04}}
+        result = evaluate_qualification("qualification", **approved_inputs(
+            requirement=requirement, pipeline_result=pipeline_result,
+        ))
+        self.assertEqual(result.evidence_disposition, "qualification_pending_review")
+        target = result.requirement_evaluations[0]["targets"][0]
+        self.assertEqual(target["status"], "pass")
+        self.assertAlmostEqual(target["margins"]["min"], 0.02)
+
+    def test_unmeasurable_target_blocks(self):
+        requirement = {"status": "active", "target": {"metric": "max_displacement_m", "max": 0.001}}
+        result = evaluate_qualification("qualification", **approved_inputs(
+            requirement=requirement, pipeline_result={"mass": {"mass_kg": 0.04}},
+        ))
+        self.assertEqual(result.evidence_disposition, "qualification_blocked")
+        self.assertIn("REQUIREMENT_EVALUATION", result.blocking_keys)
+        self.assertEqual(result.requirement_evaluations[0]["status"], "not_available")
+
+    def test_max_displacement_metric_resolved_from_structural_response(self):
+        requirement = {"status": "active", "target": {"metric": "max_displacement_m", "max": 0.001}}
+        pipeline_result = {"structural": {"response": {"max_displacement_m": 0.0005}}}
+        result = evaluate_qualification("qualification", **approved_inputs(
+            requirement=requirement, pipeline_result=pipeline_result,
+        ))
+        self.assertEqual(result.evidence_disposition, "qualification_pending_review")
+        self.assertEqual(result.requirement_evaluations[0]["targets"][0]["status"], "pass")
+
+    def test_requirement_without_structured_target_is_not_evaluated(self):
+        result = evaluate_qualification("qualification", **approved_inputs())
+        self.assertEqual(result.evidence_disposition, "qualification_pending_review")
+        self.assertEqual(result.requirement_evaluations[0]["status"], "not_evaluated")
+        self.assertNotIn("REQUIREMENT_EVALUATION", result.blocking_keys)
+
+    def test_requirements_list_is_evaluated(self):
+        requirement = {"status": "active", "target": {"metric": "mass_kg", "max": 0.05}}
+        other = {"status": "active", "acceptance": {"metric_key": "deflection"}}
+        result = evaluate_qualification("qualification", **approved_inputs(
+            requirement=requirement,
+            requirements=[requirement, other],
+            pipeline_result={"mass": {"mass_kg": 0.04}},
+        ))
+        statuses = [item["status"] for item in result.requirement_evaluations]
+        self.assertEqual(statuses, ["pass", "not_evaluated"])
+
+    def test_to_dict_includes_integrity_fields(self):
+        payload = evaluate_qualification("qualification", **approved_inputs()).to_dict()
+        for key in (
+            "integrity_gates",
+            "requirement_evaluations",
+            "convergence_evidence",
+            "force_balance",
+            "structural_validity",
+        ):
+            self.assertIn(key, payload)
+        self.assertEqual(len(payload["integrity_gates"]), 5)
+
+
+class ConvergenceEvidenceTests(unittest.TestCase):
+    def test_convergence_claimed_with_invalid_response_blocks(self):
+        result = evaluate_qualification("qualification", **approved_inputs(
+            convergence_evidence=True, force_balance=True,
+            structural_response={"validity": "failed"},
+        ))
+        self.assertIn("CONVERGENCE_EVIDENCE", result.blocking_keys)
+        gate = {item.key: item for item in result.integrity_gates}["CONVERGENCE_EVIDENCE"]
+        self.assertFalse(gate.passed)
+        self.assertIn("validity", gate.explanation)
+
+    def test_convergence_claimed_with_valid_response_passes(self):
+        result = evaluate_qualification("qualification", **approved_inputs(
+            convergence_evidence=True, force_balance=True,
+            structural_response={"validity": "valid"},
+        ))
+        self.assertEqual(result.evidence_disposition, "qualification_pending_review")
+        gate = {item.key: item for item in result.integrity_gates}["CONVERGENCE_EVIDENCE"]
+        self.assertTrue(gate.passed)
+
+    def test_unclaimed_evidence_is_clean(self):
+        result = evaluate_qualification("qualification", **approved_inputs(
+            convergence_evidence=False, force_balance=False,
+        ))
+        gate = {item.key: item for item in result.integrity_gates}["CONVERGENCE_EVIDENCE"]
+        self.assertTrue(gate.passed)
+        self.assertNotIn("CONVERGENCE_EVIDENCE", result.blocking_keys)
+
+    def test_explicit_evidence_fields_in_result(self):
+        result = evaluate_qualification("qualification", **approved_inputs(
+            convergence_evidence=True, force_balance=True,
+            structural_response={"validity": "valid"},
+        ))
+        self.assertTrue(result.convergence_evidence)
+        self.assertTrue(result.force_balance)
+        self.assertEqual(result.structural_validity, "valid")
+        payload = result.to_dict()
+        self.assertIs(payload["convergence_evidence"], True)
+        self.assertIs(payload["force_balance"], True)
+        self.assertEqual(payload["structural_validity"], "valid")
 
 
 if __name__ == "__main__":

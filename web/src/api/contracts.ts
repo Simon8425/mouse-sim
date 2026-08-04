@@ -332,6 +332,8 @@ export interface ImpactEstimate {
   load_path_stress_pa: number | null;
   safety_factor: number | string;
   qualification_blocked: boolean;
+  contact_model?: string;
+  peak_force_estimate_n?: number | null;
 }
 
 export interface ImpactSection {
@@ -355,6 +357,7 @@ export interface QualificationResult {
   qualified: boolean;
   evidence_disposition: string;
   gates: QualificationGate[];
+  integrity_gates?: QualificationGate[];
   blocking_keys: string[];
   summary: string;
 }

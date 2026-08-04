@@ -11,6 +11,7 @@ import math
 from typing import Any, Mapping, Optional, Tuple
 
 from .model import MaterialDefinition, MaterialProperties
+from .errors import UnitError
 from .units import to_si
 
 SERIES_NOT_CONVERGED = "SERIES_NOT_CONVERGED"
@@ -18,6 +19,18 @@ THIN_SHELL_OUT_OF_RANGE = "THIN_SHELL_OUT_OF_RANGE"
 POINT_LOAD_SINGULARITY = "POINT_LOAD_SINGULARITY"
 UNSUPPORTED_STIFFNESS_REDUCTION = "UNSUPPORTED_STIFFNESS_REDUCTION"
 UNDERCONSTRAINED_REACTIONS = "UNDERCONSTRAINED_REACTIONS"
+INVALID_LOAD_UNITS = "INVALID_LOAD_UNITS"
+INVALID_LOAD_VALUE = "INVALID_LOAD_VALUE"
+INVALID_LOAD_LOCATION = "INVALID_LOAD_LOCATION"
+INVALID_POISSON_RATIO = "INVALID_POISSON_RATIO"
+
+SCREENING_SURROGATE_MODEL_ID = "screening_surrogate_v1"
+_STRUCTURAL_SOLVER_METADATA = {
+    "model_family": "closed_form_screening",
+    "model_id": SCREENING_SURROGATE_MODEL_ID,
+    "backend": "surrogate_closed_form",
+    "description": "closed-form surrogate solver; screening-quality estimates, not validated FEA",
+}
 
 SHELL_PANEL_METHOD = "shell_navier_v1"
 BEAM_METHOD = "beam_closed_form_v1"
@@ -53,7 +66,11 @@ Vector3 = Tuple[float, float, float]
 
 @dataclass(frozen=True)
 class StructuralResponse:
-    """Immutable result of a closed-form structural screening estimate."""
+    """Immutable result of a closed-form structural screening estimate.
+
+    ``solver_metadata`` identifies the model as ``screening_surrogate_v1``:
+    a coarse closed-form screening surrogate, not a validated FEA solver.
+    """
 
     method_id: str
     max_displacement_m: Optional[float] = None
@@ -70,6 +87,7 @@ class StructuralResponse:
     assumptions: Tuple[str, ...] = ()
     unsupported_failure_modes: Tuple[str, ...] = ()
     validity: str = "valid"
+    solver_metadata: Mapping = field(default_factory=lambda: dict(_STRUCTURAL_SOLVER_METADATA))
 
     def to_dict(self):
         location = None if self.max_displacement_location is None else list(self.max_displacement_location)
@@ -90,6 +108,7 @@ class StructuralResponse:
             "assumptions": list(self.assumptions),
             "unsupported_failure_modes": list(self.unsupported_failure_modes),
             "validity": self.validity,
+            "solver_metadata": dict(self.solver_metadata),
         }
 
 
@@ -134,6 +153,13 @@ def _positive(value, label):
     number = _finite(value, label)
     if number <= 0.0:
         raise ValueError("{} must be positive; got {!r}".format(label, value))
+    return number
+
+
+def _poisson(value):
+    number = _finite(value, "nu")
+    if not -1.0 < number < 0.5:
+        raise ValueError("nu must be between -1 and 0.5")
     return number
 
 
@@ -186,11 +212,17 @@ def _material_props(material):
     return E, material.get("poissons_ratio"), material.get("tensile_allowable_pa")
 
 
-def _load_magnitude(load, key):
+def _load_magnitude(load, key, expected_dimension=None):
+    """Read a load magnitude, converting an explicitly unit-annotated value.
+
+    ``expected_dimension`` (e.g. ``"pressure"`` or ``"force"``) is enforced
+    so a force value cannot be silently accepted as a pressure and vice
+    versa; a mismatch raises :class:`mouse_sim.errors.UnitError`.
+    """
     value = load.get(key)
     if isinstance(value, Mapping):
         if "unit" in value:
-            return to_si(value.get("value", 0.0), value["unit"])
+            return to_si(value.get("value", 0.0), value["unit"], expected_dimension)
         value = value.get("value")
     return value
 
@@ -307,7 +339,7 @@ def shell_panel_response(a_m, b_m, t_m, E_pa, nu, pressure_pa, series_order=9, a
     t = _positive(t_m, "t_m")
     E = _positive(E_pa, "E_pa")
     p = _finite(pressure_pa, "pressure_pa")
-    nu = _finite(nu, "nu")
+    nu = _poisson(nu)
     order = max(1, int(series_order))
     if order % 2 == 0:
         order -= 1
@@ -351,9 +383,17 @@ def shell_panel_response(a_m, b_m, t_m, E_pa, nu, pressure_pa, series_order=9, a
 
 
 def _shell_point_load_response(a, b, t, E, nu, force_n, location, allowable_pa=None, series_order=9):
+    a = _positive(a, "a_m")
+    b = _positive(b, "b_m")
+    t = _positive(t, "t_m")
+    E = _positive(E, "E_pa")
+    nu = _poisson(nu)
+    force_n = _finite(force_n, "force_n")
     D = E * t ** 3 / (12.0 * (1.0 - nu * nu))
     x0 = _finite(location[0], "location[0]")
     y0 = _finite(location[1], "location[1]")
+    if not 0.0 <= x0 <= a or not 0.0 <= y0 <= b:
+        raise ValueError("point load location must lie within the shell panel bounds")
     order = max(1, int(series_order))
     if order % 2 == 0:
         order -= 1
@@ -387,6 +427,7 @@ def beam_response(load_type, L_m, E_pa, I_m4, A_m2, nu, force_n=None,
     I = _positive(I_m4, "I_m4")
     A = _positive(A_m2, "A_m2")
     nu = _finite(nu, "nu")
+    Z = _positive(section_modulus_m3, "section_modulus_m3") if section_modulus_m3 is not None else None
     specs = {
         "cantilever_point": ("point", "cantilever"),
         "cantilever_uniform": ("uniform", "cantilever"),
@@ -419,7 +460,7 @@ def beam_response(load_type, L_m, E_pa, I_m4, A_m2, nu, force_n=None,
         formula = "w = q*L^4/(8*E*I), Mmax = q*L^2/2" if cantilever else "w = 5*q*L^4/(384*E*I), Mmax = q*L^2/8"
     if cantilever:
         reactions["M1"] = -moment
-    stress = moment / section_modulus_m3 if section_modulus_m3 else None
+    stress = moment / Z if Z is not None else None
     tau = 1.5 * shear / A
     vm = math.sqrt(stress * stress + 3.0 * tau * tau) if stress is not None else None
     factor, status = _safety(allowable_pa, vm)
@@ -460,29 +501,89 @@ def solve_load_case(load_case_dict, structure_dict, material_dict, fixtures=None
         flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
         assumptions.append("young modulus unavailable; stiffness cannot be computed")
         return _blank_response(flags, assumptions)
+    try:
+        _poisson(nu)
+    except ValueError as exc:
+        flags.append(INVALID_POISSON_RATIO)
+        assumptions.append(str(exc))
+        return _blank_response(flags, assumptions)
     s_type = structure.get("type")
     if s_type not in ("shell_panel", "beam"):
         flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
         assumptions.append("structure_dict must have type shell_panel or beam")
         return _blank_response(flags, assumptions)
+    dims_ok = True
+    if s_type == "shell_panel":
+        a, b, t = _shell_dims(structure)
+        for name, value in (("a_m", a), ("b_m", b), ("t_m", t)):
+            if value is None:
+                flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
+                assumptions.append("shell_panel structure requires {}".format(name))
+                dims_ok = False
+                break
+            try:
+                _positive(value, name)
+            except ValueError as exc:
+                flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
+                assumptions.append(str(exc))
+                dims_ok = False
+                break
+    else:
+        L, I, A, Z = _beam_dims(structure)
+        for name, value in (("L_m", L), ("I_m4", I), ("A_m2", A)):
+            if value is None:
+                flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
+                assumptions.append("beam structure requires {}".format(name))
+                dims_ok = False
+                break
+            try:
+                _positive(value, name)
+            except ValueError as exc:
+                flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
+                assumptions.append(str(exc))
+                dims_ok = False
+                break
+        if dims_ok and Z is not None:
+            try:
+                _positive(Z, "section_modulus_m3")
+            except ValueError as exc:
+                flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
+                assumptions.append(str(exc))
+                dims_ok = False
+    if not dims_ok:
+        return _blank_response(flags, assumptions)
     kind = load.get("kind")
     if kind is None:
         flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
-        return _blank_response(flags, assumptions + ("load_case_dict missing kind",))
+        return _blank_response(flags, assumptions + ["load_case_dict missing kind",])
     if kind == "pressure":
-        p = _load_magnitude(load, "magnitude_pa")
+        try:
+            p = _load_magnitude(load, "magnitude_pa", "pressure")
+        except UnitError as exc:
+            flags.append(INVALID_LOAD_UNITS)
+            return _blank_response(flags, assumptions + [str(exc)])
         if p is None:
             flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
-            return _blank_response(flags, assumptions + ("pressure load requires magnitude_pa",))
+            return _blank_response(flags, assumptions + ["pressure load requires magnitude_pa",])
+        try:
+            p = _finite(p, "pressure_pa")
+        except ValueError as exc:
+            flags.append(INVALID_LOAD_VALUE)
+            return _blank_response(flags, assumptions + [str(exc)])
         if s_type == "shell_panel":
             a, b, t = _shell_dims(structure)
+            if load.get("distribution") == "localized":
+                assumptions.append(
+                    "localized pressure approximated as uniform full-panel pressure;"
+                    " local stress concentrations not resolved"
+                )
             result = shell_panel_response(a, b, t, E, nu, p, allowable_pa=allowable)
         else:
             L, I, A, Z = _beam_dims(structure)
             width = structure.get("width_m")
             if not width:
                 flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
-                return _blank_response(flags, assumptions + ("beam pressure load requires width_m",))
+                return _blank_response(flags, assumptions + ["beam pressure load requires width_m",])
             q = p * _positive(width, "width_m")
             support = structure.get("support", "cantilever")
             beam_type = "cantilever_uniform" if support == "cantilever" else "simply_supported_uniform"
@@ -490,25 +591,68 @@ def solve_load_case(load_case_dict, structure_dict, material_dict, fixtures=None
                                    section_modulus_m3=Z, allowable_pa=allowable)
         return _merged(result, flags, assumptions)
     if kind == "force":
-        F = _load_magnitude(load, "force_n")
+        try:
+            F = _load_magnitude(load, "force_n", "force")
+        except UnitError as exc:
+            flags.append(INVALID_LOAD_UNITS)
+            return _blank_response(flags, assumptions + [str(exc)])
         if F is None:
             flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
-            return _blank_response(flags, assumptions + ("force load requires force_n",))
+            return _blank_response(flags, assumptions + ["force load requires force_n",])
+        try:
+            F = _finite(F, "force_n")
+        except ValueError as exc:
+            flags.append(INVALID_LOAD_VALUE)
+            return _blank_response(flags, assumptions + [str(exc)])
         point = bool(load.get("point_load", False))
         if point:
             flags.append(POINT_LOAD_SINGULARITY)
             assumptions.append("point load singularity: local contact stress not resolved")
         if s_type == "shell_panel":
             a, b, t = _shell_dims(structure)
-            location = load.get("location", (a / 2.0, b / 2.0))
-            result = _shell_point_load_response(a, b, t, E, nu, F, tuple(location),
-                                                allowable_pa=allowable)
+            if point:
+                location = load.get("location", (a / 2.0, b / 2.0))
+                if not isinstance(location, (tuple, list)) or len(location) < 2:
+                    flags.append(INVALID_LOAD_LOCATION)
+                    return _blank_response(
+                        flags,
+                        assumptions + ["point load location must contain x and y coordinates"],
+                    )
+                try:
+                    x0 = _finite(location[0], "location[0]")
+                    y0 = _finite(location[1], "location[1]")
+                except ValueError as exc:
+                    flags.append(INVALID_LOAD_LOCATION)
+                    return _blank_response(flags, assumptions + [str(exc)])
+                if not 0.0 <= x0 <= a or not 0.0 <= y0 <= b:
+                    flags.append(INVALID_LOAD_LOCATION)
+                    return _blank_response(
+                        flags,
+                        assumptions + ["point load location must lie within the shell panel bounds"],
+                    )
+                result = _shell_point_load_response(a, b, t, E, nu, F, tuple(location),
+                                                    allowable_pa=allowable)
+            else:
+                pressure = F / (a * b)
+                assumptions.append(
+                    "force distributed as full-panel uniform pressure: p = F/(a*b) = {:.6g} Pa".format(pressure)
+                )
+                result = shell_panel_response(a, b, t, E, nu, pressure, allowable_pa=allowable)
         else:
             L, I, A, Z = _beam_dims(structure)
             support = structure.get("support", "cantilever")
-            beam_type = "cantilever_point" if support == "cantilever" else "simply_supported_point"
-            result = beam_response(beam_type, L, E, I, A, nu, force_n=F,
-                                   section_modulus_m3=Z, allowable_pa=allowable)
+            if point:
+                beam_type = "cantilever_point" if support == "cantilever" else "simply_supported_point"
+                result = beam_response(beam_type, L, E, I, A, nu, force_n=F,
+                                       section_modulus_m3=Z, allowable_pa=allowable)
+            else:
+                q = F / L
+                assumptions.append(
+                    "force distributed as uniform line load: q = F/L = {:.6g} N/m".format(q)
+                )
+                beam_type = "cantilever_uniform" if support == "cantilever" else "simply_supported_uniform"
+                result = beam_response(beam_type, L, E, I, A, nu, q_n_per_m=q,
+                                       section_modulus_m3=Z, allowable_pa=allowable)
         if point:
             result = replace(result, validity="approximate")
         return _merged(result, flags, assumptions)
@@ -525,7 +669,7 @@ def solve_load_case(load_case_dict, structure_dict, material_dict, fixtures=None
         assumptions.append("torque loads not supported by closed-form surrogate")
         return _blank_response(flags, assumptions, validity="inconclusive")
     flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
-    return _blank_response(flags, assumptions + ("unknown load kind {!r}".format(kind),))
+    return _blank_response(flags, assumptions + ["unknown load kind {!r}".format(kind),])
 
 
 def _merged(result, flags, assumptions):
@@ -553,18 +697,37 @@ def preflight_structural_case(load_case_dict, structure_dict, material_dict, fix
         })
     elif s_type == "shell_panel":
         a, b, t = _shell_dims(structure)
-        if t and a and t / min(a, b) > 0.1:
+        dimensions_valid = True
+        for name, value in (("a_m", a), ("b_m", b), ("t_m", t)):
+            try:
+                _positive(value, name)
+            except (TypeError, ValueError) as exc:
+                dimensions_valid = False
+                issues.append({
+                    "code": "INVALID_STRUCTURE_DIMENSION",
+                    "severity": "error",
+                    "message": str(exc),
+                })
+        if dimensions_valid and t / min(a, b) > 0.1:
             issues.append({
                 "code": THIN_SHELL_OUT_OF_RANGE,
                 "severity": "warning",
                 "message": "panel thickness exceeds 10% of span; thin-plate theory approximate",
             })
-    E, _, _ = _material_props(material)
+    E, nu, _ = _material_props(material)
     if E is None:
         issues.append({
             "code": UNSUPPORTED_STIFFNESS_REDUCTION,
             "severity": "error",
             "message": "young_modulus_pa missing; stiffness cannot be computed",
+        })
+    try:
+        _poisson(nu)
+    except ValueError as exc:
+        issues.append({
+            "code": INVALID_POISSON_RATIO,
+            "severity": "error",
+            "message": str(exc),
         })
     kind = load.get("kind")
     if kind == "pressure" and load.get("magnitude_pa") is None:
@@ -627,6 +790,7 @@ MOUSE_LOAD_TEMPLATES = {
                           "distribution": "localized", "direction": (0, 0, -1)},
         "fixture_assumptions": "panel simply supported on all four edges",
         "acceptance_notes": "localized pressure approaches point-load behavior; check the singularity flag",
+        "limitations": "dispatched as uniform full-panel pressure; localized distribution is not resolved",
     },
 }
 
@@ -635,8 +799,13 @@ __all__ = [
     "BEAM_METHOD",
     "BEAM_UNSUPPORTED_FAILURE_MODES",
     "CLOSED_FORM_METHOD",
+    "INVALID_LOAD_LOCATION",
+    "INVALID_LOAD_VALUE",
+    "INVALID_LOAD_UNITS",
+    "INVALID_POISSON_RATIO",
     "MOUSE_LOAD_TEMPLATES",
     "POINT_LOAD_SINGULARITY",
+    "SCREENING_SURROGATE_MODEL_ID",
     "SERIES_NOT_CONVERGED",
     "SHELL_PANEL_ASSUMPTIONS",
     "SHELL_PANEL_METHOD",

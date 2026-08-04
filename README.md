@@ -9,7 +9,7 @@
 - imports geometry (analytic primitives, OBJ/STL meshes) and computes mass properties;
 - conservatively classifies components and runs DFM-lite validation (wall thickness, geometry health, material approval, PCB clearance, classification);
 - screens loads with closed-form surrogates (Navier thin-plate and Euler-Bernoulli beam) and estimates drop-impact response by energy balance;
-- evaluates a 12-gate qualification readiness model with a hard exploration/qualification separation;
+- evaluates a 17-gate qualification readiness model (12 readiness gates + 5 analysis-integrity gates) with a hard exploration/qualification separation;
 - emits byte-deterministic JSON, HTML, and manifest artifacts plus a digest-verified content-addressed cache.
 
 Every artifact is a pure function of the inputs: no timestamps, no random state — identical inputs produce byte-identical outputs.
@@ -18,7 +18,40 @@ Every artifact is a pure function of the inputs: no timestamps, no random state 
 
 - **Exploration vs. qualification is enforced, not suggested.** Exploration output is always `exploration_only` and unqualified. Qualification output reaches at most `qualification_pending_review`, and only when all gates pass; automatic promotion to accepted evidence is never performed.
 - **No legal certification.** Results are engineering screening estimates (surrogate closed-form and energy methods), not certified FEA, and each analysis section carries an explicit unsupported-failure-mode list.
-- Headless and stdlib-only by design: no UI, no cloud, no STEP/OCCT kernel.
+- Headless and stdlib-only by design: the analysis core has no UI (the optional web console in `web/` is a separate layer), no cloud, no STEP/OCCT kernel.
+
+## Capability boundary — what is and isn't modeled
+
+`mouse_sim` is a **deterministic exploratory screening engine**, not a general-purpose FEA product. Every structural result carries solver metadata identifying it as `screening_surrogate_v1` (`model_family: closed_form_screening`, `backend: surrogate_closed_form`); impact results are `energy_quasi_static_v1`. The metadata description is explicit: *"closed-form surrogate solver; screening-quality estimates, not validated FEA."*
+
+**Modeled (closed-form + energy, always recorded with assumptions):**
+
+- **Mass properties** — analytic primitive/mesh volume × density, measured-mass overrides, centroid and full inertia-tensor aggregation in the project frame.
+- **Structural screening** — Navier simply-supported thin-plate response (`shell_navier_v1`) and elementary Euler-Bernoulli beam response (`beam_closed_form_v1`), linear elastic, small deflection, SI units.
+- **Impact screening** — energy/momentum-balance estimate of peak force, peak acceleration, contact duration, and optional load-path stress, with translation/rotation energy partition when inertia is supplied.
+- **DFM-lite validation** — wall thickness, geometry health, material approval/provenance, classification, and tolerance-aware PCB clearance.
+
+**Not modeled (never hidden — always listed as unsupported failure modes):**
+
+- Plasticity and nonlinear material behavior; explicit (transient) dynamics.
+- Impact-specific hazards: battery crush, PCB/component shock, fracture, delamination, screw pull-out.
+- Shell: buckling, yield localization, crack propagation, snap-through, vibration fatigue. Beam: buckling, fatigue crack, joint failure, torsion buckling.
+
+**Accuracy claims require physical calibration.** No accuracy percentage is claimed for uncalibrated screening output — a "95–98% physical accuracy" statement is only possible after instrumented physical calibration of the model against measured data. Calibration is enforced structurally through correlation records: qualification runs may require correlation, and the `CORRELATION_ERROR` integrity gate fails when any recorded error fraction exceeds the configured `maximum_error_fraction` policy. Until such calibration exists, results are screening estimates labeled `exploration_only` or, at most, `qualification_pending_review`.
+
+### Qualification integrity gates
+
+In addition to the 12 readiness gates (approved method, geometry, materials, pinned load case, reviewed fixtures, tolerance profile, solver capability, convergence, force balance, correlation, active requirement, no blocking issues), qualification runs evaluate five **integrity gates** that hard-block on invalid or unsubstantiated analysis:
+
+| Gate | Meaning |
+|---|---|
+| `ANALYSIS_VALIDITY` | Underlying analysis is valid and complete (no invalid/inconclusive/failed response) |
+| `IMPACT_VALIDITY` | Impact result is not qualification-blocked and carries no unsupported failure modes |
+| `CORRELATION_ERROR` | Correlation error fractions are within the policy `maximum_error_fraction` |
+| `REQUIREMENT_EVALUATION` | Structured requirement targets measure to pass |
+| `CONVERGENCE_EVIDENCE` | Claimed convergence/force-balance evidence is substantiated by a valid response |
+
+**Requirement evaluation semantics:** a requirement is evaluated only when it carries structured targets — `{"metric": ..., "max": ...}` and/or `{"min": ...}` bounds — resolved against pipeline results (`mass_kg`, `max_displacement_m`, `max_stress_pa`, `safety_factor`, `peak_force_n`, or dotted paths). Each structured target is scored `pass` / `fail` / `not_available`; requirements without any structured metric target are reported as `not_evaluated` and do not fail the `REQUIREMENT_EVALUATION` gate (they also never pretend to pass).
 
 ## Quickstart
 
@@ -37,6 +70,32 @@ python3 -S -m mouse_sim import --input part.obj --format obj --units mm --out pa
 ```
 
 `run` writes `reports/report.json`, `reports/report.html`, and `reports/manifest.json`; stdout prints a `mode=... decision=... run_id=...` summary. `python3 -S` runs the package against the standard library only.
+
+### Run the web console
+
+```bash
+# Terminal 1 — backend API + built web dashboard (single process):
+python3 -m mouse_sim serve --project-root . --web-dist web/dist
+
+# Terminal 2 — frontend dev server (hot reload, proxies /api to the backend):
+cd web
+npm run dev
+```
+
+Open `http://127.0.0.1:8000/` (single-process serve) or `http://localhost:5173/` (Vite dev server).
+
+### Run the test suites
+
+```bash
+# Python backend suite (337 tests, stdlib only):
+python3 -m unittest discover -s tests -q
+
+# Frontend unit tests (Vitest, 56 tests):
+cd web && npm test
+
+# End-to-end Playwright matrix (44 tests: Chromium desktop/tablet/mobile + Firefox):
+cd web && npm run e2e
+```
 
 ## CLI reference
 
@@ -77,12 +136,13 @@ Layered and acyclic — foundations never import analysis layers, and each layer
 | | `classification.py` | Name-synonym and topology-based conservative classification |
 | Screening | `collision.py` | AABB clearance with tolerances and pair rules |
 | | `validation.py` | DFM-lite structured findings (thickness, health, PCB, material) |
-| | `qualification.py` | 12-gate readiness model with hard mode separation |
+| | `qualification.py` | 17-gate readiness + integrity model with hard mode separation |
 | Physics | `physics.py` | Navier shell / Euler-Bernoulli beam surrogates, load templates, preflight |
 | | `impact.py` | Energy-based impact estimate, fatigue screening, desk-edge helper |
 | Orchestration | `pipeline.py` | Deterministic run orchestration, run manifests, cache integration |
 | | `cache.py` | Content-addressed artifact cache with digest verification |
 | Output | `reports.py` | Deterministic JSON/HTML/evidence rendering |
+| | `web_api.py` | Deterministic HTTP API server for the web console |
 | | `cli.py` | argparse CLI, exit-code contract |
 
 Data flow: foundations → geometry/mass → materials/classification → collision/validation/qualification → physics/impact → pipeline/cache → reports/cli. The graph is acyclic.
@@ -102,7 +162,7 @@ Data flow: foundations → geometry/mass → materials/classification → collis
 
 - **Mass**: total ≈ **69.6 g** with per-object calculated masses, mass overrides for the screws, and centroid/inertia aggregation.
 - **Structural**: `shell_flex` 5 kPa panel → Navier response (`shell_navier_v1`): max displacement ≈ 0.45 mm, max stress ≈ 2.5 MPa, safety factor ≈ 10.3 vs. ABS allowable (pass), with thin-shell and equilibrium assumptions recorded.
-- **Impact**: 0.75 m free fall, restitution 0.3, contact stiffness 1e5 N/m → energy-based peak force ≈ 320 N, peak acceleration, contact duration, and load-path stress; all five unsupported impact failure modes listed.
+- **Impact**: 0.75 m free fall, restitution 0.3, contact stiffness 1e5 N/m → energy-based peak force ≈ 320 N, peak acceleration, and contact duration (load-path stress is not set here — it requires an explicit `load_path_area_m2`); all five unsupported impact failure modes listed.
 - **Disposition**: exploration → `exploration_only`, decision `not_qualified` (by convention — see `docs/walkthrough.md`), exit 0.
 
 ## Testing
@@ -112,7 +172,10 @@ python3 -S -m compileall -q mouse_sim
 python3 -S -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Full suite: **208 tests, all green** (15 test modules, no third-party dependencies).
+Full suite: **337 tests, all green** (16 test modules, no third-party dependencies).
+
+See [`docs/testing.md`](docs/testing.md) for the test groups, engineering purpose of each group,
+expected validity semantics, and the complete validation command matrix.
 
 ## Roadmap (deferred)
 
@@ -121,9 +184,24 @@ Full suite: **208 tests, all green** (15 test modules, no third-party dependenci
 - Cloud / service deployment
 - STEP/OCCT import kernel (currently rejected with a structured diagnostic)
 
-## Web viewer and analysis console
+## Web console — Mission Control dashboard
 
-`mouse_sim` includes a web-based 3D engineering console in the `web/` directory built with React 18, TypeScript, and Three.js. It connects to the Python API (`mouse_sim/web_api.py`) to deliver interactive model navigation, physical property inspection, and real-time visualization of analysis findings and structural overlays.
+`mouse_sim` includes a web-based 3D engineering console in the `web/` directory built with React 18, TypeScript, and Three.js. It acts as a **Mission Control dashboard**: a centralized control panel that combines **system monitoring** (engine/API versions, cache status, supported formats, health) with a **study launcher** (load the server-owned baseline project, upload a part, or run an analysis) in one screen. It connects to the Python API (`mouse_sim/web_api.py`) to deliver interactive model navigation, physical property inspection, and real-time visualization of analysis findings and structural overlays.
+
+### Baseline boot flow
+
+On startup the dashboard calls `GET /api/projects/baseline`, which returns the server-owned baseline project (`examples/mouse_baseline.json` under `--project-root`) as a `gms.web-baseline/1` envelope. The workspace boots from that server-owned project; the request is aborted on unmount so stale source data can never commit.
+
+### Upload lifecycle
+
+1. The user drops a geometry file; parsing runs in a **Web Worker** (`geometry.worker.ts`) off the UI thread — OBJ/STL text/binary parsing with unit conversion, triangulation, and bounded warning collection.
+2. The parsed preview is posted to `POST /api/geometry/normalize?format=...&units=...`, which runs the Python importer and returns a `gms.geometry-preview/1` envelope.
+3. Unsupported formats and parse failures return **422 envelopes with diagnostics** (e.g. `E_INVALID_FORMAT`, `invalid_units`, `parse_failed`); the client deliberately accepts 422 as a valid envelope carrying the preview error diagnostics, so the failure is shown in the dashboard instead of being swallowed as a transport error.
+
+### Scene hardening
+
+- **Geometry guards** (`scene/geometryFactory.ts`): runtime validation stricter than the public TypeScript contract — every vertex must be finite and float32-representable, triangle indices must be integers within bounds, dimensions must be non-negative/positive, and transforms finite — so malformed API payloads can never poison Three.js buffers.
+- **Overlay scaling** (`scene/overlays.ts`): overlay geometry (load arrows, fixture octahedra, displacement pins, contact plane) is scaled from a guarded plane radius that is re-derived from the current model bounds; non-finite or degenerate radii fall back to a safe default, and radius changes re-apply the overlay spec.
 
 ### Dev quick start
 
@@ -156,14 +234,14 @@ Open `http://127.0.0.1:8898/` in your browser.
 
 | Option | Description | Default / Environment Override |
 |---|---|---|
-| `--host HOST` | Bind host IP address | `127.0.0.1` (`GMS_WEB_HOST`) |
-| `--port PORT` | Bind port number | `8000` (`GMS_WEB_PORT`) |
-| `--web-dist PATH` | Path to built SPA dist directory | `None` (`GMS_WEB_DIST`) |
-| `--project-root PATH` | Base directory for file resolution | Current working directory |
-| `--cache-dir PATH` | Cache storage directory | `.web-cache` |
-| `--cors-origin ORIGIN` | Allowed CORS origins (exact matches only) | `*` in dev, exact in prod |
-| `--max-json-bytes BYTES` | Max payload size for JSON requests | `8388608` (8 MiB) |
-| `--max-geometry-bytes BYTES` | Max upload size for geometry files | `67108864` (64 MiB) |
+| `--host HOST` | Bind host IP address | `127.0.0.1` |
+| `--port PORT` | Bind port number | `8000` |
+| `--web-dist PATH` | Path to built SPA dist directory | `None` (API only) |
+| `--project-root PATH` | Base directory for file resolution | `None` — package parent directory (repo root when run from checkout) |
+| `--cache-dir PATH` | Cache storage directory | `None` (cache disabled) |
+| `--cors-origin ORIGIN` | Allowed CORS origins (exact matches only, repeatable) | None sent; dev relies on the Vite `/api` proxy |
+| `--max-json-bytes BYTES` | Max payload size for JSON requests | `8388608` (8 MiB) (`MOUSE_SIM_MAX_JSON_BYTES`) |
+| `--max-geometry-bytes BYTES` | Max upload size for geometry files | `67108864` (64 MiB) (`MOUSE_SIM_MAX_GEOMETRY_BYTES`) |
 | `--quiet` | Suppress HTTP access logging | `false` |
 
 ### Web API routes
@@ -171,7 +249,7 @@ Open `http://127.0.0.1:8898/` in your browser.
 | Endpoint | Method | Schema / Response | Description |
 |---|---|---|---|
 | `/api/health` | GET | `gms.web-health/1` | Server status, version, format capabilities, cache status |
-| `/api/baseline` | GET | `gms.web-baseline/1` | Bundled baseline project request |
+| `/api/projects/baseline` | GET | `gms.web-baseline/1` | Bundled baseline project request |
 | `/api/materials` | GET | `gms.web-material-catalog/1` | Material catalog with density, modulus, and approval state |
 | `/api/geometry/normalize` | POST | `gms.geometry-preview/1` | Normalizes uploaded OBJ/STL/JSON geometry; returns 422 for unsupported formats |
 | `/api/analyze` | POST | `gms.web-analysis-response/1` | Executes pipeline over `gms.web-analysis-request/1`; returns full result payload |
@@ -192,18 +270,18 @@ Open `http://127.0.0.1:8898/` in your browser.
 ### Verification commands
 
 ```bash
-# Python Web API integration test suite (233 tests):
+# Full Python test suite (337 tests, including 27 web-API integration tests):
 python3 -B -S -m unittest discover -s tests -p 'test_*.py'
 
 # Web frontend typecheck, lint, unit tests, and build:
 cd web
 npm run typecheck
 npm run lint
-npm test -- --run
+npm test -- --run        # 56 unit tests, 12 files
 npm run build
 
-# End-to-end Playwright test suite (Chromium, Firefox, Mobile):
+# End-to-end Playwright matrix (44 tests across Chromium desktop, Chromium
+# tablet, Chromium mobile, and Firefox desktop projects):
 npx playwright install chromium
 npm run e2e
 ```
-

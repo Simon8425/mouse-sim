@@ -32,6 +32,22 @@ export function useDetectedQuality(): QualityTier {
   return tier;
 }
 
+function releaseWebGLProbe(gl: WebGLRenderingContext | WebGL2RenderingContext): void {
+  try {
+    gl.getExtension('WEBGL_lose_context')?.loseContext();
+  } catch {
+    // Some browsers expose the probe extension but reject context loss while
+    // the canvas is detached. There is no additional portable disposal API.
+  }
+}
+
+function webGLFailureReason(error: unknown): string {
+  if (error instanceof Error && error.message) {
+    return `WebGL initialization failed: ${error.message}`;
+  }
+  return 'WebGL is not available in this browser';
+}
+
 export const SceneViewport = React.forwardRef<
   SceneViewportHandle,
   SceneViewportProps
@@ -47,23 +63,39 @@ export const SceneViewport = React.forwardRef<
     if (!canvas) return;
 
     const probeCanvas = document.createElement('canvas');
-    const gl =
-      probeCanvas.getContext('webgl2') ||
-      probeCanvas.getContext('webgl') ||
-      probeCanvas.getContext('experimental-webgl');
+    let gl: WebGLRenderingContext | WebGL2RenderingContext | null = null;
+    try {
+      const context =
+        probeCanvas.getContext('webgl2') ||
+        probeCanvas.getContext('webgl') ||
+        probeCanvas.getContext('experimental-webgl');
+      if (context && typeof (context as WebGLRenderingContext).getExtension === 'function') {
+        gl = context as WebGLRenderingContext | WebGL2RenderingContext;
+      }
+    } catch {
+      gl = null;
+    }
 
     if (!gl) {
       propsRef.current.onWebGLUnsupported?.('WebGL is not available in this browser');
       return;
     }
 
-    const runtime = createSceneRuntime({
-      canvas,
-      theme: propsRef.current.theme,
-      quality: propsRef.current.quality,
-      onPick: (id) => propsRef.current.onPick(id),
-      onStats: (stats) => propsRef.current.onStats?.(stats),
-    });
+    releaseWebGLProbe(gl);
+
+    let runtime: SceneRuntime;
+    try {
+      runtime = createSceneRuntime({
+        canvas,
+        theme: propsRef.current.theme,
+        quality: propsRef.current.quality,
+        onPick: (id) => propsRef.current.onPick(id),
+        onStats: (stats) => propsRef.current.onStats?.(stats),
+      });
+    } catch (error: unknown) {
+      propsRef.current.onWebGLUnsupported?.(webGLFailureReason(error));
+      return;
+    }
 
     runtimeRef.current = runtime;
 
@@ -75,7 +107,7 @@ export const SceneViewport = React.forwardRef<
 
     return () => {
       runtime.dispose();
-      runtimeRef.current = null;
+      if (runtimeRef.current === runtime) runtimeRef.current = null;
     };
   }, []);
 

@@ -26,7 +26,9 @@ export function ViewportToolbar({ viewport, stats }: ViewportToolbarProps) {
 
   return (
     <div className="viewport-toolbar" role="toolbar" aria-label="Viewport controls">
+      <span className="viewport-toolbar__heading">Viewport HUD</span>
       <div className="viewport-toolbar__group" role="group" aria-label="Camera preset">
+        <span className="viewport-toolbar__group-label">Camera</span>
         {presetButtons.map(({ label, preset }) => (
           <button
             key={preset}
@@ -61,7 +63,7 @@ export function ViewportToolbar({ viewport, stats }: ViewportToolbarProps) {
           className="display-only-label"
           title="Display-only offsets; never included in analysis"
         >
-          DISPLAY ONLY
+          Display only
         </span>
       </div>
 
@@ -92,26 +94,24 @@ export function ViewportToolbar({ viewport, stats }: ViewportToolbarProps) {
       </details>
 
       <span className="quality-tier">
-        Tier: {state.qualityTier ?? 'auto'}
+        Quality: {state.qualityTier ?? 'auto'}
       </span>
 
-      {import.meta.env.DEV && stats && (
-        <details className="viewport-toolbar__stats">
-          <summary>Renderer</summary>
-          <dl>
-            <dt>Draw calls</dt>
-            <dd>{stats.drawCalls}</dd>
-            <dt>Triangles</dt>
-            <dd>{stats.triangles}</dd>
-            <dt>Geometries</dt>
-            <dd>{stats.geometries}</dd>
-            <dt>Textures</dt>
-            <dd>{stats.textures}</dd>
-            <dt>Tier</dt>
-            <dd>{stats.tier}</dd>
-          </dl>
-        </details>
-      )}
+      <details className="viewport-toolbar__stats">
+        <summary>Telemetry</summary>
+        <dl>
+          <dt>Draw calls</dt>
+          <dd>{stats?.drawCalls ?? '—'}</dd>
+          <dt>Triangles</dt>
+          <dd>{stats?.triangles ?? '—'}</dd>
+          <dt>Geometries</dt>
+          <dd>{stats?.geometries ?? '—'}</dd>
+          <dt>Textures</dt>
+          <dd>{stats?.textures ?? '—'}</dd>
+          <dt>Render tier</dt>
+          <dd>{stats?.tier ?? state.qualityTier ?? 'auto'}</dd>
+        </dl>
+      </details>
     </div>
   );
 }

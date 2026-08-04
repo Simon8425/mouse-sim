@@ -166,5 +166,37 @@ class RunValidationTests(unittest.TestCase):
         self.assertTrue(any(item.code == "GEOMETRY_OPEN_MESH" and item.evidence_blocking for item in report.findings))
 
 
+    def test_strict_promotes_warnings_to_fail(self):
+        geometry = {"case": Box((0.05, 0.03, 0.01))}
+        classifications = {"case": {"component_type": "solid", "structural_behavior": "solid"}}
+        options = {
+            "min_thickness_m": 0.001,
+            "max_thickness_m": 0.05,
+            "repair_records": {"case": [{"operation": "stitch", "reviewed": False}]},
+        }
+        lax = run_validation(geometry, {}, classifications, options)
+        self.assertEqual((lax.status, lax.validity_state), ("warn", "approximate"))
+        warning = next(item for item in lax.findings if item.code == "GEOMETRY_REPAIRS_UNREVIEWED")
+        self.assertEqual(warning.severity, "warning")
+        self.assertFalse(warning.evidence_blocking)
+
+        strict = run_validation(geometry, {}, classifications, dict(options, strict=True))
+        self.assertEqual((strict.status, strict.validity_state), ("fail", "failed"))
+        self.assertFalse(any(item.severity == "warning" for item in strict.findings))
+        promoted = next(item for item in strict.findings if item.code == "GEOMETRY_REPAIRS_UNREVIEWED")
+        self.assertEqual(promoted.severity, "error")
+        self.assertTrue(promoted.evidence_blocking)
+
+    def test_strict_clean_inputs_still_pass(self):
+        report = run_validation(
+            {"case": Box((0.05, 0.03, 0.01))},
+            {"case": {"approval_state": "approved", "provenance": {"confidence": "high"}, "properties": {"density": 1040, "young_modulus": 2.3e9}}},
+            {"case": {"component_type": "solid", "structural_behavior": "solid"}},
+            {"min_thickness_m": 0.001, "max_thickness_m": 0.05, "strict": True},
+        )
+        self.assertEqual(report.status, "pass")
+        self.assertEqual(report.validity_state, "valid")
+
+
 if __name__ == "__main__":
     unittest.main()

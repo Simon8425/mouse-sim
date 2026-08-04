@@ -22,11 +22,14 @@ export async function expectNoConsoleErrors(page: Page, errors: string[]): Promi
   expect(errors).toEqual([]);
 }
 
-/** Loads a model by uploading the analytic JSON fixture through the guide card. */
+/** Waits for baseline boot, then replaces it with the analytic fixture. */
 export async function modelLoaded(page: Page): Promise<void> {
   await page.goto('/');
-  await expect(page.getByRole('heading', { name: /mouse_sim/ })).toBeVisible({ timeout: 15_000 });
-  await page.getByRole('button', { name: 'Choose geometry file' }).click();
+  // The project heading is intentionally hidden by the compact mobile layout;
+  // presence confirms the app booted without requiring a desktop-only element.
+  await expect(page.getByRole('heading', { name: /mouse_sim/ })).toHaveCount(1, { timeout: 15_000 });
+  await expect(page.locator('.model-row').first()).toHaveCount(1, { timeout: 15_000 });
+  await page.getByRole('button', { name: 'Upload geometry' }).click();
   await page.locator('input[type="file"]').setInputFiles(fixturePath('analytic.json'));
   await expect(page.locator('.model-row')).toHaveCount(1, { timeout: 15_000 });
 }

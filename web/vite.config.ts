@@ -12,7 +12,16 @@ export default defineConfig({
     port: 5199,
     proxy: { '/api': { target: 'http://127.0.0.1:8899', changeOrigin: false } },
   },
-  build: { target: 'es2020' },
+  build: {
+    target: 'es2020',
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          three: ['three'],
+        },
+      },
+    },
+  },
   test: {
     environment: 'jsdom',
     globals: true,

@@ -17,8 +17,9 @@ Built bottom-up so each layer rests on verified foundations:
 3. **Materials** — `materials.py`: builtin catalog (ABS, PC/ABS, FR4, LiPo, POM, PTFE, steel),
   tolerant JSON catalog loading, assignment resolution, approval/provenance helpers.
 4. **Collision / validation / qualification** — `collision.py` (AABB clearance, tolerances, pair
-  rules), `validation.py` (DFM-lite findings), `qualification.py` (12-gate readiness model, hard
-  exploration/qualification separation).
+  rules), `validation.py` (DFM-lite findings), `qualification.py` (17-gate readiness model — 12
+  readiness gates plus 5 analysis-integrity gates — with hard exploration/qualification
+  separation).
 5. **Physics & impact** — `physics.py` (Navier shell, Euler-Bernoulli beam, load templates,
   preflight, solver capabilities), `impact.py` (energy-based estimate, Miner fatigue screening,
   desk-edge helper).
@@ -68,8 +69,10 @@ artifacts.
 - `validation.py` — `run_validation`, `ValidationReport`, `ValidationFinding`,
   `check_wall_thickness`, `check_geometry_health`, `check_material`, `check_classification`,
   `check_pcb_clearance`
-- `qualification.py` — `evaluate_qualification`, `GATE_SPECS` (12 gates), `QualificationResult`,
-  `QualificationGate`, `impact_qualification_status`, `method_supports`
+- `qualification.py` — `evaluate_qualification`, `GATE_SPECS` (17 gates: 12 readiness + 5
+  integrity `ANALYSIS_VALIDITY`/`IMPACT_VALIDITY`/`CORRELATION_ERROR`/`REQUIREMENT_EVALUATION`/
+  `CONVERGENCE_EVIDENCE`), `QualificationResult`, `QualificationGate`, `impact_qualification_status`,
+  `method_supports`
 - `physics.py` — `solve_load_case`, `shell_panel_response`, `beam_response`,
   `preflight_structural_case`, `MOUSE_LOAD_TEMPLATES`, `SOLVER_CAPABILITIES`, `StructuralResponse`
 - `impact.py` — `estimate_impact`, `ImpactResult`, `desk_edge_impact`, `repeat_impact_cycles`,
@@ -131,8 +134,8 @@ python3 -S -m compileall -q mouse_sim      # clean, exit 0
 python3 -S -m unittest discover -s tests -p 'test_*.py'
 ```
 
-- **Suite**: **208 tests, all green** (15 test modules). Progression across passes: 157 → 166
-  (numerical) → 202 (core) → 208 (e2e, +6 regression tests).
+- **Suite**: **337 tests, all green** (16 test modules). Progression across passes: 157 → 166
+  (numerical) → 202 (core) → 208 (e2e) → current 337 with the web console and integrity gates.
 - **E2E determinism**: consecutive runs produce byte-identical `report.json` / `report.html` (`cmp`
   clean); no timestamps anywhere.
 - **Cache reuse**: a second run with the same `--cache-dir` returns the same `run_id` from the
@@ -152,6 +155,12 @@ python3 -S -m unittest discover -s tests -p 'test_*.py'
 - **Impact energy method blocked for qualification**: impact results carry
   `qualification_blocked=True`; `impact_qualification_status` requires an approved method plus
   validated evidence.
+- **Integrity gates hard-block invalid evidence**: the five integrity gates
+  (`ANALYSIS_VALIDITY`, `IMPACT_VALIDITY`, `CORRELATION_ERROR`, `REQUIREMENT_EVALUATION`,
+  `CONVERGENCE_EVIDENCE`) block qualification on invalid/unsupported analysis, correlation error
+  fractions beyond `maximum_error_fraction`, failing or unmeasurable structured requirement
+  targets, and unsubstantiated convergence/force-balance claims. Requirements without structured
+  targets evaluate to `not_evaluated` and never pretend to pass.
 - **STEP/OCCT and UI deferred**: STEP/STP input is rejected with a structured `unsupported_format`
   diagnostic; there is no geometry viewer or other UI; no cloud deployment.
 - **Point loads flagged**: point loads set `POINT_LOAD_SINGULARITY` and mark the response
@@ -160,4 +169,3 @@ python3 -S -m unittest discover -s tests -p 'test_*.py'
   of `_build_manifest`.
 - Closed-form surrogates remain screening tools; real FEM, explicit dynamics, and topology
   optimization are roadmap items, not MVP claims.
-

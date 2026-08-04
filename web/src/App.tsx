@@ -8,6 +8,7 @@ import {
 } from './state/selectors';
 import { createClient } from './api/client';
 import { errorMessage, isAbortError } from './api/errors';
+import { loadBaseline } from './lib/boot';
 import { isRecord, type Vec3 } from './api/contracts';
 import { TopBar } from './components/TopBar';
 import { ModelTree } from './components/ModelTree';
@@ -17,6 +18,7 @@ import { FileDropzone } from './components/FileDropzone';
 import { GeometryGuideCard } from './components/GeometryGuideCard';
 import { ViewportToolbar } from './components/ViewportToolbar';
 import { WebGLFallback } from './components/WebGLFallback';
+import { MissionControl } from './components/MissionControl';
 import {
   SceneViewport,
   useDetectedQuality,
@@ -42,20 +44,20 @@ export function App(): React.ReactElement {
   const [stats, setStats] = React.useState<RenderStats | null>(null);
   const [uploadOpen, setUploadOpen] = React.useState(false);
 
-  // Restore the persisted theme once on mount, then keep it in sync.
-  const [initialTheme] = React.useState<'light' | 'dark'>(() => {
-    const saved = window.localStorage.getItem('mouse-sim-theme');
-    return saved === 'dark' || saved === 'light' ? saved : 'light';
-  });
-
+  // Theme is locked to neutral dark (#141414).
   React.useEffect(() => {
-    dispatch({ type: 'SET_THEME', theme: initialTheme });
-  }, [initialTheme, dispatch]);
+    dispatch({ type: 'SET_THEME', theme: 'dark' });
+    document.documentElement.dataset.theme = 'dark';
+    window.localStorage.setItem('mouse-sim-theme', 'dark');
+  }, [dispatch]);
 
+  // Boot the workspace from the server-owned baseline project. Abort the
+  // request on unmount so StrictMode remounts cannot commit stale source data.
   React.useEffect(() => {
-    document.documentElement.dataset.theme = state.theme;
-    window.localStorage.setItem('mouse-sim-theme', state.theme);
-  }, [state.theme]);
+    const controller = new AbortController();
+    void loadBaseline(clientRef.current, dispatch, controller.signal);
+    return () => controller.abort();
+  }, [dispatch]);
 
   // Server health check on mount.
   React.useEffect(() => {
@@ -100,10 +102,13 @@ export function App(): React.ReactElement {
   const abortRef = React.useRef<AbortController | null>(null);
   const debounceRef = React.useRef<number | null>(null);
   const analysisRequest = selectAnalysisRequest(state);
+  const analysisRequestRef = React.useRef(analysisRequest);
+  analysisRequestRef.current = analysisRequest;
   const requestKey = JSON.stringify(analysisRequest ?? null);
 
   React.useEffect(() => {
-    if (!analysisRequest) return;
+    const request = analysisRequestRef.current;
+    if (!request) return;
     if (debounceRef.current !== null) window.clearTimeout(debounceRef.current);
     debounceRef.current = window.setTimeout(() => {
       const token = ++tokenRef.current;
@@ -115,7 +120,7 @@ export function App(): React.ReactElement {
         .analyze(
           {
             schema_id: 'gms.web-analysis-request/1',
-            request: analysisRequest,
+            request,
             options: { strict: false, use_cache: true },
           },
           controller.signal,
@@ -128,12 +133,15 @@ export function App(): React.ReactElement {
     }, 400);
     return () => {
       if (debounceRef.current !== null) window.clearTimeout(debounceRef.current);
+      abortRef.current?.abort();
     };
-  }, [requestKey, state.mode, dispatch]);
+  }, [requestKey, state.mode, state.runNonce, dispatch]);
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   const entries = React.useMemo(
     () => selectObjectEntries(state),
+    // The selector only reads these four geometry sources. Avoid rebuilding
+    // scene entries when render stats or unrelated UI state changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [state.project, state.preview, state.tempPreview, state.draft],
   );
 
@@ -144,6 +152,9 @@ export function App(): React.ReactElement {
   const shownEntries = state.isolatedId
     ? visibleEntries.filter((entry) => entry.id === state.isolatedId)
     : visibleEntries;
+  const lastResult = state.lastResult;
+  const findingSeveritiesRef = React.useRef(selectFindingSeverities(state));
+  findingSeveritiesRef.current = selectFindingSeverities(state);
 
   // Display overlays derived from the last result, the current request,
   // and the entries actually shown in the scene.
@@ -158,7 +169,7 @@ export function App(): React.ReactElement {
       selectionAnchor: null,
     };
 
-    const result = state.lastResult;
+    const result = lastResult;
     if (result) {
       const response = result.structural?.response;
       if (response) {
@@ -204,7 +215,7 @@ export function App(): React.ReactElement {
     }
 
     // Severity markers from validation findings.
-    const severities = selectFindingSeverities(state);
+    const severities = findingSeveritiesRef.current;
     const markers: { id: string; location: Vec3; severity: string }[] = [];
     for (const entry of shownEntries) {
       const severity = severities.get(entry.id);
@@ -216,18 +227,18 @@ export function App(): React.ReactElement {
         severity,
       });
     }
+    spec.severityMarkers = markers.length > 0 ? markers : null;
     return spec;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.lastResult, analysisRequest, shownEntries]);
+  }, [lastResult, analysisRequest, shownEntries]);
 
   return (
     <div className="app" data-theme={state.theme}>
       <TopBar
         onOpenNav={() => dispatch({ type: 'SET_NAV_OPEN', open: !state.navOpen })}
         onOpenInspector={() => dispatch({ type: 'SET_INSPECTOR_OPEN', open: !state.inspectorOpen })}
+        onOpenControl={() => dispatch({ type: 'SET_CONTROL_OPEN', open: !state.controlOpen })}
         onFit={() => viewportRef.current?.fit()}
       />
-      {state.webglError ? <WebGLFallback reason={state.webglError} /> : null}
       <div className="workspace">
         <aside
           className={`drawer drawer--nav${state.navOpen ? ' is-open' : ''}`}
@@ -279,6 +290,15 @@ export function App(): React.ReactElement {
         </aside>
       </div>
       <ResultsRail />
+      {state.controlOpen ? (
+        <MissionControl
+          onClose={() => dispatch({ type: 'SET_CONTROL_OPEN', open: false })}
+          onUpload={() => {
+            dispatch({ type: 'SET_CONTROL_OPEN', open: false });
+            setUploadOpen(true);
+          }}
+        />
+      ) : null}
     </div>
   );
 }

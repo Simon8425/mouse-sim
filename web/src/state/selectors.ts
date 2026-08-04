@@ -9,6 +9,7 @@ import {
   createAnalysisRequest,
   computeObjectEntries,
 } from './projectStore';
+import { isRecord } from '../api/contracts';
 
 const SEVERITY_RANK: Record<string, number> = {
   blocker: 0,
@@ -134,4 +135,28 @@ export function selectRunStatusLabel(state: ProjectState): {
     default:
       return { text: 'Idle', live: false };
   }
+}
+
+export function selectEvidenceCount(state: ProjectState): number {
+  const qualification = state.lastResult?.qualification;
+  if (!qualification) return 0;
+  return qualification.gates.length + (qualification.integrity_gates?.length ?? 0);
+}
+
+export function selectSolverModelBadge(state: ProjectState): string | null {
+  const result = state.lastResult;
+  if (!result) return null;
+  const metadata: unknown[] = [];
+  if (result.impact?.result && isRecord(result.impact.result)) {
+    metadata.push(result.impact.result.solver_metadata);
+  }
+  if (result.structural?.response && isRecord(result.structural.response)) {
+    metadata.push(result.structural.response.solver_metadata);
+  }
+  for (const meta of metadata) {
+    if (isRecord(meta) && typeof meta.model_id === 'string' && meta.model_id.trim() !== '') {
+      return meta.model_id;
+    }
+  }
+  return null;
 }

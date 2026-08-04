@@ -5,10 +5,12 @@ export interface WebGLFallbackProps {
 export function WebGLFallback({ reason }: WebGLFallbackProps) {
   return (
     <div className="webgl-fallback" role="alert">
-      <h3>3D Viewport Unavailable</h3>
+      <span className="webgl-fallback__kicker">Display capability / WebGL</span>
+      <h3>3D viewport unavailable</h3>
       <p>{reason}</p>
       <p className="muted">
-        The analysis API and results rail remain fully operational. Try using a browser with WebGL 2.0 support.
+        WebGL is unavailable in this browser. The analysis service and results remain available; use a
+        browser with WebGL 2.0 support to restore the viewport.
       </p>
     </div>
   );

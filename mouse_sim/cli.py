@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 
 from .cache import ArtifactCache
@@ -117,9 +118,12 @@ def _cmd_run(args):
         return EXIT_INTERNAL
     request = dict(document)
     request["mode"] = mode
-    request["options"] = {"strict": bool(args.strict)}
+    document_options = document.get("options")
+    options = dict(document_options) if isinstance(document_options, Mapping) else {}
+    options["strict"] = bool(options.get("strict", False) or args.strict)
     if args.cache_dir:
-        request["options"]["cache_dir"] = args.cache_dir
+        options["cache_dir"] = args.cache_dir
+    request["options"] = options
     cache = ArtifactCache(args.cache_dir) if args.cache_dir else None
     try:
         bundle = run_pipeline(request, cache=cache, use_cache=not args.no_cache)
@@ -271,10 +275,17 @@ def _cmd_validate(args):
         _emit_error(error_format, "E_INTERNAL", "pipeline returned a non-object result")
         return EXIT_INTERNAL
     validation = bundle.get("validation") if isinstance(bundle.get("validation"), dict) else {}
-    issues = bundle.get("issues") or []
-    if not isinstance(issues, (list, tuple)):
-        issues = []
-    valid = bool(validation.get("valid", not issues))
+    pipeline_issues = bundle.get("issues") or []
+    pipeline_errors = bundle.get("errors") or []
+    validation_findings = validation.get("findings") or []
+    if not isinstance(pipeline_issues, (list, tuple)):
+        pipeline_issues = []
+    if not isinstance(pipeline_errors, (list, tuple)):
+        pipeline_errors = []
+    if not isinstance(validation_findings, (list, tuple)):
+        validation_findings = []
+    issues = list(validation_findings) + list(pipeline_issues) + list(pipeline_errors)
+    valid = validation["status"] != "fail" and not pipeline_issues and not pipeline_errors
     sys.stdout.write(
         canonical_json(
             {"schema": "gms.validation/1", "valid": valid, "issues": list(issues), "validation": validation}

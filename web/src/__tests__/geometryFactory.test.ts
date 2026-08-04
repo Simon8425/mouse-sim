@@ -139,6 +139,54 @@ describe('geometryFactory Three.js integration and parity', () => {
     expect(geom.getAttribute('normal')).toBeDefined();
   });
 
+  it('skips empty, non-finite, and out-of-range mesh buffers safely', () => {
+    const emptyMesh: MeshGeometryJson = {
+      type: 'mesh',
+      vertices: [],
+      triangles: [],
+      units: 'm',
+      transform: IDENTITY_TRANSFORM,
+    };
+    const nonFiniteMesh: MeshGeometryJson = {
+      type: 'mesh',
+      vertices: [[0, 0, Number.NaN], [1, 0, 0], [0, 1, 0]],
+      triangles: [[0, 1, 2]],
+      units: 'm',
+      transform: IDENTITY_TRANSFORM,
+    };
+    const outOfRangeMesh: MeshGeometryJson = {
+      type: 'mesh',
+      vertices: [[0, 0, 0], [1, 0, 0], [0, 1, 0]],
+      triangles: [[0, 1, 3]],
+      units: 'm',
+      transform: IDENTITY_TRANSFORM,
+    };
+
+    for (const [id, geometry] of [
+      ['empty', emptyMesh],
+      ['non-finite', nonFiniteMesh],
+      ['out-of-range', outOfRangeMesh],
+    ] as [string, MeshGeometryJson][]) {
+      const group = createObjectGroup({ id, geometry });
+      expect(group.userData.meshObjects).toHaveLength(0);
+      const bounds = worldBoundsForGeometry(geometry);
+      expect([...bounds.min, ...bounds.max].every(Number.isFinite)).toBe(true);
+    }
+  });
+
+  it('keeps bounds finite for degenerate geometry', () => {
+    const degenerateBox: BoxGeometryJson = {
+      type: 'box',
+      size: [0, 0, 0],
+      units: 'm',
+      transform: IDENTITY_TRANSFORM,
+    };
+
+    const bounds = worldBoundsForGeometry(degenerateBox);
+    expect(bounds).toEqual({ min: [0, 0, 0], max: [0, 0, 0] });
+    expect(createObjectGroup({ id: 'degenerate', geometry: degenerateBox }).userData.meshObjects).toHaveLength(1);
+  });
+
   it('applies transform once on compound containers', () => {
     const childBox: BoxGeometryJson = {
       type: 'box',

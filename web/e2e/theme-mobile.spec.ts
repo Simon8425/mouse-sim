@@ -10,16 +10,10 @@ test.describe('theme and mobile responsive', () => {
     errors = await collectPageErrors(page);
   });
 
-  test('theme toggle switches light and dark themes', async () => {
+  test('controlled console starts in the required dark theme', async () => {
     await page.addInitScript(() => window.localStorage.clear());
     await modelLoaded(page);
-    await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
-
-    await page.getByRole('button', { name: 'Toggle theme' }).click();
     await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
-
-    await page.getByRole('button', { name: 'Toggle theme' }).click();
-    await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
 
     await expectNoConsoleErrors(page, errors);
   });

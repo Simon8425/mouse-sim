@@ -4,6 +4,9 @@ import {
   selectFindingsFor,
   selectMassObject,
   selectWarningsCount,
+  selectAnalysisRequest,
+  selectAssumptions,
+  selectUnsupportedModes,
 } from '../state/selectors';
 import {
   worldBounds,
@@ -12,7 +15,15 @@ import {
   boundsCenter,
 } from '../lib/geometryBounds';
 import { formatVector3, formatMatrix3, formatNumber } from '../lib/format';
-import { formatLength, formatMass } from '../lib/units';
+import {
+  formatAcceleration,
+  formatDuration,
+  formatEnergy,
+  formatForce,
+  formatLength,
+  formatMass,
+  formatPressure,
+} from '../lib/units';
 import { severityTone, severityLabel, dispositionLabel } from '../lib/status';
 import { StatusBadge } from './StatusBadge';
 import { isRecord } from '../api/contracts';
@@ -76,6 +87,29 @@ function matrixText(value: unknown): string {
     for (const cell of row) if (typeof cell !== 'number' || !Number.isFinite(cell)) return '—';
   }
   return formatMatrix3(value as unknown as readonly (readonly number[])[]);
+}
+
+/** Formats an explicit study input without converting or inferring missing units. */
+function inputValueText(value: unknown): string | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return formatNumber(value);
+  if (typeof value === 'string') return value;
+  const vector = vec(value);
+  if (vector !== null) return formatVector3(vector);
+  if (!isRecord(value)) return null;
+
+  const raw = value.value ?? value.magnitude ?? value.force_n ?? value.pressure_pa;
+  if (raw === undefined) return null;
+  const rendered = inputValueText(raw);
+  if (rendered === null) return null;
+  const unit = readString(value.unit);
+  return unit ? `${rendered} ${unit}` : rendered;
+}
+
+/** Adds the unit encoded by a typed request field when the payload is scalar. */
+function inputValueWithUnit(value: unknown, unit: string): string {
+  const rendered = inputValueText(value);
+  if (rendered === null) return '—';
+  return isRecord(value) && typeof value.unit === 'string' ? rendered : `${rendered} ${unit}`;
 }
 
 /** Reads min/max corners from a bounds object. */
@@ -172,6 +206,22 @@ function approvalTone(approval: string): Tone {
   }
 }
 
+/** Keeps validity colors aligned with the result rail without implying approval. */
+function validityTone(validity: string): Tone {
+  switch (validity.toLowerCase()) {
+    case 'valid':
+      return 'ok';
+    case 'invalid':
+    case 'failed':
+      return 'error';
+    case 'approximate':
+    case 'inconclusive':
+      return 'warn';
+    default:
+      return 'neutral';
+  }
+}
+
 /**
  * Side panel inspecting the currently selected object: geometry, material,
  * mass properties and validation findings.
@@ -219,6 +269,15 @@ export function InspectorPanel() {
 
   const findings = selectFindingsFor(state, state.selectedId);
   const warnings = selectWarningsCount(state, state.selectedId);
+  const analysisRequest = selectAnalysisRequest(state);
+  const loadCase = isRecord(analysisRequest?.load_case) ? analysisRequest.load_case : null;
+  const impactRequest = isRecord(analysisRequest?.impact) ? analysisRequest.impact : null;
+  const structuralResponse = state.lastResult?.structural?.response ?? null;
+  const impactSection = state.lastResult?.impact ?? null;
+  const impactEstimate = impactSection?.result ?? null;
+  const impactAssumptions = impactEstimate?.assumptions ?? [];
+  const assumptions = Array.from(new Set([...selectAssumptions(state), ...impactAssumptions]));
+  const unsupportedModes = selectUnsupportedModes(state);
 
   const geometryRows: ReadonlyArray<readonly [string, string]> = [
     ['ID', readString(entry.id) ?? '—'],
@@ -237,6 +296,13 @@ export function InspectorPanel() {
 
   return (
     <div className="inspector-panel">
+      <div className="inspector-panel__header">
+        <div>
+          <span className="panel-eyebrow">Selected component</span>
+          <h2 className="inspector-panel__object">{entry.id}</h2>
+        </div>
+        {entry.className ? <StatusBadge tone="neutral">{entry.className}</StatusBadge> : null}
+      </div>
       <h3 className="section-title">Geometry</h3>
       <table className="dense-table">
         <tbody>
@@ -248,6 +314,151 @@ export function InspectorPanel() {
           ))}
         </tbody>
       </table>
+
+      <section className="study-card study-card--downforce" aria-labelledby="downforce-heading">
+        <div className="study-card__heading">
+          <h3 id="downforce-heading">Downforce / load case</h3>
+          <span className="study-card__method">{loadCase ? 'INPUT' : 'NOT CONFIGURED'}</span>
+        </div>
+        {loadCase ? (
+          <table className="dense-table">
+            <tbody>
+              <tr>
+                <th scope="row">Name</th>
+                <td>{readString(loadCase.name) ?? 'Unnamed'}</td>
+              </tr>
+              <tr>
+                <th scope="row">Kind</th>
+                <td>{readString(loadCase.kind) ?? '—'}</td>
+              </tr>
+              <tr>
+                <th scope="row">Magnitude</th>
+                <td className="num">
+                  {inputValueText(loadCase.magnitude ?? loadCase.force ?? loadCase.pressure ?? loadCase.force_n) ?? '—'}
+                </td>
+              </tr>
+              <tr>
+                <th scope="row">Direction</th>
+                <td className="num">{vecText(loadCase.direction ?? loadCase.normal ?? loadCase.vector)}</td>
+              </tr>
+              {structuralResponse ? (
+                <>
+                  <tr>
+                    <th scope="row">Response validity</th>
+                    <td>
+                      <StatusBadge tone={validityTone(structuralResponse.validity)}>
+                        {structuralResponse.validity}
+                      </StatusBadge>
+                    </td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Max displacement</th>
+                    <td className="num">{formatLength(structuralResponse.max_displacement_m)}</td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Max stress</th>
+                    <td className="num">{formatPressure(structuralResponse.max_stress_pa)}</td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Safety factor</th>
+                    <td className="num">
+                      {structuralResponse.safety_factor !== null
+                        ? formatNumber(structuralResponse.safety_factor)
+                        : structuralResponse.safety_factor_status || '—'}
+                    </td>
+                  </tr>
+                </>
+              ) : null}
+            </tbody>
+          </table>
+        ) : (
+          <p className="study-card__note">No load case configured.</p>
+        )}
+      </section>
+
+      <section className="study-card study-card--impact" aria-labelledby="impact-heading">
+        <div className="study-card__heading">
+          <h3 id="impact-heading">Slam / impact</h3>
+          <span className="study-card__method">{impactRequest ? 'INPUT + RESULT' : 'NOT CONFIGURED'}</span>
+        </div>
+        {impactRequest ? (
+          <table className="dense-table">
+            <tbody>
+              <tr>
+                <th scope="row">Fall height</th>
+                <td className="num">{inputValueWithUnit(impactRequest.fall_height_m, 'm')}</td>
+              </tr>
+              <tr>
+                <th scope="row">Restitution</th>
+                <td className="num">{inputValueText(impactRequest.restitution) ?? '—'}</td>
+              </tr>
+              <tr>
+                <th scope="row">Contact stiffness</th>
+                <td className="num">{inputValueWithUnit(impactRequest.contact_stiffness_n_per_m, 'N/m')}</td>
+              </tr>
+              {impactEstimate ? (
+                <>
+                  <tr>
+                    <th scope="row">Method</th>
+                    <td>{impactEstimate.method_id}</td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Validity</th>
+                    <td>
+                      <StatusBadge tone={validityTone(impactEstimate.validity)}>
+                        {impactEstimate.validity}
+                      </StatusBadge>
+                    </td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Impact energy</th>
+                    <td className="num">{formatEnergy(impactEstimate.impact_energy_j)}</td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Peak force</th>
+                    <td className="num">{formatForce(impactEstimate.peak_force_n)}</td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Peak acceleration</th>
+                    <td className="num">{formatAcceleration(impactEstimate.peak_acceleration_m_s2)}</td>
+                  </tr>
+                  <tr>
+                    <th scope="row">Contact duration</th>
+                    <td className="num">{formatDuration(impactEstimate.contact_duration_s)}</td>
+                  </tr>
+                </>
+              ) : null}
+            </tbody>
+          </table>
+        ) : (
+          <p className="study-card__note">No impact request configured.</p>
+        )}
+        {impactRequest && !impactEstimate ? (
+          <p className="study-card__note">{impactSection?.reason ?? 'No impact estimate returned.'}</p>
+        ) : null}
+        {impactEstimate && impactAssumptions.length > 0 ? (
+          <ul className="study-card__assumptions">
+            {impactAssumptions.map((assumption) => <li key={assumption}>{assumption}</li>)}
+          </ul>
+        ) : null}
+      </section>
+
+      <section className="study-card" aria-labelledby="assumptions-heading">
+        <div className="study-card__heading">
+          <h3 id="assumptions-heading">Assumptions and limits</h3>
+          <span className="study-card__method">EVIDENCE</span>
+        </div>
+        {assumptions.length > 0 ? (
+          <ul className="study-card__assumptions">
+            {assumptions.map((assumption) => <li key={assumption}>{assumption}</li>)}
+          </ul>
+        ) : (
+          <p className="study-card__note">None returned.</p>
+        )}
+        {unsupportedModes.length > 0 ? (
+          <p className="study-card__note">Unsupported modes: {unsupportedModes.join(', ')}</p>
+        ) : null}
+      </section>
 
       <h3 className="section-title">Material</h3>
       <table className="dense-table">
@@ -284,9 +495,6 @@ export function InspectorPanel() {
           </tr>
         </tbody>
       </table>
-      <p className="material-note">
-        Catalog values are reference data, not certification; display does not imply approval.
-      </p>
 
       <h3 className="section-title">Mass properties</h3>
       <table className="dense-table">

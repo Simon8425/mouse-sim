@@ -4,6 +4,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from mouse_sim import cli
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -112,6 +115,38 @@ class RunTests(unittest.TestCase):
             self.assertAlmostEqual(report["mass"]["mass_kg"], 0.1 * 0.06 * 0.04 * 1040.0, delta=0.01)
             self.assertIsNotNone(report["validation"])
             self.assertEqual(report["errors"], [])
+
+    @unittest.skipIf(PIPELINE_MISSING, "pipeline is being built in parallel")
+    def test_run_preserves_document_options_when_strict_is_used(self):
+        document = {
+            "schema_id": "gms.project/1",
+            "mode": "exploration",
+            "options": {"cache_dir": "document-cache", "seed": 17, "strict": False},
+        }
+        bundle = {"mode": "exploration", "qualification": {"qualified": False}, "errors": []}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project.json"
+            project.write_text(json.dumps(document), encoding="utf-8")
+            args = cli.build_parser().parse_args(
+                [
+                    "run",
+                    "--input",
+                    str(project),
+                    "--output",
+                    str(root / "reports"),
+                    "--emit",
+                    "json",
+                    "--stdout",
+                    "none",
+                    "--strict",
+                ]
+            )
+            with patch("mouse_sim.pipeline.run_pipeline", return_value=bundle) as run_pipeline:
+                with patch("mouse_sim.cli._write_atomic"), patch("mouse_sim.cli.render_json_report", return_value="{}"):
+                    self.assertEqual(cli._cmd_run(args), 0)
+        request = run_pipeline.call_args.args[0]
+        self.assertEqual(request["options"], {"cache_dir": "document-cache", "seed": 17, "strict": True})
 
     @unittest.skipIf(PIPELINE_MISSING, "pipeline is being built in parallel")
     def test_run_with_invalid_geometry_exits_twenty(self):
@@ -281,4 +316,3 @@ class ServeTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 40)
         self.assertIn("E_INTERNAL", result.stderr)
-

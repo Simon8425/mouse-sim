@@ -1,4 +1,49 @@
-import { isRecord, type WebErrorEnvelope } from './contracts';
+import {
+  isGeometryJson,
+  isRecord,
+  type GeometryPreview,
+  type WebErrorEnvelope,
+} from './contracts';
+
+/** A preview response that the importer understood but cannot display/analyze. */
+export type UnsupportedGeometryPreview = GeometryPreview & {
+  supported: false;
+  geometry: null;
+};
+
+/**
+ * Runtime guard for geometry-preview response envelopes. This is deliberately
+ * stricter than `isRecord` so a 422 web-error envelope cannot be mistaken for
+ * an unsupported geometry preview.
+ */
+export function isGeometryPreviewEnvelope(value: unknown): value is GeometryPreview {
+  if (!isRecord(value)) return false;
+  if (value.schema_id !== 'gms.geometry-preview/1') return false;
+  if (typeof value.supported !== 'boolean') return false;
+  if (typeof value.format !== 'string') return false;
+  if (value.source_units !== null && typeof value.source_units !== 'string') return false;
+  if (value.source_name !== null && typeof value.source_name !== 'string') return false;
+  if (!Array.isArray(value.diagnostics)) return false;
+
+  for (const diagnostic of value.diagnostics) {
+    if (!isRecord(diagnostic)) return false;
+    if (typeof diagnostic.code !== 'string') return false;
+    if (typeof diagnostic.severity !== 'string') return false;
+    if (typeof diagnostic.message !== 'string') return false;
+    if (!isRecord(diagnostic.details)) return false;
+  }
+
+  if (value.geometry !== null && !isGeometryJson(value.geometry)) return false;
+  if (!value.supported && value.geometry !== null) return false;
+  return true;
+}
+
+/** Type guard used by upload flows to handle unsupported previews explicitly. */
+export function isUnsupportedGeometryPreview(
+  preview: GeometryPreview,
+): preview is UnsupportedGeometryPreview {
+  return preview.supported === false;
+}
 
 /**
  * Standard API error class carrying status code, error code, severity, details,

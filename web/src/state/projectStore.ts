@@ -62,6 +62,9 @@ export interface ProjectState {
   navOpen: boolean;
   inspectorOpen: boolean;
   webglError: string | null;
+  previewRequestVersion: number;
+  controlOpen: boolean;
+  runNonce: number;
 }
 
 /** Union of all actions accepted by the project reducer. */
@@ -80,9 +83,15 @@ export type ProjectAction =
   | { type: 'ISOLATE'; id: string }
   | { type: 'CLEAR_ISOLATION' }
   | { type: 'SET_EXPLODE'; factor: number }
-  | { type: 'PREVIEW_START'; temp: TempPreview | null }
-  | { type: 'PREVIEW_OK'; preview: GeometryPreview }
-  | { type: 'PREVIEW_ERROR'; message: string; diagnostics: ImportDiagnostic[] | null }
+  | { type: 'PREVIEW_START'; temp: TempPreview | null; version?: number }
+  | { type: 'PREVIEW_OK'; preview: GeometryPreview; version?: number }
+  | {
+      type: 'PREVIEW_ERROR';
+      message: string;
+      diagnostics: ImportDiagnostic[] | null;
+      preview?: GeometryPreview | null;
+      version?: number;
+    }
   | { type: 'CLEAR_PREVIEW' }
   | { type: 'ANALYZE_START'; version: number }
   | { type: 'ANALYZE_OK'; version: number; result: PipelineResult }
@@ -97,7 +106,9 @@ export type ProjectAction =
   | { type: 'SET_QUALITY_TIER'; tier: 'high' | 'medium' | 'low' | null }
   | { type: 'SET_NAV_OPEN'; open: boolean }
   | { type: 'SET_INSPECTOR_OPEN'; open: boolean }
-  | { type: 'SET_WEBGL_ERROR'; message: string | null };
+  | { type: 'SET_WEBGL_ERROR'; message: string | null }
+  | { type: 'SET_CONTROL_OPEN'; open: boolean }
+  | { type: 'RUN_STUDY' };
 
 /** Pure reducer managing all project store state transitions. */
 export function reducer(state: ProjectState, action: ProjectAction): ProjectState {
@@ -106,11 +117,18 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
       return { ...state, sourceStatus: 'loading' };
     case 'LOAD_BASELINE_OK':
       return {
-        ...state,
+        ...resetGeometryView(state),
         project: action.project,
         projectName: action.name,
         sourceStatus: 'ready',
         sourceError: null,
+        draft: null,
+        preview: null,
+        previewStatus: 'idle',
+        previewError: null,
+        previewDiagnostics: null,
+        tempPreview: null,
+        previewRequestVersion: state.previewRequestVersion + 1,
       };
     case 'LOAD_BASELINE_ERROR':
       return {
@@ -143,41 +161,74 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
       return { ...state, isolatedId: null };
     case 'SET_EXPLODE':
       return { ...state, explode: Math.min(1, Math.max(0, action.factor)) };
-    case 'PREVIEW_START':
+    case 'PREVIEW_START': {
+      if (
+        action.version !== undefined &&
+        action.version < state.previewRequestVersion
+      ) {
+        return state;
+      }
+      const version = action.version ?? state.previewRequestVersion + 1;
       return {
-        ...state,
+        ...resetGeometryView(state),
+        previewRequestVersion: version,
         tempPreview: action.temp,
         previewStatus: 'working',
         preview: null,
         previewError: null,
         previewDiagnostics: null,
       };
+    }
     case 'PREVIEW_OK':
+      if (
+        action.version !== undefined &&
+        action.version !== state.previewRequestVersion
+      ) {
+        return state;
+      }
+      if (!action.preview.supported) {
+        const message = action.preview.diagnostics[0]?.message ?? 'Geometry preview is unsupported';
+        return {
+          ...resetGeometryView(state),
+          preview: action.preview,
+          previewStatus: 'error',
+          previewError: message,
+          previewDiagnostics: action.preview.diagnostics,
+          tempPreview: null,
+        };
+      }
       return {
-        ...state,
+        ...resetGeometryView(state),
         preview: action.preview,
         previewStatus: 'ready',
         tempPreview: null,
         previewError: null,
-        previewDiagnostics: null,
+        previewDiagnostics: action.preview.diagnostics.length > 0 ? action.preview.diagnostics : null,
       };
     case 'PREVIEW_ERROR':
+      if (
+        action.version !== undefined &&
+        action.version !== state.previewRequestVersion
+      ) {
+        return state;
+      }
       return {
-        ...state,
+        ...resetGeometryView(state),
         previewStatus: 'error',
         previewError: action.message,
-        previewDiagnostics: action.diagnostics,
-        preview: null,
+        previewDiagnostics: action.diagnostics ?? action.preview?.diagnostics ?? null,
+        preview: action.preview ?? null,
         tempPreview: null,
       };
     case 'CLEAR_PREVIEW':
       return {
-        ...state,
+        ...resetGeometryView(state),
         preview: null,
         previewStatus: 'idle',
         tempPreview: null,
         previewError: null,
         previewDiagnostics: null,
+        previewRequestVersion: state.previewRequestVersion + 1,
       };
     case 'ANALYZE_START':
       return {
@@ -220,6 +271,10 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
       return { ...state, inspectorOpen: action.open };
     case 'SET_WEBGL_ERROR':
       return { ...state, webglError: action.message };
+    case 'SET_CONTROL_OPEN':
+      return { ...state, controlOpen: action.open };
+    case 'RUN_STUDY':
+      return { ...state, runNonce: state.runNonce + 1 };
     default:
       return state;
   }
@@ -257,7 +312,20 @@ export const initialState: ProjectState = {
   navOpen: false,
   inspectorOpen: false,
   webglError: null,
+  previewRequestVersion: 0,
+  controlOpen: false,
+  runNonce: 0,
 };
+
+/** Reset view state that is keyed to the currently displayed geometry source. */
+function resetGeometryView(state: ProjectState): ProjectState {
+  return {
+    ...state,
+    selectedId: null,
+    isolatedId: null,
+    visibility: {},
+  };
+}
 
 /** A flattened geometry entry derived from the current state. */
 export interface ObjectEntry {
@@ -271,11 +339,12 @@ export function createAnalysisRequest(state: ProjectState): PipelineRequest | nu
   // While a mesh is still being parsed there is no canonical geometry yet.
   if (state.tempPreview && !state.preview) return null;
   // An uploaded geometry preview is analyzable on its own, without a project.
-  if (!state.project && !state.draft && !state.preview) return null;
+  const previewGeometry = state.preview?.supported === true ? state.preview.geometry : null;
+  if (!state.project && !state.draft && !previewGeometry) return null;
   const base: PipelineRequest = state.draft ?? state.project ?? {};
   const request: PipelineRequest = { ...base, mode: state.mode, units: base.units ?? 'mm' };
-  if (state.preview?.geometry && isGeometryJson(state.preview.geometry)) {
-    request.objects = [{ id: state.preview.source_name ?? 'upload', geometry: state.preview.geometry }];
+  if (previewGeometry && isGeometryJson(previewGeometry)) {
+    request.objects = [{ id: state.preview?.source_name ?? 'upload', geometry: previewGeometry }];
   }
   return request;
 }
@@ -291,7 +360,11 @@ function readClassification(raw: Record<string, unknown>): string | null {
 
 /** Flatten all geometry sources (preview, temp preview, or project objects) into object entries. */
 export function computeObjectEntries(state: ProjectState): ObjectEntry[] {
-  if (state.preview?.geometry && isGeometryJson(state.preview.geometry)) {
+  if (
+    state.preview?.supported === true &&
+    state.preview.geometry &&
+    isGeometryJson(state.preview.geometry)
+  ) {
     return [{ id: state.preview.source_name ?? 'upload', geometry: state.preview.geometry, className: null }];
   }
   if (state.tempPreview && !state.preview) {

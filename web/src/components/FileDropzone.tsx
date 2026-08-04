@@ -2,9 +2,9 @@ import * as React from 'react';
 import { useProjectStore } from '../state/projectStore';
 import { createClient } from '../api/client';
 import { parseInWorker, type PreviewFormat } from '../workers/workerProtocol';
-import { errorMessage } from '../api/errors';
+import { errorMessage, isAbortError, isUnsupportedGeometryPreview } from '../api/errors';
 import { LENGTH_UNITS, type LengthUnit } from '../lib/units';
-import type { MeshGeometryJson } from '../api/contracts';
+import type { GeometryPreview, ImportDiagnostic, MeshGeometryJson } from '../api/contracts';
 
 export interface FileDropzoneProps {
   onClose?: () => void;
@@ -14,60 +14,121 @@ export function FileDropzone({ onClose }: FileDropzoneProps): React.ReactElement
   const { state, dispatch } = useProjectStore();
   const clientRef = React.useRef(createClient());
   const inputRef = React.useRef<HTMLInputElement | null>(null);
+  const uploadVersionRef = React.useRef(0);
+  const abortRef = React.useRef<AbortController | null>(null);
 
   const [selectedFile, setSelectedFile] = React.useState<File | null>(null);
   const [selectedUnits, setSelectedUnits] = React.useState<LengthUnit>('mm');
   const [isParsing, setIsParsing] = React.useState(false);
 
+  React.useEffect(() => {
+    return () => {
+      uploadVersionRef.current += 1;
+      abortRef.current?.abort();
+    };
+  }, []);
+
+  const invalidateUpload = (): number => {
+    abortRef.current?.abort();
+    const version = Math.max(uploadVersionRef.current, state.previewRequestVersion) + 1;
+    uploadVersionRef.current = version;
+    abortRef.current = null;
+    return version;
+  };
+
+  const isCurrentUpload = (version: number): boolean => uploadVersionRef.current === version;
+
+  const reportPreviewError = (
+    version: number,
+    message: string,
+    diagnostics: ImportDiagnostic[] | null,
+    preview?: GeometryPreview,
+  ) => {
+    if (!isCurrentUpload(version)) return;
+    dispatch({ type: 'PREVIEW_ERROR', message, diagnostics, preview, version });
+  };
+
   const handleFileSelect = (file: File) => {
     const name = file.name.toLowerCase();
     if (name.endsWith('.json')) {
       // Normalize JSON immediately
-      dispatch({ type: 'PREVIEW_START', temp: null });
-      file.arrayBuffer().then((buf) => {
-        clientRef.current
-          .normalizeGeometry({
-            format: 'json',
-            name: file.name,
-            body: buf,
-          })
-          .then((preview) => {
-            dispatch({ type: 'PREVIEW_OK', preview });
-            onClose?.();
-          })
-          .catch((err) => {
-            dispatch({
-              type: 'PREVIEW_ERROR',
-              message: errorMessage(err),
-              diagnostics: null,
-            });
-          });
-      });
+      const version = invalidateUpload();
+      const controller = new AbortController();
+      abortRef.current = controller;
+      setIsParsing(false);
+      setSelectedFile(null);
+      dispatch({ type: 'PREVIEW_START', temp: null, version });
+
+      void (async () => {
+        try {
+          const buf = await file.arrayBuffer();
+          if (!isCurrentUpload(version)) return;
+          const preview = await clientRef.current.normalizeGeometry(
+            {
+              format: 'json',
+              name: file.name,
+              body: buf,
+            },
+            controller.signal,
+          );
+          if (!isCurrentUpload(version)) return;
+
+          if (isUnsupportedGeometryPreview(preview)) {
+            reportPreviewError(
+              version,
+              preview.diagnostics[0]?.message ?? 'Geometry preview is unsupported',
+              preview.diagnostics,
+              preview,
+            );
+            return;
+          }
+
+          dispatch({ type: 'PREVIEW_OK', preview, version });
+          onClose?.();
+        } catch (err: unknown) {
+          if (!isCurrentUpload(version) || isAbortError(err)) return;
+          reportPreviewError(version, errorMessage(err), null);
+        } finally {
+          if (isCurrentUpload(version)) abortRef.current = null;
+        }
+      })();
     } else if (name.endsWith('.obj') || name.endsWith('.stl')) {
+      invalidateUpload();
+      setIsParsing(false);
       setSelectedFile(file);
     } else if (name.endsWith('.step') || name.endsWith('.stp')) {
-      dispatch({
-        type: 'PREVIEW_ERROR',
-        message: 'STEP file format requires server CAD converter plugin',
-        diagnostics: null,
-      });
+      const version = invalidateUpload();
+      setIsParsing(false);
+      setSelectedFile(null);
+      dispatch({ type: 'PREVIEW_START', temp: null, version });
+      reportPreviewError(
+        version,
+        'STEP file format requires server CAD converter plugin',
+        null,
+      );
     } else {
-      dispatch({
-        type: 'PREVIEW_ERROR',
-        message: `Unsupported file extension for ${file.name}`,
-        diagnostics: null,
-      });
+      const version = invalidateUpload();
+      setIsParsing(false);
+      setSelectedFile(null);
+      dispatch({ type: 'PREVIEW_START', temp: null, version });
+      reportPreviewError(version, `Unsupported file extension for ${file.name}`, null);
     }
   };
 
   const processMeshFile = async () => {
-    if (!selectedFile) return;
-    const format: PreviewFormat = selectedFile.name.toLowerCase().endsWith('.obj') ? 'obj' : 'stl';
+    const file = selectedFile;
+    if (!file) return;
+    const version = uploadVersionRef.current || invalidateUpload();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const format: PreviewFormat = file.name.toLowerCase().endsWith('.obj') ? 'obj' : 'stl';
 
     setIsParsing(true);
+    dispatch({ type: 'PREVIEW_START', temp: null, version });
     try {
-      const buffer = await selectedFile.arrayBuffer();
+      const buffer = await file.arrayBuffer();
       const parseResult = await parseInWorker(format, selectedUnits, buffer.slice(0));
+      if (!isCurrentUpload(version)) return;
 
       const verticesList: number[][] = [];
       for (let i = 0; i < parseResult.vertices.length; i += 3) {
@@ -106,32 +167,44 @@ export function FileDropzone({ onClose }: FileDropzoneProps): React.ReactElement
       dispatch({
         type: 'PREVIEW_START',
         temp: {
-          id: selectedFile.name,
-          name: selectedFile.name,
+          id: file.name,
+          name: file.name,
           geometry: tempMesh,
           diagnostics: parseResult.warnings,
         },
+        version,
       });
 
       // Call API normalize for canonical representation
       const preview = await clientRef.current.normalizeGeometry({
         format,
         units: selectedUnits,
-        name: selectedFile.name,
+        name: file.name,
         body: buffer,
-      });
+      }, controller.signal);
+      if (!isCurrentUpload(version)) return;
 
-      dispatch({ type: 'PREVIEW_OK', preview });
+      if (isUnsupportedGeometryPreview(preview)) {
+        reportPreviewError(
+          version,
+          preview.diagnostics[0]?.message ?? 'Geometry preview is unsupported',
+          preview.diagnostics,
+          preview,
+        );
+        return;
+      }
+      dispatch({ type: 'PREVIEW_OK', preview, version });
       onClose?.();
     } catch (err: unknown) {
-      dispatch({
-        type: 'PREVIEW_ERROR',
-        message: errorMessage(err),
-        diagnostics: null,
-      });
+      if (isCurrentUpload(version) && !isAbortError(err)) {
+        reportPreviewError(version, errorMessage(err), null);
+      }
     } finally {
-      setIsParsing(false);
-      setSelectedFile(null);
+      if (isCurrentUpload(version)) {
+        setIsParsing(false);
+        setSelectedFile(null);
+        abortRef.current = null;
+      }
     }
   };
 
@@ -196,7 +269,11 @@ export function FileDropzone({ onClose }: FileDropzoneProps): React.ReactElement
             <button
               type="button"
               className="btn btn--ghost"
-              onClick={() => setSelectedFile(null)}
+              onClick={() => {
+                invalidateUpload();
+                setIsParsing(false);
+                setSelectedFile(null);
+              }}
             >
               Cancel
             </button>

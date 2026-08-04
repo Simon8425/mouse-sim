@@ -1,6 +1,6 @@
 """DFM-lite validation: structured findings over geometry, materials, and classifications."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Mapping, Tuple
 
@@ -283,12 +283,21 @@ def check_pcb_clearance(pcb_geometry, shell_geometry, min_clearance_m, tolerance
     return ()
 
 
+def _promote_warnings(findings):
+    return tuple(
+        replace(item, severity="error", evidence_blocking=True) if item.severity == "warning" else item
+        for item in findings
+    )
+
+
 def run_validation(geometry_objs, material_map, classifications, options):
     """Orchestrate DFM-lite checks into a sorted :class:`ValidationReport`.
 
     options: min_thickness_m, max_thickness_m, min_clearance_m,
     clearance_tolerance_m (or tolerance_m), pcb_object_id, shell_object_id,
     repair_records (mapping object id -> records, or one list for all objects).
+    strict (bool): when true, promote warning findings to evidence-blocking
+    errors so the report status is fail.
     """
 
     geometry_objs = dict(geometry_objs or {})
@@ -315,6 +324,8 @@ def run_validation(geometry_objs, material_map, classifications, options):
             findings.extend(check_wall_thickness(geometry, object_id, min_thickness, max_thickness))
     if pcb_id and shell_id and min_clearance is not None and pcb_id in geometry_objs and shell_id in geometry_objs:
         findings.extend(check_pcb_clearance(geometry_objs[pcb_id], geometry_objs[shell_id], min_clearance, tolerance, pcb_object_id=pcb_id, shell_object_id=shell_id))
+    if options.get("strict"):
+        findings = _promote_warnings(findings)
     return ValidationReport.build(findings)
 
 

@@ -25,7 +25,7 @@ test.describe('upload flow', () => {
 
     await expect(page.locator('.model-row')).toHaveCount(1, { timeout: 15_000 });
     await expect(page.locator('.model-row')).toContainText('cover.obj');
-    await expect(page.locator('.status-live')).toHaveText('Complete', { timeout: 15_000 });
+    await expect(page.locator('.run-status__value')).toHaveText('Complete', { timeout: 15_000 });
     await expectNoConsoleErrors(page, errors);
   });
 
@@ -46,7 +46,7 @@ test.describe('upload flow', () => {
 
     await expect(page.locator('.model-row')).toHaveCount(1, { timeout: 15_000 });
     await expect(page.locator('.model-row')).toContainText('analytic');
-    await expect(page.locator('.status-live')).toHaveText('Complete', { timeout: 15_000 });
+    await expect(page.locator('.run-status__value')).toHaveText('Complete', { timeout: 15_000 });
     await expectNoConsoleErrors(page, errors);
   });
 });

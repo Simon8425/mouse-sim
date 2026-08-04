@@ -8,6 +8,36 @@ import {
 } from '../state/selectors';
 import { severityTone, severityLabel } from '../lib/status';
 import { StatusBadge } from './StatusBadge';
+import { isRecord } from '../api/contracts';
+
+type ConfidenceLevel = 'high' | 'medium' | 'low' | 'unknown';
+
+function objectConfidence(
+  state: ReturnType<typeof useProjectStore>['state'],
+  id: string,
+): { label: string; level: ConfidenceLevel } {
+  const objects = state.project?.objects;
+  const raw = Array.isArray(objects)
+    ? objects.find((item) => isRecord(item) && (item.id === id || item.name === id))
+    : isRecord(objects)
+      ? objects[id]
+      : null;
+  if (!isRecord(raw) || !isRecord(raw.classification)) {
+    return { label: 'UNRATED', level: 'unknown' };
+  }
+
+  const confidence = raw.classification.confidence;
+  if (typeof confidence === 'number' && Number.isFinite(confidence)) {
+    return { label: confidence.toString(), level: 'unknown' };
+  }
+  if (typeof confidence === 'string' && confidence.trim().length > 0) {
+    const normalized = confidence.toLowerCase();
+    const level: ConfidenceLevel =
+      normalized === 'high' || normalized === 'medium' || normalized === 'low' ? normalized : 'unknown';
+    return { label: confidence.toUpperCase(), level };
+  }
+  return { label: 'UNRATED', level: 'unknown' };
+}
 
 export function ModelTree(): React.ReactElement {
   const { state, dispatch } = useProjectStore();
@@ -64,6 +94,13 @@ export function ModelTree(): React.ReactElement {
 
   return (
     <div className="model-tree">
+      <div className="model-tree__header">
+        <div>
+          <span className="panel-eyebrow">Assembly navigator</span>
+          <h2 className="model-tree__title">Model tree</h2>
+        </div>
+        <span className="model-tree__count">{entries.length.toString().padStart(2, '0')} ITEMS</span>
+      </div>
       <div className="model-tree__search">
         <input
           type="text"
@@ -131,11 +168,15 @@ export function ModelTree(): React.ReactElement {
           {filteredEntries.map((entry, index) => {
             const isSelected = state.selectedId === entry.id;
             const isVisible = state.visibility[entry.id] ?? true;
-            const isIsolated = state.isolatedId === entry.id;
             const worstSeverity = severities.get(entry.id);
             const warningsCount = selectWarningsCount(state, entry.id);
             const findings = selectFindingsFor(state, entry.id);
             const findingTitle = findings.map((f) => f.message).join('\n');
+            const confidence = objectConfidence(state, entry.id);
+            const displayType =
+              entry.className && entry.className.toLowerCase() !== entry.id.toLowerCase()
+                ? entry.className
+                : entry.geometry.type;
 
             return (
               <div
@@ -143,56 +184,38 @@ export function ModelTree(): React.ReactElement {
                 role="treeitem"
                 tabIndex={index === focusedIndex ? 0 : -1}
                 aria-selected={isSelected}
-                className={`model-row${!isVisible ? ' model-row--hidden' : ''}`}
+                className={`model-row${!isVisible ? ' model-row--hidden' : ''}${isSelected ? ' is-selected' : ''}`}
                 onClick={() => dispatch({ type: 'SELECT', id: entry.id })}
                 onKeyDown={(e) => handleKeyDown(e, index, entry.id)}
               >
-                <button
-                  type="button"
-                  className="model-row__visibility btn btn--ghost"
-                  aria-pressed={isVisible}
-                  aria-label={isVisible ? 'Hide object' : 'Show object'}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    dispatch({ type: 'TOGGLE_VISIBILITY', id: entry.id });
-                  }}
-                >
-                  {isVisible ? '👁' : '🙈'}
-                </button>
 
-                <span className="model-row__name">{entry.id}</span>
-                <span className="model-row__type muted">
-                  {entry.className ?? entry.geometry.type}
-                </span>
-
-                {worstSeverity ? (
-                  <StatusBadge tone={severityTone(worstSeverity)} title={findingTitle}>
-                    {severityLabel(worstSeverity)}
-                  </StatusBadge>
-                ) : null}
-
-                {warningsCount > 0 ? (
-                  <span className="model-row__warnings badge badge--warn">
-                    {warningsCount}
-                  </span>
-                ) : null}
-
-                <button
-                  type="button"
-                  className="model-row__isolate btn btn--ghost"
-                  aria-pressed={isIsolated}
-                  aria-label={isIsolated ? 'Clear isolation' : 'Isolate object'}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    if (isIsolated) {
-                      dispatch({ type: 'CLEAR_ISOLATION' });
-                    } else {
-                      dispatch({ type: 'ISOLATE', id: entry.id });
-                    }
-                  }}
-                >
-                  {isIsolated ? '🎯' : '⭕'}
-                </button>
+                <div className="model-row__center">
+                  <div className="model-row__title-line">
+                    <span className="model-row__name">{entry.id}</span>
+                  </div>
+                  <div className="model-row__sub-line">
+                    {displayType ? <span className="model-row__type muted">{displayType}</span> : null}
+                    {confidence.label !== 'UNRATED' ? (
+                      <span className={`model-row__confidence model-row__confidence--${confidence.level}`}>
+                        CONF {confidence.label}
+                      </span>
+                    ) : null}
+                    {worstSeverity ? (
+                      <StatusBadge tone={severityTone(worstSeverity)} title={findingTitle}>
+                        {severityLabel(worstSeverity)}
+                      </StatusBadge>
+                    ) : (
+                      <span className="model-row__confidence">
+                        {state.lastResult ? 'NO FINDINGS' : 'UNASSESSED'}
+                      </span>
+                    )}
+                    {warningsCount > 0 ? (
+                      <span className="model-row__warnings badge badge--warn" title={`${warningsCount} finding(s)`}>
+                        {warningsCount}
+                      </span>
+                    ) : null}
+                  </div>
+                </div>
               </div>
             );
           })}

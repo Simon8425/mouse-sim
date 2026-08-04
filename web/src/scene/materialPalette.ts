@@ -3,9 +3,9 @@ import * as THREE from 'three';
 export type QualityTier = 'high' | 'medium' | 'low';
 export type PaletteKey = 'shell' | 'pcb' | 'battery' | 'metal' | 'skate' | 'default';
 
-export const SELECTION_ACCENT = 0x2f6fed;
-export const WARNING_ACCENT = 0xd97706;
-export const BLOCKER_ACCENT = 0xdc2626;
+export const SELECTION_ACCENT = 0x26251e;
+export const WARNING_ACCENT = 0x8a6d3b;
+export const BLOCKER_ACCENT = 0xb3402e;
 
 export function paletteKeyForComponent(className: string | null): PaletteKey {
   if (!className) return 'default';

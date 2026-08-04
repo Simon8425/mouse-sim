@@ -6,8 +6,9 @@ while qualification output reaches at most ``qualification_pending_review``.
 Automatic promotion to accepted evidence is intentionally never performed.
 """
 
+import math
 from dataclasses import dataclass
-from typing import Mapping, Tuple
+from typing import Mapping, Optional, Tuple
 
 from .errors import ValidationError
 from .materials import TRACEABLE_SOURCE_TYPES
@@ -17,6 +18,7 @@ from .model import (
     RequirementStatus,
     ResultMode,
     ReviewState,
+    ValidityState,
 )
 
 
@@ -33,6 +35,11 @@ GATE_SPECS = (
     ("CORRELATION", "Required correlation records exist and reviewed"),
     ("REQUIREMENT_ACTIVE", "Governing requirement active with acceptance criterion"),
     ("NO_BLOCKING_ISSUES", "No blocking validation issues"),
+    ("ANALYSIS_VALIDITY", "Underlying analysis validity is clean"),
+    ("IMPACT_VALIDITY", "Impact state is not blocked and carries no unsupported modes"),
+    ("CORRELATION_ERROR", "Correlation error fractions within policy maximum"),
+    ("REQUIREMENT_EVALUATION", "Structured requirement targets evaluate to pass"),
+    ("CONVERGENCE_EVIDENCE", "Claimed convergence/force-balance evidence is substantiated"),
 )
 
 _GATE_LABELS = dict(GATE_SPECS)
@@ -70,6 +77,11 @@ class QualificationResult:
     gates: Tuple[QualificationGate, ...] = ()
     blocking_keys: Tuple[str, ...] = ()
     summary: str = ""
+    integrity_gates: Tuple[QualificationGate, ...] = ()
+    requirement_evaluations: Tuple[Mapping, ...] = ()
+    convergence_evidence: bool = False
+    force_balance: bool = False
+    structural_validity: Optional[str] = None
 
     def to_dict(self):
         return {
@@ -79,6 +91,11 @@ class QualificationResult:
             "gates": [gate.to_dict() for gate in self.gates],
             "blocking_keys": list(self.blocking_keys),
             "summary": self.summary,
+            "integrity_gates": [gate.to_dict() for gate in self.integrity_gates],
+            "requirement_evaluations": [dict(item) for item in self.requirement_evaluations],
+            "convergence_evidence": self.convergence_evidence,
+            "force_balance": self.force_balance,
+            "structural_validity": self.structural_validity,
         }
 
 
@@ -407,10 +424,11 @@ def _requirement_gate(requirement):
         return _gate("REQUIREMENT_ACTIVE", False, False, True, "governing requirement is missing")
     status = _enum(RequirementStatus, _get(requirement, "status"), RequirementStatus.DRAFT)
     acceptance = _get(requirement, "acceptance")
+    structured = _structured_targets(requirement)
     failures = []
     if status != RequirementStatus.ACTIVE:
         failures.append("requirement status is not active")
-    if acceptance is None:
+    if acceptance is None and not structured:
         failures.append("requirement has no acceptance criterion")
     explanation = "; ".join(failures) if failures else (
         "requirement is active with an acceptance criterion"
@@ -441,6 +459,320 @@ def _validation_gate(validation_report):
     return _gate("NO_BLOCKING_ISSUES", True, True, True, "validation report has no blocking findings")
 
 
+def _numeric(value):
+    """Return a finite float from a plain number, quantity, or value dict."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    if isinstance(value, Mapping):
+        for key in ("value_si", "value"):
+            if key in value:
+                return _numeric(value.get(key))
+        return None
+    for attr in ("value_si", "value"):
+        if hasattr(value, attr):
+            return _numeric(getattr(value, attr))
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _structural_validity(structural_response):
+    """Return ``(validity_state_or_None, unsupported_modes)`` for a response."""
+    if structural_response is None:
+        return None, ()
+    unsupported = []
+    validity = _get(structural_response, "validity")
+    if isinstance(validity, Mapping):
+        state = _enum(ValidityState, validity.get("state"), None)
+        unsupported.extend(_get(validity, "unsupported_failure_modes", default=()) or ())
+    else:
+        state = _enum(ValidityState, _get(validity, "state", default=validity), None)
+        if validity is not None:
+            unsupported.extend(_get(validity, "unsupported_failure_modes", default=()) or ())
+    unsupported.extend(_get(structural_response, "unsupported_failure_modes", default=()) or ())
+    return state, tuple(sorted({str(item) for item in unsupported}))
+
+
+def _analysis_validity_gate(structural_response, validation_report):
+    """ANALYSIS_VALIDITY: the underlying analysis must be valid and complete."""
+    failures = []
+    if structural_response is not None:
+        state, unsupported = _structural_validity(structural_response)
+        if state is None:
+            failures.append("structural response carries no validity state")
+        elif state != ValidityState.VALID:
+            failures.append("structural response validity is {}".format(state.value))
+        if unsupported:
+            failures.append(
+                "structural response carries unsupported failure modes: {}".format(
+                    ", ".join(unsupported)
+                )
+            )
+    if validation_report is not None:
+        report_status = str(_get(validation_report, "status", default="") or "").casefold()
+        if report_status == "fail":
+            failures.append("validation report status is fail")
+    if failures:
+        return _gate("ANALYSIS_VALIDITY", False, True, True, "; ".join(failures))
+    explanation = (
+        "underlying analysis is valid with no unsupported failure modes"
+        if structural_response is not None
+        else "no structural analysis performed; no validity constraints apply"
+    )
+    return _gate("ANALYSIS_VALIDITY", True, True, True, explanation)
+
+
+def _impact_gate(impact):
+    """IMPACT_VALIDITY: impact-based qualification needs an unblocked, clean impact."""
+    if impact is None:
+        return _gate("IMPACT_VALIDITY", True, True, True, "impact analysis not requested")
+    failures = []
+    impact_result = _get(impact, "result")
+    if impact_result is None:
+        failures.append(
+            str(_get(impact, "reason", default="") or "") or "impact result is missing"
+        )
+    else:
+        if _flag(_get(impact_result, "qualification_blocked", default=False)):
+            failures.append("impact result is qualification_blocked")
+        unsupported = list(_get(impact, "unsupported_failure_modes", default=()) or ())
+        unsupported.extend(_get(impact_result, "unsupported_failure_modes", default=()) or ())
+        unsupported = sorted({str(item) for item in unsupported})
+        if unsupported:
+            failures.append(
+                "impact analysis carries unsupported failure modes: {}".format(
+                    ", ".join(unsupported)
+                )
+            )
+        validity = str(_get(impact_result, "validity", default="") or "").casefold()
+        if validity and validity not in ("valid", "no_impact"):
+            failures.append("impact result validity is {}".format(validity))
+    if failures:
+        return _gate("IMPACT_VALIDITY", False, True, True, "; ".join(failures))
+    return _gate("IMPACT_VALIDITY", True, True, True, "impact state is clean and unblocked")
+
+
+def _comparison_error_fraction(comparison):
+    """Measured-to-predicted error fraction of a comparison, or None."""
+    if comparison is None:
+        return None
+    relative = _get(comparison, "relative_error")
+    if relative is not None:
+        value = _numeric(relative)
+        if value is not None:
+            return abs(value)
+    measured = _numeric(_get(comparison, "measured"))
+    predicted = _numeric(_get(comparison, "predicted"))
+    if measured is None or predicted is None or predicted == 0.0:
+        return None
+    return abs(measured - predicted) / abs(predicted)
+
+
+def _correlation_error_gate(method, correlation_records):
+    """CORRELATION_ERROR: error fractions must not exceed the policy maximum."""
+    if method is None:
+        return _gate("CORRELATION_ERROR", False, False, True, "no analysis method provided")
+    policy = _get(method, "required_correlation_policy")
+    if not _flag(_get(policy, "required", default=False)):
+        return _gate("CORRELATION_ERROR", True, True, True, "correlation not required by method")
+    maximum = _numeric(_get(policy, "maximum_error_fraction"))
+    if maximum is None:
+        return _gate(
+            "CORRELATION_ERROR", True, True, True, "no maximum error fraction configured"
+        )
+    records = _correlation_records(correlation_records)
+    if not records:
+        return _gate("CORRELATION_ERROR", True, True, True, "no correlation records supplied")
+    violations = []
+    for record in records:
+        record_type = str(_get(record, "record_type", default="") or "")
+        for comparison in _get(record, "comparisons", default=()) or ():
+            fraction = _comparison_error_fraction(comparison)
+            if fraction is None or fraction <= maximum:
+                continue
+            metric = str(_get(comparison, "metric_key", default="") or "") or "metric"
+            violations.append(
+                "{}[{}]: error fraction {:.6g} exceeds maximum {:.6g}".format(
+                    record_type, metric, fraction, maximum
+                )
+            )
+    if violations:
+        return _gate(
+            "CORRELATION_ERROR", False, True, True,
+            "correlation error fractions exceed the policy maximum: {}".format(
+                "; ".join(violations)
+            ),
+        )
+    return _gate(
+        "CORRELATION_ERROR", True, True, True,
+        "correlation error fractions are within the policy maximum",
+    )
+
+
+_METRIC_PATHS = {
+    "mass_kg": ("mass", "mass_kg"),
+    "max_displacement_m": ("structural", "response", "max_displacement_m"),
+    "max_stress_pa": ("structural", "response", "max_stress_pa"),
+    "safety_factor": ("structural", "response", "safety_factor"),
+    "peak_force_n": ("impact", "result", "peak_force_n"),
+}
+
+
+def _resolve_metric(pipeline_result, metric):
+    """Resolve a metric name against the pipeline result, or return None."""
+    if pipeline_result is None:
+        return None
+    path = _METRIC_PATHS.get(metric)
+    if path is None:
+        path = tuple(str(metric).split("."))
+    node = pipeline_result
+    for part in path:
+        if not isinstance(node, Mapping) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def _structured_targets(requirement):
+    """Collect structured ``{"metric": ..., "max"/"min": ...}`` targets."""
+    if requirement is None:
+        return ()
+    targets = []
+    raw_targets = _get(requirement, "targets", "target")
+    if raw_targets is not None:
+        candidates = raw_targets if isinstance(raw_targets, (list, tuple)) else (raw_targets,)
+        targets.extend(candidates)
+    acceptance = _get(requirement, "acceptance")
+    if isinstance(acceptance, Mapping):
+        targets.append(acceptance)
+    return tuple(
+        target for target in targets
+        if isinstance(target, Mapping)
+        and "metric" in target
+        and any(bound in target for bound in ("max", "min"))
+    )
+
+
+def _evaluate_target(target, pipeline_result):
+    """Evaluate one structured target; never pretend a missing value passed."""
+    metric = str(_get(target, "metric", default="") or "")
+    entry = {"metric": metric, "status": "pass"}
+    measured = _numeric(_resolve_metric(pipeline_result, metric))
+    if measured is None:
+        entry["status"] = "not_available"
+        entry["measured"] = None
+        entry["reason"] = "measured value unavailable for metric {!r}".format(metric)
+        return entry
+    entry["measured"] = measured
+    margins = {}
+    if "max" in target:
+        limit = _numeric(_get(target, "max"))
+        if limit is None:
+            entry["status"] = "not_available"
+            entry["reason"] = "max bound is not numeric"
+            return entry
+        entry["max"] = limit
+        margins["max"] = limit - measured
+        if measured > limit:
+            entry["status"] = "fail"
+    if "min" in target:
+        limit = _numeric(_get(target, "min"))
+        if limit is None:
+            entry["status"] = "not_available"
+            entry["reason"] = "min bound is not numeric"
+            return entry
+        entry["min"] = limit
+        margins["min"] = measured - limit
+        if measured < limit:
+            entry["status"] = "fail"
+    if margins:
+        entry["margins"] = margins
+    return entry
+
+
+def _evaluate_requirement(requirement, pipeline_result):
+    """Emit a pass/fail/not_evaluated evaluation for one requirement."""
+    targets = _structured_targets(requirement)
+    label = str(_get(requirement, "external_id", default="") or "")
+    if not label:
+        label = str(_get(requirement, "title", default="") or "")
+    if not label:
+        label = "requirement"
+    if not targets:
+        return {
+            "requirement": label,
+            "status": "not_evaluated",
+            "reason": "requirement carries no structured metric target",
+            "targets": [],
+        }
+    evaluated = [_evaluate_target(target, pipeline_result) for target in targets]
+    statuses = [item["status"] for item in evaluated]
+    if "fail" in statuses:
+        status = "fail"
+    elif "not_available" in statuses:
+        status = "not_available"
+    else:
+        status = "pass"
+    return {"requirement": label, "status": status, "targets": evaluated}
+
+
+def _requirement_evaluation_gate(evaluations):
+    """REQUIREMENT_EVALUATION: structured targets must measure to pass."""
+    failures = []
+    for evaluation in evaluations:
+        status = evaluation.get("status")
+        label = str(evaluation.get("requirement", "requirement"))
+        if status == "fail":
+            failures.append("requirement {!r} failed its target(s)".format(label))
+        elif status == "not_available":
+            failures.append("requirement {!r} target(s) could not be measured".format(label))
+    if failures:
+        return _gate("REQUIREMENT_EVALUATION", False, True, True, "; ".join(failures))
+    evaluated = [item for item in evaluations if item.get("status") != "not_evaluated"]
+    explanation = (
+        "all evaluated requirements pass"
+        if evaluated else "no structured requirement targets to evaluate"
+    )
+    return _gate("REQUIREMENT_EVALUATION", True, True, True, explanation)
+
+
+def _convergence_evidence_gate(convergence_evidence, force_balance, structural_response):
+    """CONVERGENCE_EVIDENCE: claimed evidence must be backed by a valid response."""
+    claims = []
+    if convergence_evidence:
+        claims.append("convergence")
+    if force_balance:
+        claims.append("force balance")
+    if not claims:
+        return _gate(
+            "CONVERGENCE_EVIDENCE", True, True, True,
+            "no convergence or force-balance evidence claimed",
+        )
+    label = " and ".join(claims)
+    if structural_response is None:
+        return _gate(
+            "CONVERGENCE_EVIDENCE", False, True, True,
+            "{} evidence claimed without a structural response; cannot be substantiated".format(label),
+        )
+    state, _ = _structural_validity(structural_response)
+    if state != ValidityState.VALID:
+        return _gate(
+            "CONVERGENCE_EVIDENCE", False, True, True,
+            "{} evidence claimed but structural response validity is {}".format(
+                label, state.value if state is not None else "unknown"
+            ),
+        )
+    return _gate(
+        "CONVERGENCE_EVIDENCE", True, True, True,
+        "{} evidence substantiated by a valid structural response".format(label),
+    )
+
+
 def evaluate_qualification(
     mode,
     method=None,
@@ -456,6 +788,10 @@ def evaluate_qualification(
     convergence_evidence=False,
     force_balance=False,
     reviewed_flags=None,
+    structural_response=None,
+    impact=None,
+    requirements=None,
+    pipeline_result=None,
     **kwargs,
 ):
     """Evaluate the hard qualification gate set for a mode.
@@ -464,8 +800,25 @@ def evaluate_qualification(
     ``exploration_only`` and unqualified; qualification output reaches at
     most ``qualification_pending_review``.  Nothing here ever promotes
     evidence to accepted status.
+
+    The integrity gate set additionally hard-blocks whenever the underlying
+    analysis is invalid, incomplete, or unsupported: an inconclusive or
+    failed structural response, unsupported failure modes, a failed
+    validation report, a qualification-blocked or unsupported impact result,
+    correlation error fractions beyond the policy maximum, unmeasurable or
+    failing structured requirement targets, or claimed convergence/force
+    balance evidence that a valid structural response cannot substantiate.
     """
     mode_value = _mode(mode)
+    if requirements is None:
+        requirement_list = (requirement,) if requirement is not None else ()
+    elif isinstance(requirements, (list, tuple)):
+        requirement_list = tuple(requirements)
+    else:
+        requirement_list = (requirements,)
+    requirement_evaluations = tuple(
+        _evaluate_requirement(item, pipeline_result) for item in requirement_list
+    )
     gates = [
         _method_gate(method),
         _geometry_gate(geometry, reviewed_flags),
@@ -480,9 +833,18 @@ def evaluate_qualification(
         _requirement_gate(requirement),
         _validation_gate(validation_report),
     ]
+    integrity_gates = [
+        _analysis_validity_gate(structural_response, validation_report),
+        _impact_gate(impact),
+        _correlation_error_gate(method, correlation_records),
+        _requirement_evaluation_gate(requirement_evaluations),
+        _convergence_evidence_gate(convergence_evidence, force_balance, structural_response),
+    ]
     gates = tuple(sorted(gates, key=lambda gate: gate.key))
+    integrity_gates = tuple(sorted(integrity_gates, key=lambda gate: gate.key))
+    all_gates = gates + integrity_gates
     blocking_keys = tuple(
-        gate.key for gate in gates if (not gate.evaluable) or (gate.blocker and not gate.passed)
+        gate.key for gate in all_gates if (not gate.evaluable) or (gate.blocker and not gate.passed)
     )
     if mode_value == "exploration":
         qualified = False
@@ -500,7 +862,8 @@ def evaluate_qualification(
             len(blocking_keys), ", ".join(blocking_keys)
         )
     else:
-        summary = "qualification pending review: all {} gates passed".format(len(gates))
+        summary = "qualification pending review: all {} gates passed".format(len(all_gates))
+    structural_validity, _ = _structural_validity(structural_response)
     return QualificationResult(
         mode=mode_value,
         qualified=qualified,
@@ -508,6 +871,13 @@ def evaluate_qualification(
         gates=gates,
         blocking_keys=blocking_keys,
         summary=summary,
+        integrity_gates=integrity_gates,
+        requirement_evaluations=requirement_evaluations,
+        convergence_evidence=bool(convergence_evidence),
+        force_balance=bool(force_balance),
+        structural_validity=(
+            structural_validity.value if structural_validity is not None else None
+        ),
     )
 
 

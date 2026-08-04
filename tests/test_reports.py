@@ -60,7 +60,13 @@ class RenderJsonReportTests(unittest.TestCase):
         self.assertEqual(
             json.loads(render_json_report(sample_bundle()))["decision"], "not_qualified"
         )
-        qualified = sample_bundle(qualification={"qualified": True, "gates": []})
+        qualified = sample_bundle(
+            qualification={
+                "qualified": True,
+                "gates": [],
+                "evidence_disposition": "qualification_accepted",
+            }
+        )
         self.assertEqual(json.loads(render_json_report(qualified))["decision"], "qualified")
         without_qualification = sample_bundle()
         del without_qualification["qualification"]
@@ -68,12 +74,71 @@ class RenderJsonReportTests(unittest.TestCase):
             json.loads(render_json_report(without_qualification))["decision"], "completed"
         )
 
+    def test_decision_never_qualified_for_pending_review(self):
+        for disposition in ("qualification_pending_review", None):
+            qualification = {"qualified": True, "gates": []}
+            if disposition is not None:
+                qualification["evidence_disposition"] = disposition
+            bundle = sample_bundle(qualification=qualification)
+            self.assertEqual(
+                json.loads(render_json_report(bundle))["decision"], "not_qualified"
+            )
+
     def test_unsupported_failure_modes_union(self):
         report = json.loads(render_json_report(sample_bundle()))
         self.assertEqual(
             report["unsupported_failure_modes"],
             ["UNSUPPORTED_BATTERY_CRUSH", "UNSUPPORTED_PCB_SHOCK"],
         )
+
+    def test_unsupported_failure_modes_recursive_nested(self):
+        bundle = sample_bundle(
+            structural={
+                "method": "beam",
+                "unsupported_failure_modes": ["UNSUPPORTED_TOP"],
+                "cases": {
+                    "impact": {
+                        "unsupported_failure_modes": ["UNSUPPORTED_NESTED_IMPACT"],
+                        "subcase": {"unsupported_failure_modes": ["UNSUPPORTED_DEEP_IMPACT"]},
+                    }
+                },
+            },
+            impact={},
+        )
+        report = json.loads(render_json_report(bundle))
+        self.assertEqual(
+            report["unsupported_failure_modes"],
+            ["UNSUPPORTED_DEEP_IMPACT", "UNSUPPORTED_NESTED_IMPACT", "UNSUPPORTED_TOP"],
+        )
+        html = render_html_report(bundle)
+        self.assertIn("<h2>Unsupported Failure Modes</h2>", html)
+        self.assertIn("UNSUPPORTED_DEEP_IMPACT", html)
+        self.assertIn("UNSUPPORTED_NESTED_IMPACT", html)
+
+    def test_pipeline_manifest_inputs_materials_and_requirements_rendered(self):
+        manifest = {
+            "schema_id": "gms.run-manifest/1",
+            "engine_version": "0.1.0",
+            "run_id": "run-0001",
+            "input_hashes": {"project": "abc123"},
+            "inputs": {
+                "materials": {
+                    "ABS": {
+                        "name": "ABS",
+                        "properties": {"density": {"value_si": 1040.0, "unit": "kg/m^3"}},
+                    }
+                },
+                "requirements": [{"id": "req-9", "title": "Survive drop", "internal": False}],
+            },
+        }
+        bundle = sample_bundle(qualification={"qualified": False, "gates": []}, manifest=manifest)
+        report = json.loads(render_json_report(bundle))
+        self.assertIn("ABS", report["materials"])
+        self.assertEqual([item["id"] for item in report["requirements"]], ["req-9"])
+        html = render_html_report(bundle)
+        self.assertIn("<h2>Materials</h2>", html)
+        self.assertIn("ABS", html)
+        self.assertIn("Survive drop", html)
 
 
 class RenderHtmlReportTests(unittest.TestCase):
@@ -105,7 +170,7 @@ class RenderHtmlReportTests(unittest.TestCase):
         html = render_html_report(sample_bundle())
         for name in (
             "Decision", "Mode &amp; Validity", "Mass", "Validation", "Analysis",
-            "Impact", "Qualification Gates", "Requirements", "Issues",
+            "Impact", "Materials", "Qualification Gates", "Requirements", "Issues",
             "Unsupported Failure Modes", "Provenance",
         ):
             self.assertIn("<h2>{}</h2>".format(name), html)

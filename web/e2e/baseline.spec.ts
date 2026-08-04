@@ -13,7 +13,7 @@ test.describe('model workspace', () => {
   test('geometry upload loads model and canvas', async () => {
     await modelLoaded(page);
     await expect(page.locator('.scene-viewport canvas')).toBeVisible();
-    await expect(page.locator('.status-live')).toHaveText('Complete', { timeout: 15_000 });
+    await expect(page.locator('.run-status__value')).toHaveText('Complete', { timeout: 15_000 });
     await expectNoConsoleErrors(page, errors);
   });
 
@@ -26,34 +26,41 @@ test.describe('model workspace', () => {
     await expect(page.locator('.inspector-panel')).toContainText('analytic');
   });
 
-  test('fit and exploded actions work', async () => {
+  test('fit and exploded actions work', async ({ viewport }) => {
     await modelLoaded(page);
-    const exploded = page.getByRole('button', { name: 'Exploded' });
-    await expect(exploded).toHaveAttribute('aria-pressed', 'false');
-    await expect(page.locator('.display-only-label')).toBeVisible();
-    await exploded.click();
-    await expect(exploded).toHaveAttribute('aria-pressed', 'true');
-    await exploded.click();
-    await expect(exploded).toHaveAttribute('aria-pressed', 'false');
+    // The exploded toggle group is hidden below 760px (styles.css responsive
+    // rules), so its behavior is only asserted on wider viewports.
+    if ((viewport?.width ?? 1440) >= 760) {
+      const exploded = page.getByRole('button', { name: 'Exploded' });
+      await expect(exploded).toHaveAttribute('aria-pressed', 'false');
+      await expect(page.locator('.display-only-label')).toBeVisible();
+      await exploded.click();
+      await expect(exploded).toHaveAttribute('aria-pressed', 'true');
+      await exploded.click();
+      await expect(exploded).toHaveAttribute('aria-pressed', 'false');
+    }
     await page.locator('.viewport-toolbar').getByRole('button', { name: 'Fit view' }).click();
   });
 
   test('result rail renders tabs and qualification disposition', async () => {
     await modelLoaded(page);
-    await expect(page.locator('.status-live')).toHaveText('Complete', { timeout: 15_000 });
+    await expect(page.locator('.run-status__value')).toHaveText('Complete', { timeout: 15_000 });
     await page.getByRole('tab', { name: 'qualification' }).click();
-    await expect(page.getByText('Exploration only')).toBeVisible();
+    await expect(
+      page.getByRole('row', { name: 'Evidence disposition', exact: true }).getByRole('status'),
+    ).toHaveText('Exploration only');
     await page.getByRole('tab', { name: 'structural' }).click();
-    await expect(page.getByText('No structural analysis was requested.')).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Structural response' })).toBeVisible();
+    await expect(page.getByRole('row', { name: /Method/ })).toContainText('shell_navier_v1');
     await page.getByRole('tab', { name: 'issues' }).click();
     await expect(page.getByText('No issues or validation findings reported.')).toBeVisible();
   });
 
   test('mode switch triggers rerun and qualification gate view', async () => {
     await modelLoaded(page);
-    await expect(page.locator('.status-live')).toHaveText('Complete', { timeout: 15_000 });
+    await expect(page.locator('.run-status__value')).toHaveText('Complete', { timeout: 15_000 });
     await page.getByRole('button', { name: 'Qualification' }).click();
-    await expect(page.locator('.status-live')).toHaveText('Complete', { timeout: 15_000 });
+    await expect(page.locator('.run-status__value')).toHaveText('Complete', { timeout: 15_000 });
     await expect(page.locator('.results-rail')).toContainText(/blocked|pending review|exploration only/i);
     await expectNoConsoleErrors(page, errors);
   });

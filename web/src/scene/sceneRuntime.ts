@@ -20,7 +20,7 @@ import {
   disposeObjectGroup,
   type ObjectSceneEntry,
 } from './geometryFactory';
-import { disposeSceneResources } from './disposal';
+import { disposeObject3D, disposeSceneResources } from './disposal';
 
 export interface RenderStats {
   drawCalls: number;
@@ -99,6 +99,30 @@ export function detectQualityTier(): QualityTier {
   return 'high';
 }
 
+function entriesSignature(entries: ObjectSceneEntry[]): string {
+  try {
+    return JSON.stringify(
+      entries.map((entry) => [entry.id, entry.className ?? null, entry.geometry]),
+    );
+  } catch {
+    // Circular data is malformed input; retain a conservative ID-based
+    // fallback rather than allowing a stats-driven render to throw.
+    return entries.map((entry) => String(entry.id)).join('|');
+  }
+}
+
+function idsSignature(entries: ObjectSceneEntry[]): string {
+  try {
+    return JSON.stringify(entries.map((entry) => entry.id));
+  } catch {
+    return entries.map((entry) => String(entry.id)).join('|');
+  }
+}
+
+function finiteBounds(bounds: { min: Vec3; max: Vec3 }): boolean {
+  return bounds.min.every((value) => Number.isFinite(value)) && bounds.max.every((value) => Number.isFinite(value));
+}
+
 export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   const { canvas } = opts;
   let theme = opts.theme;
@@ -167,19 +191,16 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
 
   const syncGridAndGround = () => {
     if (gridHelper) {
-      scene.remove(gridHelper);
-      gridHelper.geometry.dispose();
+      disposeObject3D(gridHelper);
       gridHelper = null;
     }
     if (groundMesh) {
-      scene.remove(groundMesh);
-      groundMesh.geometry.dispose();
-      (groundMesh.material as THREE.Material).dispose();
+      disposeObject3D(groundMesh);
       groundMesh = null;
     }
 
     const size = Math.max(maxDimension * 5, 0.2);
-    const gridColor = theme === 'dark' ? 0x2e333b : 0xdee2e6;
+    const gridColor = theme === 'dark' ? 0x2e2c25 : 0xd8d5cc;
     gridHelper = new THREE.GridHelper(size, 20, gridColor, gridColor);
     gridHelper.rotation.x = Math.PI / 2;
     gridHelper.userData.owned = true;
@@ -245,6 +266,8 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   let currentSelectionId: string | null = null;
   let currentExplodeFactor = 0;
   let currentIdSignature = '';
+  let currentEntriesSignature: string | null = null;
+  let disposed = false;
 
   const overlayLayer = createOverlayLayer(scene, { planeRadius: maxDimension / 2 });
 
@@ -258,6 +281,8 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     let minX = Infinity, minY = Infinity, minZ = Infinity;
     let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
 
+    let hasFiniteBounds = false;
+
     for (const entry of currentEntries) {
       const outerGroup = new THREE.Group();
       outerGroup.userData.objectId = entry.id;
@@ -270,28 +295,33 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       outerGroup.add(innerGroup);
 
       const bounds = worldBoundsForGeometry(entry.geometry);
-      minX = Math.min(minX, bounds.min[0]);
-      minY = Math.min(minY, bounds.min[1]);
-      minZ = Math.min(minZ, bounds.min[2]);
-      maxX = Math.max(maxX, bounds.max[0]);
-      maxY = Math.max(maxY, bounds.max[1]);
-      maxZ = Math.max(maxZ, bounds.max[2]);
+      if (finiteBounds(bounds)) {
+        hasFiniteBounds = true;
+        minX = Math.min(minX, bounds.min[0]);
+        minY = Math.min(minY, bounds.min[1]);
+        minZ = Math.min(minZ, bounds.min[2]);
+        maxX = Math.max(maxX, bounds.max[0]);
+        maxY = Math.max(maxY, bounds.max[1]);
+        maxZ = Math.max(maxZ, bounds.max[2]);
+      }
 
       objectsGroup.add(outerGroup);
     }
 
-    if (currentEntries.length > 0) {
+    if (hasFiniteBounds) {
       boundsUnion = { min: [minX, minY, minZ], max: [maxX, maxY, maxZ] };
       const dx = maxX - minX;
       const dy = maxY - minY;
       const dz = maxZ - minZ;
-      maxDimension = Math.max(dx, dy, dz, 0.05);
+      const dimension = Math.max(dx, dy, dz, 0.05);
+      maxDimension = Number.isFinite(dimension) ? dimension : 0.1;
     } else {
       boundsUnion = { min: [-0.05, -0.05, -0.05], max: [0.05, 0.05, 0.05] };
       maxDimension = 0.1;
     }
 
     syncGridAndGround();
+    overlayLayer.setPlaneRadius(maxDimension / 2);
     applyExplode();
     applySelection();
   };
@@ -342,7 +372,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
           if (!originalEmissiveMap.has(mat)) {
             originalEmissiveMap.set(mat, mat.emissive.getHex());
           }
-          mat.emissive.setHex(0x1d4ed8);
+          mat.emissive.setHex(0x403d36);
         }
       }
     });
@@ -366,8 +396,8 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     composer?.setSize(width, height);
   };
 
-  const resizeObserver = new ResizeObserver(() => resize());
-  if (canvas.parentElement) {
+  const resizeObserver = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(() => resize());
+  if (resizeObserver && canvas.parentElement) {
     resizeObserver.observe(canvas.parentElement);
   }
   resize();
@@ -378,10 +408,11 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   });
 
   // Render loop
-  let animationFrameId: number;
+  let animationFrameId: number | null = null;
   let frameCount = 0;
 
   const renderLoop = () => {
+    if (disposed) return;
     animationFrameId = requestAnimationFrame(renderLoop);
     controls.update();
 
@@ -406,37 +437,45 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
 
   return {
     setObjects(entries: ObjectSceneEntry[]) {
+      if (disposed) return;
       currentEntries = entries;
-      const signature = entries.map((e) => e.id).join('|');
-      const first = currentIdSignature === '';
+      const signature = entriesSignature(entries);
+      if (currentEntriesSignature === signature) return;
+
+      const idSignature = idsSignature(entries);
+      const first = currentEntriesSignature === null;
+      currentEntriesSignature = signature;
       rebuildObjects();
 
-      if (first || signature !== currentIdSignature) {
-        currentIdSignature = signature;
+      if (first || idSignature !== currentIdSignature) {
+        currentIdSignature = idSignature;
         fitCameraToBounds(camera, controls, boundsUnion);
       }
     },
 
     setSelection(id: string | null) {
+      if (disposed) return;
       currentSelectionId = id;
       applySelection();
     },
 
     setExplode(factor: number) {
+      if (disposed || factor === currentExplodeFactor) return;
       currentExplodeFactor = factor;
       applyExplode();
     },
 
     setTheme(newTheme: 'light' | 'dark') {
+      if (disposed || newTheme === theme) return;
       theme = newTheme;
       palette.dispose();
       palette = new MaterialPalette(theme);
-      scene.background = new THREE.Color(theme === 'dark' ? 0x14161a : 0xf4f5f7);
-      syncGridAndGround();
+scene.background = new THREE.Color(theme === 'dark' ? 0x141310 : 0xf7f7f4);
       rebuildObjects();
     },
 
     setQuality(newQuality: QualityTier) {
+      if (disposed || newQuality === quality) return;
       quality = newQuality;
       updatePixelRatio();
       renderer.shadowMap.enabled = quality !== 'low';
@@ -444,19 +483,21 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       keyLight.shadow.mapSize.width = quality === 'high' ? 1024 : 512;
       keyLight.shadow.mapSize.height = quality === 'high' ? 1024 : 512;
       initComposer();
-      syncGridAndGround();
       rebuildObjects();
     },
 
     setOverlays(spec: OverlaySpec | null) {
+      if (disposed) return;
       overlayLayer.apply(spec);
     },
 
     fit() {
+      if (disposed) return;
       fitCameraToBounds(camera, controls, boundsUnion);
     },
 
     preset(name: CameraPreset) {
+      if (disposed) return;
       const center = [
         (boundsUnion.min[0] + boundsUnion.max[0]) / 2,
         (boundsUnion.min[1] + boundsUnion.max[1]) / 2,
@@ -477,8 +518,10 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     },
 
     dispose() {
-      cancelAnimationFrame(animationFrameId);
-      resizeObserver.disconnect();
+      if (disposed) return;
+      disposed = true;
+      if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
+      resizeObserver?.disconnect();
       picker.dispose();
       controls.dispose();
       composer?.dispose();
@@ -491,6 +534,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       }
       disposeSceneResources(scene);
       renderer.dispose();
+      if (typeof renderer.forceContextLoss === 'function') renderer.forceContextLoss();
     },
   };
 }
