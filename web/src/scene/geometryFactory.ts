@@ -7,6 +7,8 @@ export interface ObjectSceneEntry {
   id: string;
   geometry: GeometryJson;
   className?: string | null;
+  displayAssetUrl?: string | null;
+  color?: [number, number, number] | null;
 }
 
 export interface FactoryOptions {
@@ -166,6 +168,11 @@ export function createObjectGroup(entry: ObjectSceneEntry, opts?: FactoryOptions
   group.userData.className = entry.className ?? null;
   group.userData.meshObjects = [] as THREE.Mesh[];
 
+  // A kernel-backed STEP preview has a native GLB display asset. The scene
+  // runtime loads it asynchronously; keep the normalized mesh only for
+  // bounds/analysis and avoid rendering two overlapping representations.
+  if (entry.displayAssetUrl) return group;
+
   const quality = opts?.quality ?? 'high';
   const sphereSegments = quality === 'high' ? 32 : quality === 'medium' ? 24 : 16;
   const sphereRings = quality === 'high' ? 16 : quality === 'medium' ? 12 : 8;
@@ -186,7 +193,26 @@ export function createObjectGroup(entry: ObjectSceneEntry, opts?: FactoryOptions
     }
 
     const key = paletteKeyForComponent(entry.className ?? null);
-    const material = resolveMaterial(key);
+    const material = entry.color
+      ? (() => {
+          // Kernel-tessellated STEP parts carry their CAD presentation color;
+          // own the material so disposal never touches the shared palette.
+          // CAD colors are sRGB; the renderer outputs sRGB with ACES tone
+          // mapping, so convert once to linear.
+          const colored = new THREE.MeshStandardMaterial({
+            color: new THREE.Color().setRGB(
+              entry.color[0],
+              entry.color[1],
+              entry.color[2],
+              THREE.SRGBColorSpace,
+            ),
+            roughness: 0.6,
+            metalness: 0.1,
+          });
+          colored.userData.owned = true;
+          return colored;
+        })()
+      : resolveMaterial(key);
     let mesh: THREE.Mesh | null = null;
     let createdGeometry: THREE.BufferGeometry | null = null;
     let wireframeMaterial: THREE.LineBasicMaterial | null = null;
@@ -299,7 +325,12 @@ export function createObjectGroup(entry: ObjectSceneEntry, opts?: FactoryOptions
     const container = new THREE.Group();
     entry.geometry.children.forEach((child: GeometryJson, index: number) => {
       const childGroup = createObjectGroup(
-        { id: `${entry.id}:${index}`, geometry: child, className: entry.className },
+        {
+          id: `${entry.id}:${index}`,
+          geometry: child,
+          className: entry.className,
+          color: entry.color,
+        },
         opts,
       );
       if (childGroup.userData.meshObjects.length > 0) container.add(childGroup);

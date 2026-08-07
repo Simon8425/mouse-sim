@@ -493,6 +493,90 @@ class ConvergenceEvidenceTests(unittest.TestCase):
         self.assertEqual(payload["structural_validity"], "valid")
 
 
+class RobustnessQualificationTests(unittest.TestCase):
+    def test_nan_correlation_values_do_not_crash(self):
+        data = approved_inputs()
+        data["method"] = dict(data["method"])
+        data["method"]["required_correlation_policy"] = {
+            "required": True,
+            "required_record_types": ("static_correlation",),
+            "require_reviewed_records": True,
+            "maximum_error_fraction": 0.1,
+        }
+        data["correlation_records"] = (
+            {
+                "record_type": "static_correlation",
+                "review_state": "approved",
+                "comparisons": (
+                    {"metric_key": "deflection", "measured": float("nan"), "predicted": 1.0},
+                    {"metric_key": "stress", "predicted": 0.0, "measured": 1.0},
+                    {"metric_key": "force", "relative_error": float("inf")},
+                ),
+            },
+        )
+        result = evaluate_qualification("qualification", **data)
+        self.assertEqual(result.evidence_disposition, "qualification_pending_review")
+        self.assertNotIn("CORRELATION_ERROR", result.blocking_keys)
+
+    def test_missing_evidence_with_conflicting_claims_blocks(self):
+        result = evaluate_qualification("qualification", **approved_inputs(
+            validation_report={"findings": ({"code": "E", "evidence_blocking": True},)},
+            structural_response={"validity": "failed"},
+        ))
+        self.assertEqual(result.evidence_disposition, "qualification_blocked")
+        self.assertIn("NO_BLOCKING_ISSUES", result.blocking_keys)
+        self.assertIn("ANALYSIS_VALIDITY", result.blocking_keys)
+        failed_gates = [gate.key for gate in result.integrity_gates if not gate.passed]
+        self.assertEqual(
+            sorted(failed_gates),
+            sorted(("ANALYSIS_VALIDITY", "CONVERGENCE_EVIDENCE")),
+        )
+
+    def test_requirements_list_only_still_evaluates_governing_requirement_gate(self):
+        requirement = {"status": "active", "acceptance": {"metric_key": "deflection"}}
+        result = evaluate_qualification(
+            "qualification",
+            **approved_inputs(requirement=None, requirements=[requirement]),
+        )
+        gate = {item.key: item for item in result.gates}["REQUIREMENT_ACTIVE"]
+        self.assertTrue(gate.passed)
+        self.assertEqual(result.evidence_disposition, "qualification_pending_review")
+
+    def test_requirements_list_only_with_unapproved_first_requirement_blocks(self):
+        requirement = {"status": "draft", "acceptance": {"metric_key": "deflection"}}
+        result = evaluate_qualification(
+            "qualification",
+            **approved_inputs(requirement=None, requirements=[requirement]),
+        )
+        gate = {item.key: item for item in result.gates}["REQUIREMENT_ACTIVE"]
+        self.assertFalse(gate.passed)
+        self.assertIn("REQUIREMENT_ACTIVE", result.blocking_keys)
+
+    def test_materials_single_definition_mapping_gate_blocks_when_unapproved(self):
+        result = evaluate_qualification("qualification", **approved_inputs(
+            materials={"meta": {"entity_type": "MaterialDefinition", "id": "mat_x"},
+                       "properties": {"density": 1040},
+                       "provenance": {"source_type": "supplier", "source_id": "s1",
+                                      "condition": "c", "confidence": "high"}},
+        ))
+        gate = {item.key: item for item in result.gates}["MATERIALS_APPROVED"]
+        self.assertFalse(gate.passed)
+        self.assertIn("MATERIALS_APPROVED", result.blocking_keys)
+
+    def test_empty_findings_report_passes_no_blocking_issues(self):
+        result = evaluate_qualification("qualification", **approved_inputs(
+            validation_report={"findings": (), "status": "pass"},
+        ))
+        gate = {item.key: item for item in result.gates}["NO_BLOCKING_ISSUES"]
+        self.assertTrue(gate.passed)
+        self.assertNotIn("NO_BLOCKING_ISSUES", result.blocking_keys)
+
+    def test_max_disposition_is_never_accepted(self):
+        result = evaluate_qualification("qualification", **approved_inputs())
+        self.assertEqual(result.evidence_disposition, "qualification_pending_review")
+        self.assertNotEqual(result.evidence_disposition, "qualification_accepted")
+
+
 if __name__ == "__main__":
     unittest.main()
 

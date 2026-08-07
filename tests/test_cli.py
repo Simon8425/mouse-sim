@@ -266,10 +266,21 @@ class ImportTests(unittest.TestCase):
     def test_unsupported_format_exits_thirty(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "model.step"
-            source.write_text("ISO-10303-21;", encoding="utf-8")
-            result = run_cli("import", "--input", str(source), "--format", "step", "--units", "mm")
+            source = root / "model.iges"
+            source.write_text("Start of IGES file", encoding="utf-8")
+            result = run_cli("import", "--input", str(source), "--format", "iges")
         self.assertEqual(result.returncode, 30)
+
+    def test_faceted_step_import_exits_zero(self):
+        fixture = REPO_ROOT / "tests" / "fixtures" / "faceted_cube.step"
+        result = run_cli("import", "--input", str(fixture), "--format", "step")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["schema"], "gms.normalized-geometry/1")
+        self.assertEqual(payload["format"], "step")
+        self.assertEqual(payload["source_units"], "mm")
+        self.assertEqual(payload["geometry"]["type"], "mesh")
+        self.assertEqual(len(payload["geometry"]["triangles"]), 12)
 
     def test_json_geometry_import_exits_zero(self):
         with tempfile.TemporaryDirectory() as directory:

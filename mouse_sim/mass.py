@@ -158,6 +158,8 @@ class MassPropertiesResult:
 def _unwrap_geometry(value):
     if value is None:
         return None
+    if isinstance(value, Mapping) and "geometry" in value:
+        return value["geometry"]
     geometry = getattr(value, "geometry", None)
     if geometry is not None and not isinstance(value, Geometry):
         return geometry

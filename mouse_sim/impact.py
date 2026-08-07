@@ -65,6 +65,7 @@ CONTACT_MODEL_STOPPING_DISTANCE = "stopping_distance"
 HERTZ_EFFECTIVE_MODULUS_DEFAULT_PA = 1e9
 HERTZ_CONTACT_DURATION_FACTOR = 2.94
 PEAK_FORCE_CONSERVATIVE_FACTOR = 2.0
+_MAX_SCREENING_LIFE_CYCLES = 1e18
 _IMPACT_SOLVER_METADATA = {
     "model_family": "energy_quasi_static_screening",
     "model_id": SCREENING_SURROGATE_MODEL_ID,
@@ -305,6 +306,13 @@ def _energy_partition(total_mass, inertia, normal, impulse, offset):
     translational = j_squared / (2.0 * total_mass)
     rotational = 0.5 * j_squared * max(0.0, k)
     total = translational + rotational
+    if not (
+        math.isfinite(translational) and math.isfinite(rotational) and math.isfinite(total)
+    ):
+        return None, [
+            "rotational energy partition not estimated: partition quantities overflowed "
+            "for the screening surrogate"
+        ]
     partition = {
         "model": "rigid_body_impulse_partition",
         "total_mass_kg": total_mass,
@@ -490,6 +498,16 @@ def estimate_impact(
     partition_mass = total_mass if total_mass is not None else effective_mass
     energy = 0.5 * effective_mass * normal_velocity * normal_velocity
     impulse = effective_mass * (1.0 + restitution) * normal_velocity
+    if (
+        not math.isfinite(energy)
+        or not math.isfinite(impulse)
+        or (normal_velocity > 0.0 and energy <= 0.0)
+    ):
+        return _failed(
+            INVALID_KINEMATICS,
+            "impact energy or impulse is not finite; input magnitudes out of range "
+            "for the screening surrogate",
+        )
     values = {}
     for name, value, flag in (
         ("contact_stiffness_n_per_m", contact_stiffness_n_per_m, INVALID_STIFFNESS),
@@ -586,6 +604,12 @@ def estimate_impact(
         force_text = "peak force not estimated: supply contact_stiffness_n_per_m, stopping_distance_m, or contact_duration_s (PEAK_FORCE_NOT_ESTIMATED)"
     response_force = peak_force_estimate if peak_force_estimate is not None else peak_force
     peak_acceleration = response_force / effective_mass
+    computed = (energy, impulse, peak_force, peak_acceleration, contact_duration, compression)
+    if not all(math.isfinite(value) for value in computed):
+        return _failed(
+            INVALID_KINEMATICS,
+            "impact estimate overflowed; input magnitudes out of range for the screening surrogate",
+        )
     stress_label = "conservative peak-force estimate" if stopping is not None else "peak force"
     if force_estimated:
         stress, stress_texts = _load_path_stress(
@@ -717,6 +741,11 @@ def _load_path_stress(force, area, lever, modulus, force_label="peak force"):
         texts.append("bending omitted: load_path_lever_arm_m and section_modulus_m3 must both be supplied")
     if stress is None:
         texts.append("load-path stress not computed: load_path_area_m2 required")
+    if stress is not None and not math.isfinite(stress):
+        return _failed(
+            INVALID_LOAD_PATH,
+            "load-path stress overflowed; input magnitudes out of range for the screening surrogate",
+        ), ()
     return stress, texts
 
 
@@ -730,7 +759,16 @@ def _cycles_to_failure(stress, curve):
             return min(candidates)
         return min(max(1.0, float(life)) for life in curve.values())
     # Conservative screening power law: 1e6 cycles at 1 MPa, exponent 3.
-    return max(1.0, 1e6 * (1e6 / stress) ** 3)
+    # The life is capped so astronomically low stresses cannot overflow into
+    # inf and corrupt JSON output; a capped life contributes ~0 damage.
+    ratio = 1e6 / stress
+    try:
+        life = 1e6 * ratio ** 3
+    except OverflowError:
+        life = float("inf")
+    if not math.isfinite(life) or life > _MAX_SCREENING_LIFE_CYCLES:
+        return _MAX_SCREENING_LIFE_CYCLES
+    return max(1.0, life)
 
 
 def _cycle_levels(cycles_n, stress_amplitude_pa):

@@ -20,6 +20,8 @@ export function FileDropzone({ onClose }: FileDropzoneProps): React.ReactElement
   const [selectedFile, setSelectedFile] = React.useState<File | null>(null);
   const [selectedUnits, setSelectedUnits] = React.useState<LengthUnit>('mm');
   const [isParsing, setIsParsing] = React.useState(false);
+  const processingRef = React.useRef(false);
+  const processingNameRef = React.useRef<string | null>(null);
 
   React.useEffect(() => {
     return () => {
@@ -48,66 +50,73 @@ export function FileDropzone({ onClose }: FileDropzoneProps): React.ReactElement
     dispatch({ type: 'PREVIEW_ERROR', message, diagnostics, preview, version });
   };
 
+  const normalizeServerSide = async (
+    format: 'json' | 'step',
+    file: File,
+    controller: AbortController,
+    version: number,
+  ): Promise<void> => {
+    try {
+      const buf = await file.arrayBuffer();
+      if (!isCurrentUpload(version)) return;
+      const preview = await clientRef.current.normalizeGeometry(
+        {
+          format,
+          name: file.name,
+          body: buf,
+        },
+        controller.signal,
+      );
+      if (!isCurrentUpload(version)) return;
+
+      if (isUnsupportedGeometryPreview(preview)) {
+        reportPreviewError(
+          version,
+          preview.diagnostics[0]?.message ?? 'Geometry preview is unsupported',
+          preview.diagnostics,
+          preview,
+        );
+        return;
+      }
+
+      dispatch({ type: 'PREVIEW_OK', preview, version });
+      onClose?.();
+    } catch (err: unknown) {
+      if (!isCurrentUpload(version) || isAbortError(err)) return;
+      reportPreviewError(version, errorMessage(err), null);
+    } finally {
+      if (isCurrentUpload(version)) {
+        abortRef.current = null;
+        processingRef.current = false;
+        processingNameRef.current = null;
+        setIsParsing(false);
+      }
+    }
+  };
+
   const handleFileSelect = (file: File) => {
+    if (processingRef.current) return;
     const name = file.name.toLowerCase();
-    if (name.endsWith('.json')) {
-      // Normalize JSON immediately
+    if (name.endsWith('.json') || name.endsWith('.step') || name.endsWith('.stp')) {
       const version = invalidateUpload();
       const controller = new AbortController();
       abortRef.current = controller;
-      setIsParsing(false);
+      processingRef.current = true;
+      processingNameRef.current = file.name;
+      setIsParsing(true);
       setSelectedFile(null);
       dispatch({ type: 'PREVIEW_START', temp: null, version });
-
-      void (async () => {
-        try {
-          const buf = await file.arrayBuffer();
-          if (!isCurrentUpload(version)) return;
-          const preview = await clientRef.current.normalizeGeometry(
-            {
-              format: 'json',
-              name: file.name,
-              body: buf,
-            },
-            controller.signal,
-          );
-          if (!isCurrentUpload(version)) return;
-
-          if (isUnsupportedGeometryPreview(preview)) {
-            reportPreviewError(
-              version,
-              preview.diagnostics[0]?.message ?? 'Geometry preview is unsupported',
-              preview.diagnostics,
-              preview,
-            );
-            return;
-          }
-
-          dispatch({ type: 'PREVIEW_OK', preview, version });
-          onClose?.();
-        } catch (err: unknown) {
-          if (!isCurrentUpload(version) || isAbortError(err)) return;
-          reportPreviewError(version, errorMessage(err), null);
-        } finally {
-          if (isCurrentUpload(version)) abortRef.current = null;
-        }
-      })();
+      void normalizeServerSide(name.endsWith('.json') ? 'json' : 'step', file, controller, version);
     } else if (name.endsWith('.obj') || name.endsWith('.stl')) {
       invalidateUpload();
+      processingRef.current = false;
+      processingNameRef.current = null;
       setIsParsing(false);
       setSelectedFile(file);
-    } else if (name.endsWith('.step') || name.endsWith('.stp')) {
-      const version = invalidateUpload();
-      setIsParsing(false);
-      setSelectedFile(null);
-      dispatch({ type: 'PREVIEW_START', temp: null, version });
-      reportPreviewError(
-        version,
-        'STEP file format requires server CAD converter plugin',
-        null,
-      );
     } else {
       const version = invalidateUpload();
+      processingRef.current = false;
+      processingNameRef.current = null;
       setIsParsing(false);
       setSelectedFile(null);
       dispatch({ type: 'PREVIEW_START', temp: null, version });
@@ -222,7 +231,11 @@ export function FileDropzone({ onClose }: FileDropzoneProps): React.ReactElement
         }}
       />
 
-      {!selectedFile ? (
+      {isParsing && !selectedFile ? (
+        <div className="dropzone-processing">
+          <p>Processing <strong>{processingNameRef.current ?? 'geometry file'}</strong>… this can take a while for large STEP models.</p>
+        </div>
+      ) : !selectedFile ? (
         <div
           role="button"
           tabIndex={0}
@@ -242,7 +255,7 @@ export function FileDropzone({ onClose }: FileDropzoneProps): React.ReactElement
             }
           }}
         >
-          <p>Drop geometry file (.json, .obj, .stl) or click to browse</p>
+          <p>Drop geometry file (.json, .obj, .stl, .step/.stp) or click to browse</p>
         </div>
       ) : (
         <div className="dropzone-unit-selector">

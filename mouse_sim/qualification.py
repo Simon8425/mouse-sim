@@ -816,6 +816,9 @@ def evaluate_qualification(
         requirement_list = tuple(requirements)
     else:
         requirement_list = (requirements,)
+    governing_requirement = requirement
+    if governing_requirement is None and requirement_list:
+        governing_requirement = requirement_list[0]
     requirement_evaluations = tuple(
         _evaluate_requirement(item, pipeline_result) for item in requirement_list
     )
@@ -830,7 +833,7 @@ def evaluate_qualification(
         _evidence_gate("CONVERGENCE", method, "require_convergence", convergence_evidence),
         _evidence_gate("FORCE_BALANCE", method, "require_force_balance", force_balance),
         _correlation_gate(method, correlation_records),
-        _requirement_gate(requirement),
+        _requirement_gate(governing_requirement),
         _validation_gate(validation_report),
     ]
     integrity_gates = [

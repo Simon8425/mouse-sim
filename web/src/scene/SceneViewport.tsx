@@ -17,12 +17,14 @@ export interface SceneViewportHandle {
 
 export interface SceneViewportProps {
   entries: ObjectSceneEntry[];
+  visibility: Record<string, boolean>;
   selectedId: string | null;
   explode: number;
   theme: 'light' | 'dark';
   quality: QualityTier;
   overlays: OverlaySpec | null;
   onPick: (id: string | null) => void;
+  onDoublePick?: (id: string | null) => void;
   onStats?: (stats: RenderStats) => void;
   onWebGLUnsupported?: (reason: string) => void;
 }
@@ -101,6 +103,7 @@ export const SceneViewport = React.forwardRef<
 
     // Initial sync
     runtime.setObjects(propsRef.current.entries);
+    runtime.setVisibility(propsRef.current.visibility);
     runtime.setSelection(propsRef.current.selectedId);
     runtime.setExplode(propsRef.current.explode);
     runtime.setOverlays(propsRef.current.overlays);
@@ -115,6 +118,10 @@ export const SceneViewport = React.forwardRef<
   React.useEffect(() => {
     runtimeRef.current?.setObjects(props.entries);
   }, [props.entries]);
+
+  React.useEffect(() => {
+    runtimeRef.current?.setVisibility(props.visibility);
+  }, [props.visibility]);
 
   React.useEffect(() => {
     runtimeRef.current?.setSelection(props.selectedId);

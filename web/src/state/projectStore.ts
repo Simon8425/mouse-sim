@@ -65,6 +65,8 @@ export interface ProjectState {
   previewRequestVersion: number;
   controlOpen: boolean;
   runNonce: number;
+  objectMaterials: Record<string, string>;
+  partGeometry: Record<string, GeometryJson> | null;
 }
 
 /** Union of all actions accepted by the project reducer. */
@@ -108,7 +110,14 @@ export type ProjectAction =
   | { type: 'SET_INSPECTOR_OPEN'; open: boolean }
   | { type: 'SET_WEBGL_ERROR'; message: string | null }
   | { type: 'SET_CONTROL_OPEN'; open: boolean }
-  | { type: 'RUN_STUDY' };
+  | { type: 'RUN_STUDY' }
+  | { type: 'SET_OBJECT_MATERIAL'; objectId: string; materialKey: string | null }
+  | {
+      type: 'PARTS_OK';
+      assetId: string;
+      parts: { id: string; name: string; geometry: GeometryJson }[];
+    }
+  | { type: 'PARTS_ERROR'; assetId: string };
 
 /** Pure reducer managing all project store state transitions. */
 export function reducer(state: ProjectState, action: ProjectAction): ProjectState {
@@ -171,6 +180,7 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
       const version = action.version ?? state.previewRequestVersion + 1;
       return {
         ...resetGeometryView(state),
+        navOpen: true,
         previewRequestVersion: version,
         tempPreview: action.temp,
         previewStatus: 'working',
@@ -190,6 +200,7 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
         const message = action.preview.diagnostics[0]?.message ?? 'Geometry preview is unsupported';
         return {
           ...resetGeometryView(state),
+          navOpen: true,
           preview: action.preview,
           previewStatus: 'error',
           previewError: message,
@@ -199,6 +210,7 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
       }
       return {
         ...resetGeometryView(state),
+        navOpen: true,
         preview: action.preview,
         previewStatus: 'ready',
         tempPreview: null,
@@ -267,6 +279,27 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
       return { ...state, qualityTier: action.tier };
     case 'SET_NAV_OPEN':
       return { ...state, navOpen: action.open };
+    case 'SET_OBJECT_MATERIAL': {
+      const objectMaterials = { ...state.objectMaterials };
+      if (action.materialKey === null) {
+        delete objectMaterials[action.objectId];
+      } else {
+        objectMaterials[action.objectId] = action.materialKey;
+      }
+      return { ...state, objectMaterials };
+    }
+    case 'PARTS_OK': {
+      if (state.preview?.display_asset?.asset_id !== action.assetId) return state;
+      const partGeometry: Record<string, GeometryJson> = {};
+      for (const part of action.parts) {
+        if (!isGeometryJson(part.geometry)) continue;
+        partGeometry[part.id] = part.geometry;
+      }
+      return { ...state, partGeometry };
+    }
+    case 'PARTS_ERROR':
+      if (state.preview?.display_asset?.asset_id !== action.assetId) return state;
+      return { ...state, partGeometry: null };
     case 'SET_INSPECTOR_OPEN':
       return { ...state, inspectorOpen: action.open };
     case 'SET_WEBGL_ERROR':
@@ -315,6 +348,8 @@ export const initialState: ProjectState = {
   previewRequestVersion: 0,
   controlOpen: false,
   runNonce: 0,
+  objectMaterials: {},
+  partGeometry: null,
 };
 
 /** Reset view state that is keyed to the currently displayed geometry source. */
@@ -324,6 +359,8 @@ function resetGeometryView(state: ProjectState): ProjectState {
     selectedId: null,
     isolatedId: null,
     visibility: {},
+    objectMaterials: {},
+    partGeometry: null,
   };
 }
 
@@ -332,6 +369,9 @@ export interface ObjectEntry {
   id: string;
   geometry: GeometryJson;
   className: string | null;
+  displayAssetUrl?: string | null;
+  name?: string | null;
+  color?: [number, number, number] | null;
 }
 
 /** Build the analysis request from the current state, or null when there is nothing to analyze. */
@@ -344,7 +384,30 @@ export function createAnalysisRequest(state: ProjectState): PipelineRequest | nu
   const base: PipelineRequest = state.draft ?? state.project ?? {};
   const request: PipelineRequest = { ...base, mode: state.mode, units: base.units ?? 'mm' };
   if (previewGeometry && isGeometryJson(previewGeometry)) {
-    request.objects = [{ id: state.preview?.source_name ?? 'upload', geometry: previewGeometry }];
+    const parts = state.preview?.display_asset?.parts ?? null;
+    const geometries = state.partGeometry;
+    if (parts && parts.length > 0 && geometries && parts.every((part) => geometries[part.id])) {
+      request.objects = parts.map((part) => {
+        const materialKey = state.objectMaterials[part.id];
+        const entry: Record<string, unknown> = { id: part.id, geometry: geometries[part.id] };
+        if (materialKey) entry.material = materialKey;
+        return entry;
+      });
+    } else {
+      const objectId = state.preview?.source_name ?? 'upload';
+      const materialKey = state.objectMaterials[objectId];
+      request.objects = [
+        materialKey
+          ? { id: objectId, geometry: previewGeometry, material: materialKey }
+          : { id: objectId, geometry: previewGeometry },
+      ];
+    }
+    // Kernel-backed STEP previews are CAD display tessellations (open,
+    // multi-body, arbitrary winding). The pipeline treats their topology
+    // findings as approximations instead of hard validation blockers.
+    if (state.preview?.display_asset) {
+      request.options = { ...(request.options ?? {}), display_tessellation: true };
+    }
   }
   return request;
 }
@@ -365,7 +428,30 @@ export function computeObjectEntries(state: ProjectState): ObjectEntry[] {
     state.preview.geometry &&
     isGeometryJson(state.preview.geometry)
   ) {
-    return [{ id: state.preview.source_name ?? 'upload', geometry: state.preview.geometry, className: null }];
+    const parts = state.preview.display_asset?.parts ?? null;
+    const geometries = state.partGeometry;
+    if (parts && parts.length > 0 && geometries) {
+      const entries: ObjectEntry[] = [];
+      for (const part of parts) {
+        const geometry = geometries[part.id];
+        if (!geometry) continue;
+        entries.push({
+          id: part.id,
+          name: part.name,
+          geometry,
+          className: 'mesh',
+          displayAssetUrl: null,
+          color: part.color ?? null,
+        });
+      }
+      if (entries.length > 0) return entries;
+    }
+    return [{
+      id: state.preview.source_name ?? 'upload',
+      geometry: state.preview.geometry,
+      className: null,
+      displayAssetUrl: state.preview.display_asset?.url ?? null,
+    }];
   }
   if (state.tempPreview && !state.preview) {
     return [{ id: state.tempPreview.id, geometry: state.tempPreview.geometry, className: 'mesh' }];

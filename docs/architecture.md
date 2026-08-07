@@ -14,7 +14,7 @@ centralized control panel combining:
 - **System monitoring** — engine version, API version, cache status, and supported
   geometry formats surfaced from `GET /api/health` (`gms.web-health/1`), rendered
   in the top bar with a live status badge.
-- **Study launcher** — boot the server-owned baseline project, upload a geometry
+- **Study launcher** — upload a geometry
   part, or run an analysis (`POST /api/analyze`) from one screen; results stream
   into the model tree, inspector panel, and results rail.
 
@@ -40,18 +40,25 @@ presentation layer that consumes the deterministic API.
    STL (binary via length-exact triangle-count check, or ASCII), applies the
    requested unit factor, deduplicates vertices, and returns typed arrays plus a
    capped warnings list (max 50 warnings). Parse failures return a structured
-   `ParseError` to the main thread.
-2. **Normalize** — the parsed preview is posted to
+   `ParseError` to the main thread. JSON and STEP/STP uploads skip the worker and
+    normalize server-side immediately: simple faceted STEP can use the stdlib
+    path, while advanced assembly STEP is sent through the isolated
+    FreeCAD/OCCT worker and produces a native GLB display asset.
+2. **Normalize** — the parsed preview (or the raw JSON/STEP bytes) is posted to
    `POST /api/geometry/normalize?format=...&units=...` (`gms.geometry-preview/1`).
-   The Python importer (`importers.load_geometry`) runs again server-side.
+    The Python importer (`importers.load_geometry`) runs again server-side.
+    Advanced B-rep uses `step_kernel.py` and FreeCAD/OCCT so placements,
+    colors, holes, and curved surfaces are tessellated by the CAD kernel.
 3. **422 envelopes with diagnostics** — unsupported formats return
-   `E_INVALID_FORMAT`; `UnitError` yields an `invalid_units` blocker diagnostic and
-   `ValueError` a `parse_failed` error diagnostic, both wrapped in the
-   `gms.geometry-preview/1` envelope with `supported: false` and the diagnostics
-   attached. The client deliberately accepts 422 as a valid envelope carrying
-   preview error diagnostics (`accept422` in `api/client.ts`), so failures render
-   in the dashboard with their machine-readable reason instead of being treated as
-   transport errors.
+    `E_INVALID_FORMAT`; unavailable or failed FreeCAD/OCCT returns
+    `step_kernel_unavailable`/`step_kernel_failed` blocker diagnostics;
+    `UnitError` yields an
+   `invalid_units` blocker diagnostic and `ValueError` a `parse_failed` error
+   diagnostic, all wrapped in the `gms.geometry-preview/1` envelope with
+   `supported: false` and the diagnostics attached. The client deliberately
+   accepts 422 as a valid envelope carrying preview error diagnostics
+   (`accept422` in `api/client.ts`), so failures render in the dashboard with
+   their machine-readable reason instead of being treated as transport errors.
 
 ## Scene hardening
 
@@ -89,5 +96,5 @@ tracked and disposed on re-apply and teardown.
 | Health | `GET /api/health` | `gms.web-health/1` | — |
 | Baseline boot | `GET /api/projects/baseline` | `gms.web-baseline/1` | 404 `E_NOT_FOUND` |
 | Materials | `GET /api/materials` | `gms.web-material-catalog/1` | — |
-| Upload normalize | `POST /api/geometry/normalize` | `gms.geometry-preview/1` | 422 envelope + diagnostics (`E_INVALID_FORMAT`, `invalid_units`, `parse_failed`) |
+| Upload normalize | `POST /api/geometry/normalize` | `gms.geometry-preview/1` | 422 envelope + diagnostics (`E_INVALID_FORMAT`, `step_kernel_unavailable`, `step_kernel_failed`, `invalid_units`, `parse_failed`); advanced STEP returns a kernel mesh plus GLB asset |
 | Analyze | `POST /api/analyze` | `gms.web-analysis-request/1` → `gms.web-analysis-response/1` | 422/500 web-error envelopes (`E_INVALID_ENVELOPE`, pipeline validation failures) |

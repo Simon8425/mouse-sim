@@ -1,7 +1,5 @@
 import * as React from 'react';
 import { useProjectStore } from '../state/projectStore';
-import { createClient } from '../api/client';
-import { loadBaseline } from '../lib/boot';
 import { STUDY_PRESETS, type StudyPreset } from '../lib/studies';
 import {
   selectEvidenceCount,
@@ -92,9 +90,7 @@ function Chips({ items }: { items: string[] }): React.ReactElement {
 
 export function MissionControl({ onClose, onUpload }: MissionControlProps): React.ReactElement {
   const { state, dispatch } = useProjectStore();
-  const clientRef = React.useRef(createClient());
   const panelRef = React.useRef<HTMLDivElement | null>(null);
-  const [baselineLoading, setBaselineLoading] = React.useState(false);
 
   React.useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -114,15 +110,6 @@ export function MissionControl({ onClose, onUpload }: MissionControlProps): Reac
 
   const handleRunStudy = () => {
     dispatch({ type: 'RUN_STUDY' });
-  };
-
-  const handleLoadBaseline = () => {
-    setBaselineLoading(true);
-    void loadBaseline(clientRef.current, dispatch)
-      .then(() => {
-        onClose();
-      })
-      .finally(() => setBaselineLoading(false));
   };
 
   const health = state.health;
@@ -268,14 +255,6 @@ export function MissionControl({ onClose, onUpload }: MissionControlProps): Reac
               </div>
 
               <div className="mc-actions-row">
-                <button
-                  type="button"
-                  className="btn btn--sm"
-                  onClick={handleLoadBaseline}
-                  disabled={baselineLoading}
-                >
-                  {baselineLoading ? 'Loading…' : 'Load baseline'}
-                </button>
                 <button type="button" className="btn btn--sm" onClick={onUpload}>
                   Upload geometry
                 </button>

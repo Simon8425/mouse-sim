@@ -6,8 +6,10 @@ from mouse_sim.errors import UnitError
 from mouse_sim.physics import (
     INVALID_LOAD_UNITS,
     INVALID_LOAD_LOCATION,
+    INVALID_LOAD_VALUE,
     INVALID_POISSON_RATIO,
     MOUSE_LOAD_TEMPLATES,
+    NUMERIC_OVERFLOW,
     POINT_LOAD_SINGULARITY,
     SCREENING_SURROGATE_MODEL_ID,
     THIN_SHELL_OUT_OF_RANGE,
@@ -350,6 +352,89 @@ class SolverMetadataPhysicsTests(unittest.TestCase):
         material = {"young_modulus_pa": 2e9, "poissons_ratio": 0.35}
         res = solve_load_case({"kind": "pressure", "magnitude_pa": 1000.0}, structure, material)
         self.assertEqual(res.solver_metadata["model_id"], SCREENING_SURROGATE_MODEL_ID)
+
+
+class NumericOverflowGuardTests(unittest.TestCase):
+    """Degenerate magnitudes must produce a flagged inconclusive response,
+    never a crash, NaN, or inf that would corrupt JSON serialization."""
+
+    def _assert_clean_overflow(self, response, method_id):
+        self.assertEqual(response.validity, "inconclusive")
+        self.assertIn(NUMERIC_OVERFLOW, response.flags)
+        self.assertEqual(response.method_id, method_id)
+        text = json.dumps(response.to_dict())
+        self.assertNotIn("NaN", text)
+        self.assertNotIn("Infinity", text)
+
+    def test_shell_tiny_dimensions_no_division_crash(self):
+        response = shell_panel_response(1e-200, 1e-200, 1e-200, 2e9, 0.35, 1000.0)
+        self._assert_clean_overflow(response, "shell_navier_v1")
+
+    def test_shell_extreme_dimensions_no_nan_output(self):
+        response = shell_panel_response(1e-160, 1e-160, 1e-160, 2e9, 0.35, 1000.0)
+        self._assert_clean_overflow(response, "shell_navier_v1")
+
+    def test_shell_huge_pressure_no_infinite_reactions(self):
+        response = shell_panel_response(100.0, 100.0, 0.002, 2e9, 0.35, 1e308)
+        self._assert_clean_overflow(response, "shell_navier_v1")
+
+    def test_beam_extreme_lengths_no_crash(self):
+        response = beam_response("cantilever_point", L_m=1e308, E_pa=1e-308, I_m4=1e-308,
+                                 A_m2=1.0, nu=0.3, force_n=1e308)
+        self._assert_clean_overflow(response, "beam_closed_form_v1")
+
+    def test_beam_huge_uniform_load_no_infinite_reactions(self):
+        response = beam_response("simply_supported_uniform", L_m=1e300, E_pa=1e-300,
+                                 I_m4=1e-300, A_m2=1.0, nu=0.3, q_n_per_m=1e300)
+        self._assert_clean_overflow(response, "beam_closed_form_v1")
+
+    def test_shell_point_load_extreme_moment_flagged(self):
+        response = solve_load_case(
+            {"kind": "force", "force_n": 1e300, "point_load": True, "location": (0.05, 1e299)},
+            {"type": "shell_panel", "a_m": 0.1, "b_m": 1e300, "t_m": 0.002},
+            {"young_modulus_pa": 2e9, "poissons_ratio": 0.35},
+        )
+        self.assertIn(NUMERIC_OVERFLOW, response.flags)
+
+    def test_shell_series_order_is_capped(self):
+        response = shell_panel_response(0.1, 0.1, 0.002, 2e9, 0.35, 1000.0, series_order=10 ** 9)
+        self.assertEqual(response.validity, "valid")
+        self.assertTrue(any("series order 49" in item for item in response.assumptions))
+
+    def test_beam_rejects_invalid_poisson_ratio(self):
+        with self.assertRaises(ValueError):
+            beam_response("cantilever_point", L_m=0.1, E_pa=200e9, I_m4=1e-8,
+                          A_m2=1e-4, nu=0.5, force_n=10.0)
+        with self.assertRaises(ValueError):
+            beam_response("cantilever_point", L_m=0.1, E_pa=200e9, I_m4=1e-8,
+                          A_m2=1e-4, nu=5.0, force_n=10.0)
+        with self.assertRaises(ValueError):
+            beam_response("cantilever_point", L_m=0.1, E_pa=200e9, I_m4=1e-8,
+                          A_m2=1e-4, nu=float("nan"), force_n=10.0)
+
+    def test_nan_allowable_yields_not_available_safety(self):
+        response = shell_panel_response(0.1, 0.1, 0.002, 2e9, 0.35, 1000.0,
+                                        allowable_pa=float("nan"))
+        self.assertIsNone(response.safety_factor)
+        self.assertEqual(response.safety_factor_status, "not_available")
+        text = json.dumps(response.to_dict())
+        self.assertNotIn("NaN", text)
+
+    def test_beam_solve_invalid_width_flagged_not_crash(self):
+        structure = {"type": "beam", "L_m": 0.1, "I_m4": 1e-8, "A_m2": 1e-4}
+        material = {"young_modulus_pa": 200e9, "poissons_ratio": 0.3}
+        for width in (float("nan"), 0.0, "not-a-number"):
+            structure["width_m"] = width
+            response = solve_load_case(
+                {"kind": "pressure", "magnitude_pa": 1000.0}, structure, material
+            )
+            self.assertEqual(response.validity, "inconclusive", width)
+            self.assertIn(INVALID_LOAD_VALUE, response.flags)
+
+    def test_normal_magnitudes_still_valid(self):
+        response = shell_panel_response(0.1, 0.1, 0.002, 2e9, 0.35, 1000.0)
+        self.assertEqual(response.validity, "valid")
+        self.assertNotIn(NUMERIC_OVERFLOW, response.flags)
 
 
 if __name__ == "__main__":

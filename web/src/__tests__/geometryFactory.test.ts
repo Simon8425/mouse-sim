@@ -1,6 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
 import * as THREE from 'three';
 import {
+  entriesSignature,
+} from '../scene/sceneRuntime';
+import {
   pythonTransformToMatrix4,
   createObjectGroup,
   worldBoundsForGeometry,
@@ -232,5 +235,52 @@ describe('geometryFactory Three.js integration and parity', () => {
     disposeObjectGroup(group);
     expect(spyGeomDispose).toHaveBeenCalled();
     expect(spyMatDispose).not.toHaveBeenCalled();
+  });
+});
+
+describe('entriesSignature', () => {
+  const meshEntry = {
+    id: 'part-0',
+    geometry: {
+      type: 'mesh' as const,
+      vertices: Array.from({ length: 100 }, (_, i) => [i, 0, 0] as [number, number, number]),
+      triangles: [[0, 1, 2] as [number, number, number]],
+      units: 'm' as const,
+      transform: {
+        rotation: [[1, 0, 0], [0, 1, 0], [0, 0, 1]] as [[number, number, number], [number, number, number], [number, number, number]],
+        translation: [0, 0, 0] as [number, number, number],
+        units: 'm' as const,
+      },
+    },
+    className: 'mesh',
+  };
+
+  it('is stable when only visibility changes (no scene rebuild)', () => {
+    const signature = entriesSignature([{ ...meshEntry, displayAssetUrl: null }]);
+    expect(signature).toBe(signature);
+  });
+
+  it('changes when mesh sizes change but not when vertices move', () => {
+    const base = entriesSignature([meshEntry]);
+    const moved = entriesSignature([
+      {
+        ...meshEntry,
+        geometry: {
+          ...meshEntry.geometry,
+          vertices: Array.from({ length: 100 }, (_, i) => [i + 1, 0, 0] as [number, number, number]),
+        },
+      },
+    ]);
+    const resized = entriesSignature([
+      {
+        ...meshEntry,
+        geometry: {
+          ...meshEntry.geometry,
+          vertices: Array.from({ length: 101 }, (_, i) => [i, 0, 0] as [number, number, number]),
+        },
+      },
+    ]);
+    expect(moved).toBe(base);
+    expect(resized).not.toBe(base);
   });
 });

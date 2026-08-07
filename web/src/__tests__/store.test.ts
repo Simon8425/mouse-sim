@@ -183,6 +183,35 @@ describe('projectStore state reducer and selectors', () => {
     expect((req?.objects as unknown[]).length).toBe(1);
   });
 
+  it('opens the navigator drawer when a geometry preview starts and completes', () => {
+    expect(initialState.navOpen).toBe(false);
+
+    let state = reducer(initialState, { type: 'PREVIEW_START', temp: null, version: 1 });
+    expect(state.navOpen).toBe(true);
+
+    const preview: GeometryPreview = {
+      schema_id: 'gms.geometry-preview/1',
+      supported: true,
+      format: 'json',
+      source_units: 'mm',
+      geometry: {
+        type: 'box',
+        size: [10, 10, 10],
+        units: 'mm',
+        transform: IDENTITY_TRANSFORM,
+      },
+      diagnostics: [],
+      source_name: 'housing.step',
+    };
+    state = reducer(state, { type: 'PREVIEW_OK', preview, version: 1 });
+    expect(state.navOpen).toBe(true);
+  });
+
+  it('keeps the navigator closed on a clean start without geometry', () => {
+    const state = reducer(initialState, { type: 'SET_NAV_OPEN', open: false });
+    expect(state.navOpen).toBe(false);
+  });
+
   it('resets geometry view state when baseline or import replaces the source', () => {
     let state: ProjectState = {
       ...initialState,
@@ -313,10 +342,204 @@ describe('projectStore state reducer and selectors', () => {
     expect(Array.isArray(req?.objects)).toBe(true);
     expect((req?.objects as unknown[]).length).toBe(1);
     expect(req?.mode).toBe('exploration');
+    expect(req?.options?.display_tessellation).toBeUndefined();
 
     const entries = computeObjectEntries(state);
     expect(entries.length).toBe(1);
     expect(entries[0].id).toBe('analytic.json');
+  });
+
+  it('tags kernel-backed STEP previews as display tessellations', () => {
+    const preview: GeometryPreview = {
+      schema_id: 'gms.geometry-preview/1',
+      supported: true,
+      format: 'step',
+      source_units: 'mm',
+      geometry: {
+        type: 'mesh',
+        vertices: [[0, 0, 0], [1, 0, 0], [0, 1, 0]],
+        triangles: [[0, 1, 2]],
+        units: 'm',
+        transform: IDENTITY_TRANSFORM,
+      },
+      diagnostics: [],
+      source_name: 'G3-20260320.stp',
+      display_asset: {
+        asset_id: 'a'.repeat(64),
+        url: '/api/geometry/assets/' + 'a'.repeat(64) + '.glb',
+        format: 'glb',
+      },
+    };
+
+    const state = reducer(initialState, { type: 'PREVIEW_OK', preview });
+    const req = createAnalysisRequest(state);
+    expect(req?.options?.display_tessellation).toBe(true);
+  });
+
+  it('assigns a material override to an uploaded object and clears it', () => {
+    const preview: GeometryPreview = {
+      schema_id: 'gms.geometry-preview/1',
+      supported: true,
+      format: 'json',
+      source_units: 'mm',
+      geometry: {
+        type: 'box',
+        size: [40, 20, 4],
+        units: 'mm',
+        transform: IDENTITY_TRANSFORM,
+      },
+      diagnostics: [],
+      source_name: 'case.stl',
+    };
+    let state = reducer(initialState, { type: 'PREVIEW_OK', preview });
+    state = reducer(state, {
+      type: 'SET_OBJECT_MATERIAL',
+      objectId: 'case.stl',
+      materialKey: 'ABS',
+    });
+
+    const req = createAnalysisRequest(state);
+    expect(req?.objects).toEqual([
+      { id: 'case.stl', geometry: preview.geometry, material: 'ABS' },
+    ]);
+
+    state = reducer(state, {
+      type: 'SET_OBJECT_MATERIAL',
+      objectId: 'case.stl',
+      materialKey: null,
+    });
+    const cleared = createAnalysisRequest(state);
+    expect(cleared?.objects).toEqual([{ id: 'case.stl', geometry: preview.geometry }]);
+  });
+
+  it('clears material overrides when a new preview replaces the source', () => {
+    let state = reducer(initialState, {
+      type: 'PREVIEW_OK',
+      preview: {
+        schema_id: 'gms.geometry-preview/1',
+        supported: true,
+        format: 'stl',
+        source_units: 'mm',
+        geometry: {
+          type: 'mesh',
+          vertices: [[0, 0, 0]],
+          triangles: [],
+          units: 'm',
+          transform: IDENTITY_TRANSFORM,
+        },
+        diagnostics: [],
+        source_name: 'a.stl',
+      },
+    });
+    state = reducer(state, { type: 'SET_OBJECT_MATERIAL', objectId: 'a.stl', materialKey: 'ABS' });
+    expect(state.objectMaterials).toEqual({ 'a.stl': 'ABS' });
+
+    state = reducer(state, { type: 'PREVIEW_START', temp: null, version: 2 });
+    expect(state.objectMaterials).toEqual({});
+  });
+
+  it('expands kernel STEP previews into per-part entries once part geometry loads', () => {
+    const preview: GeometryPreview = {
+      schema_id: 'gms.geometry-preview/1',
+      supported: true,
+      format: 'step',
+      source_units: 'mm',
+      geometry: {
+        type: 'mesh',
+        vertices: [[0, 0, 0]],
+        triangles: [],
+        units: 'm',
+        transform: IDENTITY_TRANSFORM,
+      },
+      diagnostics: [],
+      source_name: 'G3-20260320.stp',
+      display_asset: {
+        asset_id: 'b'.repeat(64),
+        url: '/api/geometry/assets/' + 'b'.repeat(64) + '.glb',
+        format: 'glb',
+        parts: [
+          { id: 'part-0', name: 'TD011-TOP-C', color: [0.36, 1.0, 0.41] },
+          { id: 'part-1', name: 'TD011-BOT1', color: [1.0, 0.0, 0.0] },
+        ],
+      },
+    };
+    let state = reducer(initialState, { type: 'PREVIEW_OK', preview });
+
+    // Before parts arrive, the preview stays a single entry.
+    let entries = computeObjectEntries(state);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].id).toBe('G3-20260320.stp');
+    expect(entries[0].displayAssetUrl).not.toBeNull();
+
+    state = reducer(state, {
+      type: 'PARTS_OK',
+      assetId: 'b'.repeat(64),
+      parts: [
+        {
+          id: 'part-0',
+          name: 'TD011-TOP-C',
+          geometry: {
+            type: 'mesh',
+            vertices: [[0, 0, 0], [1, 0, 0], [0, 1, 0]],
+            triangles: [[0, 1, 2]],
+            units: 'm',
+            transform: IDENTITY_TRANSFORM,
+          },
+        },
+        {
+          id: 'part-1',
+          name: 'TD011-BOT1',
+          geometry: {
+            type: 'mesh',
+            vertices: [[0, 0, 0], [2, 0, 0], [0, 2, 0]],
+            triangles: [[0, 1, 2]],
+            units: 'm',
+            transform: IDENTITY_TRANSFORM,
+          },
+        },
+      ],
+    });
+
+    entries = computeObjectEntries(state);
+    expect(entries.map((e) => e.id)).toEqual(['part-0', 'part-1']);
+    expect(entries[0].name).toBe('TD011-TOP-C');
+    expect(entries[0].color).toEqual([0.36, 1.0, 0.41]);
+    expect(entries[0].displayAssetUrl).toBeNull();
+
+    state = reducer(state, { type: 'SET_OBJECT_MATERIAL', objectId: 'part-1', materialKey: 'PC/ABS' });
+    const req = createAnalysisRequest(state);
+    expect(req?.objects).toEqual([
+      { id: 'part-0', geometry: entries[0].geometry },
+      { id: 'part-1', geometry: entries[1].geometry, material: 'PC/ABS' },
+    ]);
+    expect(req?.options?.display_tessellation).toBe(true);
+  });
+
+  it('falls back to a single-object request when part geometry fails to load', () => {
+    const preview: GeometryPreview = {
+      schema_id: 'gms.geometry-preview/1',
+      supported: true,
+      format: 'step',
+      source_units: 'mm',
+      geometry: {
+        type: 'box',
+        size: [1, 1, 1],
+        units: 'm',
+        transform: IDENTITY_TRANSFORM,
+      },
+      diagnostics: [],
+      source_name: 'model.stp',
+      display_asset: {
+        asset_id: 'c'.repeat(64),
+        url: '/api/geometry/assets/' + 'c'.repeat(64) + '.glb',
+        format: 'glb',
+        parts: [{ id: 'part-0', name: 'A' }],
+      },
+    };
+    let state = reducer(initialState, { type: 'PREVIEW_OK', preview });
+    state = reducer(state, { type: 'PARTS_ERROR', assetId: 'c'.repeat(64) });
+    const req = createAnalysisRequest(state);
+    expect(req?.objects).toEqual([{ id: 'model.stp', geometry: preview.geometry }]);
   });
 
   it('returns null while a mesh preview is still being parsed without a project', () => {

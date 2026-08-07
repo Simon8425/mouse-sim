@@ -11,13 +11,7 @@ export interface GeometryGuideCardProps {
 export function GeometryGuideCard({ onUpload }: GeometryGuideCardProps): React.ReactElement {
   const { state } = useProjectStore();
   const working = state.previewStatus === 'working';
-  const baselineLoading = state.sourceStatus === 'loading';
-  const baselineText =
-    state.sourceStatus === 'ready'
-      ? `Baseline available: ${state.projectName || 'server source'}`
-      : state.sourceStatus === 'error'
-        ? 'Baseline unavailable — upload a part to continue'
-        : 'Baseline loads automatically when the engine is connected';
+  const baselineText = 'No geometry loaded — upload a part to begin';
 
   return (
     <div className="guide-card" role="dialog" aria-label="Geometry upload guide">
@@ -31,7 +25,7 @@ export function GeometryGuideCard({ onUpload }: GeometryGuideCardProps): React.R
       <p className="guide-card__body">
         Load the server baseline or import a part. Analysis runs on normalized geometry only.
       </p>
-      <div className={`guide-card__baseline${baselineLoading ? ' guide-card__baseline--loading' : ''}`}>
+      <div className="guide-card__baseline">
         {baselineText}
       </div>
       <ul className="guide-card__list">
@@ -43,7 +37,9 @@ export function GeometryGuideCard({ onUpload }: GeometryGuideCardProps): React.R
           <strong>OBJ / STL</strong> — triangle meshes. Units are requested on import.
         </li>
         <li>
-          <strong>STEP / STP</strong> — requires the server CAD converter plugin.
+          <strong>STEP / STP</strong> — faceted B-rep files are converted on the server.
+          Advanced assemblies use the installed FreeCAD/OCCT tessellator and preserve
+          placements, colors, holes, and curved surfaces; a missing kernel reports a blocker.
         </li>
       </ul>
       <div className="guide-card__actions">

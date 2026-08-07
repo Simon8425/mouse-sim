@@ -6,7 +6,6 @@ function contactPlaneSpec(): OverlaySpec {
   return {
     loadVector: null,
     fixtures: null,
-    displacementPin: null,
     stressBadge: null,
     contactPlane: { normal: [0, 0, 1], point: [0, 0, 0] },
     severityMarkers: null,

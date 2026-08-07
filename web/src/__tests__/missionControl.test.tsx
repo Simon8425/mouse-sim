@@ -1,6 +1,6 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { useEffect } from 'react';
 import { MissionControl } from '../components/MissionControl';
 import { ProjectProvider, useProjectStore, type ProjectAction } from '../state/projectStore';
@@ -9,17 +9,13 @@ import type {
   WebHealth,
   PipelineResult,
   PipelineRequest,
-  WebBaselineResponse,
   StructuralResponse,
   ImpactEstimate,
 } from '../api/contracts';
 import { IDENTITY_TRANSFORM } from '../api/contracts';
 
-const { getBaselineMock } = vi.hoisted(() => ({ getBaselineMock: vi.fn() }));
-
 vi.mock('../api/client', () => ({
   createClient: () => ({
-    getBaseline: getBaselineMock,
     getHealth: vi.fn(),
     getMaterials: vi.fn(),
     normalizeGeometry: vi.fn(),
@@ -65,7 +61,7 @@ const mockHealth: WebHealth = {
   schema_id: 'gms.web-health/1',
   engine_version: '0.1.0',
   api_version: '2.0.0',
-  supported_formats: ['json', 'obj', 'stl'],
+  supported_formats: ['json', 'obj', 'stl', 'step'],
   solver_capabilities: ['shell_navier_v1', 'energy_quasi_static_v1'],
   cache_active: true,
   max_json_bytes: 1000000,
@@ -180,10 +176,6 @@ const mockResult: PipelineResult = {
   errors: [],
 };
 
-beforeEach(() => {
-  getBaselineMock.mockReset();
-});
-
 describe('MissionControl dashboard', () => {
   it('renders engine health, study cards, and empty state', () => {
     renderPanel([{ type: 'HEALTH_OK', health: mockHealth }]);
@@ -201,7 +193,6 @@ describe('MissionControl dashboard', () => {
     expect(screen.getByRole('button', { name: 'Run study' })).toBeInTheDocument();
 
     expect(screen.getAllByText('Idle').length).toBeGreaterThan(0);
-    expect(screen.getByRole('button', { name: 'Load baseline' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Upload geometry' })).toBeInTheDocument();
   });
 
@@ -276,19 +267,4 @@ describe('MissionControl dashboard', () => {
     expect(screen.getByText(/gates evaluated/)).toBeInTheDocument();
   });
 
-  it('loads the baseline from the client when the empty-state CTA is clicked', async () => {
-    const user = userEvent.setup();
-    const baseline: WebBaselineResponse = {
-      schema_id: 'gms.web-baseline/1',
-      source: 'mouse_baseline',
-      project: mockBaselineProject,
-    };
-    getBaselineMock.mockResolvedValueOnce(baseline);
-
-    renderPanel([]);
-    await user.click(screen.getByRole('button', { name: 'Load baseline' }));
-
-    await waitFor(() => expect(getBaselineMock).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(screen.getByText('Ready')).toBeInTheDocument());
-  });
 });

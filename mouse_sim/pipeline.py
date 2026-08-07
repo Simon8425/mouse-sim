@@ -702,82 +702,110 @@ def _execute(request, mode, options, result):
     result["structural"] = None
     structural_response = None
     if load_case is not None and structure is not None:
-        normalized_load = _normalize_load(load_case)
-        structure_data = dict(structure)
-        material_ref = structure_data.get("material")
-        material_def = catalog.get(material_ref) if material_ref is not None else _first_material(catalog)
-        material_payload = material_def if material_def is not None else {}
-        fixtures = request.get("fixtures")
-        preflight = [
-            dict(item)
-            for item in physics.preflight_structural_case(normalized_load, structure_data, material_payload, fixtures)
-        ]
-        response = physics.solve_load_case(normalized_load, structure_data, material_payload, fixtures)
-        structural_response = response
-        result["structural"] = {
-            "load_case": normalized_load,
-            "structure": structure_data,
-            "material": material_ref,
-            "fixtures": fixtures,
-            "preflight": preflight,
-            "response": response.to_dict(),
-        }
+        try:
+            if not isinstance(structure, Mapping):
+                raise ValueError("structure must be an object")
+            normalized_load = _normalize_load(load_case)
+            structure_data = dict(structure)
+            material_ref = structure_data.get("material")
+            material_def = catalog.get(material_ref) if material_ref is not None else _first_material(catalog)
+            material_payload = material_def if material_def is not None else {}
+            fixtures = request.get("fixtures")
+            preflight = [
+                dict(item)
+                for item in physics.preflight_structural_case(normalized_load, structure_data, material_payload, fixtures)
+            ]
+            response = physics.solve_load_case(normalized_load, structure_data, material_payload, fixtures)
+            structural_response = response
+            result["structural"] = {
+                "load_case": normalized_load,
+                "structure": structure_data,
+                "material": material_ref,
+                "fixtures": fixtures,
+                "preflight": preflight,
+                "response": response.to_dict(),
+            }
+        except Exception as exc:
+            message = str(exc) or "structural evaluation failed"
+            result["issues"].append(
+                _issue("STRUCTURAL_EVALUATION_FAILED", "error", "structural", message, evidence_blocking=True)
+            )
+            result["errors"].append({"code": "STRUCTURAL_EVALUATION_FAILED", "message": message})
 
     result["collision"] = _run_collision(request, geometry_objs, result)
 
     impact_request = request.get("impact")
     result["impact"] = None
     if impact_request is not None:
-        impact_data = dict(impact_request)
-        total_mass = None
-        if result["mass"] is not None:
-            total_mass = result["mass"].get("mass_kg")
-        mass_kg = impact_data.get("mass_kg", total_mass)
-        unsupported = list(impact.IMPACT_UNSUPPORTED_FAILURE_MODES)
-        if mass_kg is None:
-            result["impact"] = {
-                "mass_kg": None,
-                "result": None,
-                "reason": "no mass available for impact estimate",
-                "unsupported_failure_modes": unsupported,
-            }
-        else:
-            kwargs = {key: impact_data[key] for key in _IMPACT_KWARGS if key in impact_data}
-            estimate = impact.estimate_impact(mass_kg, **kwargs)
-            result["impact"] = {
-                "mass_kg": mass_kg,
-                "result": estimate.to_dict(),
-                "reason": None,
-                "unsupported_failure_modes": unsupported,
-            }
+        try:
+            if not isinstance(impact_request, Mapping):
+                raise ValueError("impact must be an object")
+            impact_data = dict(impact_request)
+            total_mass = None
+            if result["mass"] is not None:
+                total_mass = result["mass"].get("mass_kg")
+            mass_kg = impact_data.get("mass_kg", total_mass)
+            unsupported = list(impact.IMPACT_UNSUPPORTED_FAILURE_MODES)
+            if mass_kg is None:
+                result["impact"] = {
+                    "mass_kg": None,
+                    "result": None,
+                    "reason": "no mass available for impact estimate",
+                    "unsupported_failure_modes": unsupported,
+                }
+            else:
+                kwargs = {key: impact_data[key] for key in _IMPACT_KWARGS if key in impact_data}
+                estimate = impact.estimate_impact(mass_kg, **kwargs)
+                result["impact"] = {
+                    "mass_kg": mass_kg,
+                    "result": estimate.to_dict(),
+                    "reason": None,
+                    "unsupported_failure_modes": unsupported,
+                }
+        except Exception as exc:
+            message = str(exc) or "impact evaluation failed"
+            result["issues"].append(
+                _issue("IMPACT_EVALUATION_FAILED", "error", "impact", message, evidence_blocking=True)
+            )
+            result["errors"].append({"code": "IMPACT_EVALUATION_FAILED", "message": message})
 
     if result["structural"] is not None:
         qual_load_case = result["structural"]["load_case"]
     elif request.get("load_case") is not None:
-        qual_load_case = _normalize_load(request["load_case"])
+        try:
+            qual_load_case = _normalize_load(request["load_case"])
+        except Exception:
+            qual_load_case = None
     else:
         qual_load_case = None
-    qualification_result = qualification.evaluate_qualification(
-        mode=mode,
-        method=request.get("method"),
-        geometry=request.get("geometry"),
-        materials=list(materials_by_object.values()) if materials_by_object else None,
-        load_case=qual_load_case,
-        fixtures=request.get("fixtures"),
-        tolerance_profile=request.get("tolerance_profile"),
-        correlation_records=request.get("correlation_records"),
-        requirement=request.get("requirement"),
-        validation_report=result["validation"],
-        solver=physics.SOLVER_CAPABILITIES,
-        convergence_evidence=bool(request.get("convergence_evidence", False)),
-        force_balance=bool(request.get("force_balance", False)),
-        reviewed_flags=request.get("reviewed_flags"),
-        structural_response=structural_response.to_dict() if structural_response is not None else None,
-        impact=result["impact"],
-        requirements=result["requirements"],
-        pipeline_result=result,
-    )
-    result["qualification"] = qualification_result.to_dict()
+    try:
+        qualification_result = qualification.evaluate_qualification(
+            mode=mode,
+            method=request.get("method"),
+            geometry=request.get("geometry"),
+            materials=list(materials_by_object.values()) if materials_by_object else None,
+            load_case=qual_load_case,
+            fixtures=request.get("fixtures"),
+            tolerance_profile=request.get("tolerance_profile"),
+            correlation_records=request.get("correlation_records"),
+            requirement=request.get("requirement"),
+            validation_report=result["validation"],
+            solver=physics.SOLVER_CAPABILITIES,
+            convergence_evidence=bool(request.get("convergence_evidence", False)),
+            force_balance=bool(request.get("force_balance", False)),
+            reviewed_flags=request.get("reviewed_flags"),
+            structural_response=structural_response.to_dict() if structural_response is not None else None,
+            impact=result["impact"],
+            requirements=result["requirements"],
+            pipeline_result=result,
+        )
+        result["qualification"] = qualification_result.to_dict()
+    except Exception as exc:
+        message = str(exc) or "qualification evaluation failed"
+        result["issues"].append(
+            _issue("QUALIFICATION_EVALUATION_FAILED", "error", "qualification", message, evidence_blocking=True)
+        )
+        result["errors"].append({"code": "QUALIFICATION_EVALUATION_FAILED", "message": message})
 
     result["validity"] = _validity(result)
 
@@ -835,9 +863,17 @@ def run_pipeline(request: dict, cache: Optional[ArtifactCache] = None, use_cache
     are given, a verified cache hit returns the stored payload directly;
     otherwise the fresh result is computed and stored.
     """
+    if request is not None and not isinstance(request, Mapping):
+        mode = _normalize_mode(None)
+        result = _new_result(mode)
+        result["run_id"] = _run_id_for(mode, {}, {})
+        _pipeline_error(result, "INVALID_REQUEST", "request must be an object")
+        result["lifecycle_state"] = "failed"
+        return result
     request = dict(request or {})
     mode = _normalize_mode(request.get("mode", "exploration"))
-    options = dict(request.get("options") or {})
+    options = request.get("options")
+    options = dict(options) if isinstance(options, Mapping) else {}
     debug = bool(options.get("debug", False))
     result = _new_result(mode)
     try:

@@ -1,3 +1,4 @@
+import math
 import unittest
 
 from mouse_sim import Box, Quantity, TriangleMesh, classify_objects, mass_properties
@@ -66,6 +67,57 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(item.component_type, "surface")
         self.assertTrue(item.unresolved)
         self.assertFalse(item.semantic_separation_claimed)
+
+
+class RobustnessTests(unittest.TestCase):
+    def test_objects_mapping_of_records_is_unwrapped(self):
+        document = {"objects": {"a": {"geometry": Box((1, 1, 1)), "material": "ABS"}}}
+        result = mass_properties(document, {"a": 1000})
+        self.assertEqual(result.mass_status, "calculated")
+        self.assertAlmostEqual(result.mass_kg, 1000.0)
+
+    def test_direct_mapping_of_records_is_unwrapped(self):
+        document = {"a": {"geometry": Box((1, 1, 1)), "material": "ABS"}}
+        result = mass_properties(document, {"a": 1000})
+        self.assertEqual(result.mass_status, "calculated")
+        self.assertAlmostEqual(result.mass_kg, 1000.0)
+
+    def test_degenerate_zero_volume_mesh_is_unknown(self):
+        mesh = TriangleMesh([(0, 0, 0), (1, 0, 0), (2, 0, 0)], [(0, 1, 2)])
+        result = mass_properties({"plate": mesh}, {"plate": 1000})
+        self.assertEqual(result.mass_status, "unknown")
+        self.assertIsNone(result.mass_kg)
+        self.assertEqual(result.completeness, 0.0)
+        self.assertTrue(any("zero_signed_volume" in item for item in result.objects[0].diagnostics))
+
+    def test_open_mesh_with_measured_override_is_never_complete(self):
+        mesh = TriangleMesh([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [(0, 1, 2)])
+        result = mass_properties({"plate": mesh}, {}, {"plate": {"value": 0.5, "unit": "kg"}})
+        self.assertEqual(result.objects[0].mass_status, "measured")
+        self.assertEqual(result.objects[0].completeness, 0.5)
+        self.assertIsNone(result.objects[0].inertia_tensor_kg_m2)
+
+    def test_nan_density_is_unknown_not_crash(self):
+        result = mass_properties({"a": Box((1, 1, 1))}, {"a": float("nan")})
+        self.assertEqual(result.mass_status, "unknown")
+        self.assertIsNone(result.mass_kg)
+        self.assertTrue(any("density_unknown" in item for item in result.objects[0].diagnostics))
+
+    def test_empty_document_returns_unknown(self):
+        result = mass_properties({}, {})
+        self.assertEqual(result.mass_status, "unknown")
+        self.assertIsNone(result.mass_kg)
+        self.assertIsNone(result.center_of_mass_m)
+        self.assertEqual(result.completeness, 0.0)
+
+    def test_totals_are_finite_when_some_objects_unknown(self):
+        result = mass_properties(
+            {"known": Box((1, 1, 1)), "unknown": Box((2, 2, 2))},
+            {"known": 1000},
+        )
+        self.assertEqual(result.mass_status, "partial")
+        self.assertAlmostEqual(result.mass_kg, 1000.0)
+        self.assertTrue(math.isfinite(result.mass_kg))
 
 
 if __name__ == "__main__":

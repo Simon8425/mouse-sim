@@ -82,6 +82,7 @@ Layered, unidirectional data flow. No module talks "sideways" except through the
 - STEP: preserve solids/faces, names, colors, assembly hierarchy, instance transforms, and supported metadata if present. Record the STEP application protocol (for example AP203/AP214/AP242) and importer warnings.
 - STL/OBJ: wrap as mesh-only "dumb solid". STL normally has no trustworthy unit, material, assembly, or part-boundary metadata; OBJ units and object/group semantics are not guaranteed. Require an import confirmation when metadata is absent.
 - Unit detection/normalization (STEP carries units; STL/OBJ require explicit assumption or user confirmation). Show a scale sanity check against expected mouse dimensions before analysis.
+- **Implementation status (MVP):** small faceted STEP fixtures remain covered by the pure-stdlib importer; arbitrary assembly STEP now uses an isolated FreeCAD/OCCT worker with deterministic native tessellation and GLB display output. Kernel failures block instead of silently fabricating geometry. The original STEP remains the CAD source of truth and the display mesh is explicitly tessellated/approximate.
 - Healing must never silently change engineering geometry. Store original and healed versions, list every repair (weld, normal reversal, hole closure, self-intersection fix), and mark affected results as approximate until reviewed.
 - Import diagnostics: solid count, open/non-manifold mesh count, duplicate geometry, zero-area faces, self-intersections, extreme dimensions, invalid transforms, missing names, and unsupported entities.
 - Output: immutable source asset plus derived bodies, transforms, diagnostics, and a user-review status in the Geometry Engine.
@@ -309,7 +310,7 @@ Hard rule: no cycles; results flow through the project document, not direct modu
 
 ### Phase 0 — Foundations (MVP-0)
 - Versioned core project model + serialization/migrations, coordinate frames, units, tolerances, logging, immutable source/run manifests.
-- OCCT integration: STEP/STL/OBJ import, tessellation, import diagnostics, repair review, basic viewer (rotate/pan/zoom, component list, colors).
+- OCCT integration: STEP/STL/OBJ import, tessellation, import diagnostics, repair review, basic viewer (rotate/pan/zoom, component list, colors). *Status: FreeCAD/OCCT-backed STEP tessellation and GLB display are implemented; exact CAD mass/property integration and repair review remain separate scope.*
 - Material library (hardcoded ~12 materials) + assignment UI, property provenance, measured-mass override, and material validation.
 - Mass Calculator: weights, per-component table, CoM with visualization marker.
 - Headless import/mass/report path and preflight checklist.
@@ -443,7 +444,7 @@ For the MVP and early releases: nonlinear/plastic materials, thermal, creep, ele
 ## 13. Build Order Summary (for the implementing agent)
 
 1. Versioned core project model, coordinate frames, units/tolerances, immutable run manifests, schema migrations, and serialization.
-2. OCCT/mesh wrapper + import (STEP/STL/OBJ), diagnostics/repair review, and viewer with component list.
+2. OCCT/mesh wrapper + import (STEP/STL/OBJ), diagnostics/repair review, and viewer with component list. *Kernel-backed STEP tessellation and native GLB display are shipped; repair review and exact CAD-property integration remain.*
 3. Material system, behavior abstractions, measured-mass overrides, Mass Calculator, inertia, and CoM marker.
 4. Classification heuristics, unresolved/confidence states, semantic regions, and manual override/segmentation UI.
 5. Solver representation benchmark: compare shell, solid, rigid, and connector choices on analytical and representative mouse cases before selecting the MVP backend.
@@ -458,7 +459,7 @@ Each step is independently demoable and testable; do not proceed to production l
 
 ### Coverage of the requested scope
 
-- CAD import: STEP, STL, OBJ, units, assemblies, transforms, repair diagnostics.
+- CAD import: STEP, STL, OBJ, units, assemblies, transforms, repair diagnostics. *Shipped: FreeCAD/OCCT-backed STEP assembly tessellation and GLB display; deferred: exact CAD-property integration and repair review.*
 - Component separation: assisted classification with confidence, manual segmentation, unresolved state, and explicit limits for fused solids.
 - Materials: density, stiffness, strength, elasticity-related properties, friction, cost, provenance, conditioning, and uncertainty.
 - Mass properties: total/component mass, center of mass, inertia, sensor-frame offset, measured overrides, and completeness status.

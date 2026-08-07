@@ -6,7 +6,7 @@
 
 `mouse_sim` is a headless, stdlib-only, deterministic engineering-surrogate pipeline for gaming-mouse mechanical design. Given a JSON project document (objects, materials, load case, impact scenario, qualification inputs), it:
 
-- imports geometry (analytic primitives, OBJ/STL meshes) and computes mass properties;
+- imports geometry (analytic primitives, OBJ/STL meshes, and kernel-tessellated STEP assemblies) and computes mass properties;
 - conservatively classifies components and runs DFM-lite validation (wall thickness, geometry health, material approval, PCB clearance, classification);
 - screens loads with closed-form surrogates (Navier thin-plate and Euler-Bernoulli beam) and estimates drop-impact response by energy balance;
 - evaluates a 17-gate qualification readiness model (12 readiness gates + 5 analysis-integrity gates) with a hard exploration/qualification separation;
@@ -18,7 +18,7 @@ Every artifact is a pure function of the inputs: no timestamps, no random state 
 
 - **Exploration vs. qualification is enforced, not suggested.** Exploration output is always `exploration_only` and unqualified. Qualification output reaches at most `qualification_pending_review`, and only when all gates pass; automatic promotion to accepted evidence is never performed.
 - **No legal certification.** Results are engineering screening estimates (surrogate closed-form and energy methods), not certified FEA, and each analysis section carries an explicit unsupported-failure-mode list.
-- Headless and stdlib-only by design: the analysis core has no UI (the optional web console in `web/` is a separate layer), no cloud, no STEP/OCCT kernel.
+- Headless and stdlib-only by design for the analysis core; advanced STEP display uses an isolated optional FreeCAD/OCCT worker so the normal Python server remains dependency-free. Arbitrary STEP is never silently reduced to the handwritten approximation.
 
 ## Capability boundary — what is and isn't modeled
 
@@ -65,7 +65,8 @@ python3 -S -m mouse_sim --version
 # Validate a material catalog JSON:
 python3 -S -m mouse_sim material validate --input path/to/material_catalog.json
 
-# Normalize geometry to JSON (auto/json/obj/stl/ascii; STEP is rejected with a diagnostic):
+# Normalize geometry to JSON (auto/json/obj/stl/ascii/step/stp; advanced STEP uses
+# the isolated FreeCAD/OCCT tessellator when available):
 python3 -S -m mouse_sim import --input part.obj --format obj --units mm --out part.json
 ```
 
@@ -87,13 +88,13 @@ Open `http://127.0.0.1:8000/` (single-process serve) or `http://localhost:5173/`
 ### Run the test suites
 
 ```bash
-# Python backend suite (337 tests, stdlib only):
+# Python backend suite (353 tests, stdlib only):
 python3 -m unittest discover -s tests -q
 
 # Frontend unit tests (Vitest, 56 tests):
 cd web && npm test
 
-# End-to-end Playwright matrix (44 tests: Chromium desktop/tablet/mobile + Firefox):
+# End-to-end Playwright matrix (52 tests: Chromium desktop/tablet/mobile + Firefox):
 cd web && npm run e2e
 ```
 
@@ -102,7 +103,7 @@ cd web && npm run e2e
 | Command | Purpose | Key flags |
 |---|---|---|
 | `run` | Run the analysis pipeline over a project document | `--input PATH` (required), `--output DIR` (default `reports`), `--emit json,html`, `--stdout json\|summary\|none`, `--mode exploration\|qualification`, `--cache-dir PATH`, `--no-cache`, `--strict`, `--debug`, `--error-format text\|json` |
-| `import` | Normalize geometry to JSON | `--input PATH`, `--format auto\|json\|obj\|stl\|ascii`, `--units mm\|cm\|m\|in`, `--out PATH` |
+| `import` | Normalize geometry to JSON | `--input PATH`, `--format auto\|json\|obj\|stl\|ascii\|step\|stp`, `--units mm\|cm\|m\|in`, `--out PATH` |
 | `material validate` | Validate a material catalog JSON | `--input PATH` |
 | `validate` | Validate a full project document | `--input PATH`, `--emit json`, `--debug`, `--error-format` |
 | `--version` | Print `mouse-sim 0.1.0` | — |
@@ -130,7 +131,7 @@ Layered and acyclic — foundations never import analysis layers, and each layer
 | | `model.py` | Versioned, serializable data models (project, materials, enums) |
 | | `schema.py` | Schema loading and dependency-free document validation |
 | Geometry & mass | `geometry.py` | Analytic primitives, transforms, mesh diagnostics, solid properties |
-| | `importers.py` | OBJ/STL/JSON geometry import; STEP rejected with a diagnostic |
+| | `importers.py` / `step_kernel.py` | OBJ/STL/JSON import plus FreeCAD/OCCT-backed advanced STEP tessellation |
 | | `mass.py` | Mass properties, measured overrides, aggregation |
 | Materials & objects | `materials.py` | Builtin catalog, tolerant loading, assignment, approval checks |
 | | `classification.py` | Name-synonym and topology-based conservative classification |
@@ -172,7 +173,7 @@ python3 -S -m compileall -q mouse_sim
 python3 -S -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Full suite: **337 tests, all green** (16 test modules, no third-party dependencies).
+Full suite: **353 tests, all green** (16 test modules, no third-party dependencies).
 
 See [`docs/testing.md`](docs/testing.md) for the test groups, engineering purpose of each group,
 expected validity semantics, and the complete validation command matrix.
@@ -182,21 +183,21 @@ expected validity semantics, and the complete validation command matrix.
 - Real FEM / explicit dynamics (current: closed-form and energy surrogates)
 - Topology optimization
 - Cloud / service deployment
-- STEP/OCCT import kernel (currently rejected with a structured diagnostic)
+- Optional FreeCAD/OCCT worker for advanced STEP tessellation is now implemented; the original STEP remains the CAD source of truth and the GLB is a display tessellation.
 
 ## Web console — Mission Control dashboard
 
-`mouse_sim` includes a web-based 3D engineering console in the `web/` directory built with React 18, TypeScript, and Three.js. It acts as a **Mission Control dashboard**: a centralized control panel that combines **system monitoring** (engine/API versions, cache status, supported formats, health) with a **study launcher** (load the server-owned baseline project, upload a part, or run an analysis) in one screen. It connects to the Python API (`mouse_sim/web_api.py`) to deliver interactive model navigation, physical property inspection, and real-time visualization of analysis findings and structural overlays.
+`mouse_sim` includes a web-based 3D engineering console in the `web/` directory built with React 18, TypeScript, and Three.js. It acts as a **Mission Control dashboard**: a centralized control panel that combines **system monitoring** (engine/API versions, cache status, supported formats, health) with a **study launcher** (upload a part or run an analysis) in one screen. It connects to the Python API (`mouse_sim/web_api.py`) to deliver interactive model navigation, physical property inspection, and real-time visualization of analysis findings and structural overlays.
 
 ### Baseline boot flow
 
-On startup the dashboard calls `GET /api/projects/baseline`, which returns the server-owned baseline project (`examples/mouse_baseline.json` under `--project-root`) as a `gms.web-baseline/1` envelope. The workspace boots from that server-owned project; the request is aborted on unmount so stale source data can never commit.
+On startup the dashboard opens an empty workspace. No baseline or demo geometry is loaded; the user explicitly uploads the geometry to display and analyze.
 
 ### Upload lifecycle
 
-1. The user drops a geometry file; parsing runs in a **Web Worker** (`geometry.worker.ts`) off the UI thread — OBJ/STL text/binary parsing with unit conversion, triangulation, and bounded warning collection.
+1. The user drops a geometry file; OBJ/STL parsing runs in a **Web Worker** (`geometry.worker.ts`) off the UI thread — text/binary parsing with unit conversion, triangulation, and bounded warning collection. JSON and STEP/STP files skip the worker and are sent straight to the server. Advanced STEP is imported by the isolated FreeCAD/OCCT worker and its native GLB is used for display.
 2. The parsed preview is posted to `POST /api/geometry/normalize?format=...&units=...`, which runs the Python importer and returns a `gms.geometry-preview/1` envelope.
-3. Unsupported formats and parse failures return **422 envelopes with diagnostics** (e.g. `E_INVALID_FORMAT`, `invalid_units`, `parse_failed`); the client deliberately accepts 422 as a valid envelope carrying the preview error diagnostics, so the failure is shown in the dashboard instead of being swallowed as a transport error.
+3. Missing CAD-kernel support, kernel failures, unsupported formats, and parse failures return **422 envelopes with diagnostics** (e.g. `step_kernel_unavailable`, `step_kernel_failed`, `parse_failed`); the client deliberately accepts 422 as a valid envelope carrying the preview error diagnostics.
 
 ### Scene hardening
 
@@ -240,7 +241,7 @@ Open `http://127.0.0.1:8898/` in your browser.
 | `--project-root PATH` | Base directory for file resolution | `None` — package parent directory (repo root when run from checkout) |
 | `--cache-dir PATH` | Cache storage directory | `None` (cache disabled) |
 | `--cors-origin ORIGIN` | Allowed CORS origins (exact matches only, repeatable) | None sent; dev relies on the Vite `/api` proxy |
-| `--max-json-bytes BYTES` | Max payload size for JSON requests | `8388608` (8 MiB) (`MOUSE_SIM_MAX_JSON_BYTES`) |
+| `--max-json-bytes BYTES` | Max payload size for JSON requests | `134217728` (128 MiB) (`MOUSE_SIM_MAX_JSON_BYTES`) |
 | `--max-geometry-bytes BYTES` | Max upload size for geometry files | `67108864` (64 MiB) (`MOUSE_SIM_MAX_GEOMETRY_BYTES`) |
 | `--quiet` | Suppress HTTP access logging | `false` |
 
@@ -251,7 +252,7 @@ Open `http://127.0.0.1:8898/` in your browser.
 | `/api/health` | GET | `gms.web-health/1` | Server status, version, format capabilities, cache status |
 | `/api/projects/baseline` | GET | `gms.web-baseline/1` | Bundled baseline project request |
 | `/api/materials` | GET | `gms.web-material-catalog/1` | Material catalog with density, modulus, and approval state |
-| `/api/geometry/normalize` | POST | `gms.geometry-preview/1` | Normalizes uploaded OBJ/STL/JSON geometry; returns 422 for unsupported formats |
+| `/api/geometry/normalize` | POST | `gms.geometry-preview/1` | Normalizes uploaded OBJ/STL/JSON/STEP geometry; advanced STEP returns a kernel-tessellated mesh plus a registered GLB display asset, or a blocker if FreeCAD/OCCT is unavailable |
 | `/api/analyze` | POST | `gms.web-analysis-response/1` | Executes pipeline over `gms.web-analysis-request/1`; returns full result payload |
 
 ### Browser support & fallbacks
@@ -270,17 +271,17 @@ Open `http://127.0.0.1:8898/` in your browser.
 ### Verification commands
 
 ```bash
-# Full Python test suite (337 tests, including 27 web-API integration tests):
+# Full Python test suite (353 tests, including 31 web-API integration tests):
 python3 -B -S -m unittest discover -s tests -p 'test_*.py'
 
 # Web frontend typecheck, lint, unit tests, and build:
 cd web
 npm run typecheck
 npm run lint
-npm test -- --run        # 56 unit tests, 12 files
+npm test -- --run        # 58 unit tests, 12 files
 npm run build
 
-# End-to-end Playwright matrix (44 tests across Chromium desktop, Chromium
+# End-to-end Playwright matrix (52 tests across Chromium desktop, Chromium
 # tablet, Chromium mobile, and Firefox desktop projects):
 npx playwright install chromium
 npm run e2e

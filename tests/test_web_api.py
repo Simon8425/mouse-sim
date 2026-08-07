@@ -10,8 +10,10 @@ from unittest import mock
 from urllib.parse import quote, urlsplit
 
 from mouse_sim.canonical import canonical_json
+from mouse_sim.geometry import TriangleMesh
+from mouse_sim.importers import GeometryLoadResult, ImportDiagnostic
 from mouse_sim.pipeline import run_pipeline
-from mouse_sim.web_api import WebConfig, build_server
+from mouse_sim.web_api import WebConfig, build_server, register_step_asset
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BASELINE_PATH = REPO_ROOT / "examples" / "mouse_baseline.json"
@@ -28,7 +30,7 @@ STL_SOURCE = (
     "endfacet\n"
     "endsolid sample\n"
 )
-STEP_SOURCE = "ISO-10303-21;"
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 
 def request(base_url, method, path, body=None, headers=None):
@@ -76,13 +78,17 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(payload["schema_id"], "gms.web-health/1")
         self.assertEqual(payload["api_version"], "1")
         self.assertEqual(payload["engine_version"], "0.1.0")
-        for fmt in ("json", "obj", "stl"):
+        for fmt in ("json", "obj", "stl", "step"):
             self.assertIn(fmt, payload["supported_formats"])
         self.assertTrue(payload["solver_capabilities"])
         self.assertFalse(payload["cache_active"])
         self.assertGreater(payload["max_json_bytes"], 0)
         self.assertGreater(payload["max_geometry_bytes"], 0)
         self.assertTrue(payload["deterministic"])
+        self.assertEqual(payload["step_backend"], "auto")
+        self.assertIn("step_kernel_available", payload)
+        self.assertEqual(payload["advanced_step_backend"], "kernel")
+        self.assertTrue(payload["advanced_step_uses_kernel"])
         self.assertNotIn("time", payload)
         self.assertFalse(any("timestamp" in key for key in payload))
 
@@ -464,22 +470,299 @@ class WebApiTests(unittest.TestCase):
         self.assertFalse(payload["supported"])
         self.assertEqual(payload["diagnostics"][0]["code"], "invalid_units")
 
-    def test_normalize_step_unsupported(self):
+    def test_normalize_step_success(self):
         server, base_url = self.start_server()
+        body = (FIXTURES_DIR / "faceted_cube.step").read_bytes()
         response, data = request(
             base_url,
             "POST",
-            "/api/geometry/normalize?format=step&units=mm",
-            body=STEP_SOURCE.encode("utf-8"),
+            "/api/geometry/normalize?format=step",
+            body=body,
+        )
+        self.assertEqual(response.status, 200, data.decode("utf-8"))
+        payload = json.loads(data)
+        self.assertEqual(payload["schema_id"], "gms.geometry-preview/1")
+        self.assertTrue(payload["supported"])
+        self.assertEqual(payload["format"], "step")
+        self.assertEqual(payload["source_units"], "mm")
+        self.assertEqual(payload["geometry"]["type"], "mesh")
+        self.assertEqual(len(payload["geometry"]["vertices"]), 8)
+        self.assertEqual(len(payload["geometry"]["triangles"]), 12)
+
+    def test_normalize_step_advanced_faces_success(self):
+        server, base_url = self.start_server()
+        body = (FIXTURES_DIR / "faceted_cube_advanced_faces.step").read_bytes()
+        response, data = request(
+            base_url,
+            "POST",
+            "/api/geometry/normalize?format=step",
+            body=body,
+        )
+        self.assertEqual(response.status, 200, data.decode("utf-8"))
+        payload = json.loads(data)
+        self.assertTrue(payload["supported"])
+        self.assertEqual(payload["format"], "step")
+        self.assertEqual(payload["source_units"], "mm")
+        self.assertEqual(len(payload["geometry"]["triangles"]), 12)
+
+    def test_normalize_step_edge_loops_success(self):
+        server, base_url = self.start_server()
+        body = (FIXTURES_DIR / "faceted_cube_edge_loops.step").read_bytes()
+        response, data = request(
+            base_url,
+            "POST",
+            "/api/geometry/normalize?format=step",
+            body=body,
+        )
+        self.assertEqual(response.status, 200, data.decode("utf-8"))
+        payload = json.loads(data)
+        self.assertTrue(payload["supported"])
+        self.assertEqual(payload["format"], "step")
+        self.assertEqual(payload["source_units"], "mm")
+        self.assertEqual(len(payload["geometry"]["triangles"]), 12)
+
+    def test_normalize_advanced_step_rejected(self):
+        server, base_url = self.start_server()
+        body = (FIXTURES_DIR / "advanced_brep.step").read_bytes()
+        response, data = request(
+            base_url,
+            "POST",
+            "/api/geometry/normalize?format=step",
+            body=body,
         )
         self.assertEqual(response.status, 422)
         payload = json.loads(data)
+        self.assertEqual(payload["schema_id"], "gms.geometry-preview/1")
         self.assertFalse(payload["supported"])
         self.assertIsNone(payload["geometry"])
         self.assertEqual(payload["format"], "step")
         diagnostic = payload["diagnostics"][0]
         self.assertEqual(diagnostic["code"], "unsupported_format")
         self.assertEqual(diagnostic["severity"], "blocker")
+
+    def test_registered_step_asset_serving_is_sanitized(self):
+        asset_id = "a" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / (asset_id + ".glb")
+            path.write_bytes(b"glTF\x02binary")
+            public = register_step_asset(
+                {
+                    "asset_id": asset_id,
+                    "path": str(path),
+                    "sha256": "b" * 64,
+                    "bytes": path.stat().st_size,
+                    "object_count": 1,
+                    "triangle_count": 2,
+                    "backend": "freecad-occt",
+                    "tessellation_deflection_mm": 0.1,
+                }
+            )
+            self.assertIsNotNone(public)
+            self.assertNotIn("path", public)
+            server, base_url = self.start_server(cors_origins=("http://localhost:5173",))
+            response, data = request(
+                base_url,
+                "GET",
+                public["url"],
+                headers={"Origin": "http://localhost:5173"},
+            )
+            self.assertEqual(response.status, 200)
+            self.assertEqual(data, b"glTF\x02binary")
+            self.assertEqual(response.getheader("Content-Type"), "model/gltf-binary")
+            self.assertEqual(response.getheader("Content-Length"), str(len(data)))
+            self.assertEqual(
+                response.getheader("Cache-Control"), "public, max-age=31536000, immutable"
+            )
+            self.assertEqual(
+                response.getheader("Access-Control-Allow-Origin"), "http://localhost:5173"
+            )
+            response, data = request(base_url, "GET", "/api/geometry/assets/not-safe.glb")
+            self.assertEqual(response.status, 404)
+            self.assertEqual(json.loads(data)["error"]["code"], "E_NOT_FOUND")
+            response, data = request(
+                base_url, "GET", "/api/geometry/assets/{}.glb".format("c" * 64)
+            )
+            self.assertEqual(response.status, 404)
+            self.assertEqual(json.loads(data)["error"]["code"], "E_NOT_FOUND")
+
+    def test_normalize_exposes_public_display_asset_and_url(self):
+        asset_id = "d" * 64
+        mesh = TriangleMesh([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [(0, 1, 2)], units="m")
+        diagnostic = ImportDiagnostic(
+            "step_kernel_tessellated", "info", "display mesh", (("backend", "freecad-occt"),)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / (asset_id + ".glb")
+            path.write_bytes(b"glTF\x02asset")
+            result = GeometryLoadResult(
+                geometry=mesh,
+                format="step",
+                source_units="mm",
+                diagnostics=(diagnostic,),
+                source_name="assembly.step",
+                display_asset={
+                    "asset_id": asset_id,
+                    "path": str(path),
+                    "format": "glb",
+                    "sha256": "e" * 64,
+                    "bytes": path.stat().st_size,
+                    "object_count": 1,
+                    "triangle_count": 1,
+                    "backend": "freecad-occt",
+                    "tessellation_deflection_mm": 0.1,
+                },
+            )
+            with mock.patch("mouse_sim.importers.load_geometry", return_value=result):
+                server, base_url = self.start_server()
+                response, data = request(
+                    base_url,
+                    "POST",
+                    "/api/geometry/normalize?format=step",
+                    body=b"step",
+                )
+            self.assertEqual(response.status, 200, data.decode("utf-8"))
+            payload = json.loads(data)
+            self.assertIn("display_asset", payload)
+            self.assertEqual(payload["display_asset"]["format"], "glb")
+            self.assertTrue(payload["display_asset"]["url"].endswith(".glb"))
+            self.assertNotIn("path", payload["display_asset"])
+            response, data = request(base_url, "GET", payload["display_asset"]["url"])
+            self.assertEqual(response.status, 200)
+            self.assertEqual(data, b"glTF\x02asset")
+
+    def test_registered_step_asset_parts_json_endpoint(self):
+        asset_id = "e" * 64
+        with tempfile.TemporaryDirectory() as directory:
+            glb_path = Path(directory) / (asset_id + ".glb")
+            glb_path.write_bytes(b"glTF\x02binary")
+            parts_path = Path(directory) / (asset_id + ".parts.json")
+            parts_payload = {
+                "parts": [
+                    {
+                        "id": "part-0",
+                        "name": "Shell Top",
+                        "geometry": {
+                            "type": "mesh",
+                            "vertices": [[0.0, 0.0, 0.0]],
+                            "triangles": [],
+                            "units": "m",
+                            "transform": [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+                        },
+                    }
+                ]
+            }
+            parts_path.write_text(json.dumps(parts_payload), encoding="utf-8")
+            public = register_step_asset(
+                {
+                    "asset_id": asset_id,
+                    "path": str(glb_path),
+                    "sha256": "f" * 64,
+                    "bytes": glb_path.stat().st_size,
+                    "object_count": 1,
+                    "triangle_count": 1,
+                    "backend": "freecad-occt",
+                    "tessellation_deflection_mm": 0.1,
+                    "parts": [{"id": "part-0", "name": "Shell Top"}],
+                    "parts_path": str(parts_path),
+                }
+            )
+            self.assertIsNotNone(public)
+            self.assertEqual(public["parts"], [{"id": "part-0", "name": "Shell Top"}])
+            self.assertEqual(
+                public["parts_url"], "/api/geometry/assets/{}.parts.json".format(asset_id)
+            )
+            self.assertNotIn("path", public)
+            self.assertNotIn("parts_path", public)
+            server, base_url = self.start_server(cors_origins=("http://localhost:5173",))
+            response, data = request(
+                base_url,
+                "GET",
+                public["parts_url"],
+                headers={"Origin": "http://localhost:5173"},
+            )
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.loads(data), parts_payload)
+            self.assertTrue(response.getheader("Content-Type").startswith("application/json"))
+            self.assertEqual(response.getheader("Content-Length"), str(len(data)))
+            self.assertEqual(
+                response.getheader("Cache-Control"), "public, max-age=31536000, immutable"
+            )
+            self.assertEqual(
+                response.getheader("Access-Control-Allow-Origin"), "http://localhost:5173"
+            )
+            response, data = request(
+                base_url, "GET", "/api/geometry/assets/{}.parts.json".format("g" * 64)
+            )
+            self.assertEqual(response.status, 404)
+            self.assertEqual(json.loads(data)["error"]["code"], "E_NOT_FOUND")
+            response, data = request(base_url, "GET", "/api/geometry/assets/not-safe.parts.json")
+            self.assertEqual(response.status, 404)
+            self.assertEqual(json.loads(data)["error"]["code"], "E_NOT_FOUND")
+            response, data = request(base_url, "GET", public["url"])
+            self.assertEqual(response.status, 200)
+            self.assertEqual(data, b"glTF\x02binary")
+
+    def test_normalize_exposes_parts_metadata_and_url(self):
+        asset_id = "1" * 64
+        mesh = TriangleMesh([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [(0, 1, 2)], units="m")
+        diagnostic = ImportDiagnostic(
+            "step_kernel_tessellated", "info", "display mesh", (("backend", "freecad-occt"),)
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / (asset_id + ".glb")
+            path.write_bytes(b"glTF\x02asset")
+            parts_path = Path(directory) / (asset_id + ".parts.json")
+            parts_payload = {
+                "parts": [
+                    {"id": "part-0", "name": "Shell Top"},
+                    {"id": "part-1", "name": "Shell Bottom"},
+                ]
+            }
+            parts_path.write_text(json.dumps(parts_payload), encoding="utf-8")
+            result = GeometryLoadResult(
+                geometry=mesh,
+                format="step",
+                source_units="mm",
+                diagnostics=(diagnostic,),
+                source_name="assembly.step",
+                display_asset={
+                    "asset_id": asset_id,
+                    "path": str(path),
+                    "format": "glb",
+                    "sha256": "i" * 64,
+                    "bytes": path.stat().st_size,
+                    "object_count": 2,
+                    "triangle_count": 1,
+                    "backend": "freecad-occt",
+                    "tessellation_deflection_mm": 0.1,
+                    "parts": [
+                        {"id": "part-0", "name": "Shell Top"},
+                        {"id": "part-1", "name": "Shell Bottom"},
+                    ],
+                    "parts_path": str(parts_path),
+                },
+            )
+            with mock.patch("mouse_sim.importers.load_geometry", return_value=result):
+                server, base_url = self.start_server()
+                response, data = request(
+                    base_url,
+                    "POST",
+                    "/api/geometry/normalize?format=step",
+                    body=b"step",
+                )
+            self.assertEqual(response.status, 200, data.decode("utf-8"))
+            payload = json.loads(data)
+            display = payload["display_asset"]
+            self.assertEqual(
+                display["parts"],
+                [{"id": "part-0", "name": "Shell Top"}, {"id": "part-1", "name": "Shell Bottom"}],
+            )
+            self.assertTrue(display["parts_url"].endswith(".parts.json"))
+            self.assertNotIn("path", display)
+            self.assertNotIn("parts_path", display)
+            response, data = request(base_url, "GET", display["parts_url"])
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.loads(data), parts_payload)
 
     def test_normalize_invalid_format_and_media_type(self):
         server, base_url = self.start_server()
@@ -635,6 +918,94 @@ class WebApiTests(unittest.TestCase):
         payload = json.loads(data)
         self.assertEqual(payload["schema_id"], "gms.web-error/1")
         self.assertEqual(payload["error"]["code"], "E_NOT_FOUND")
+
+
+class AssetRegistryLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        import mouse_sim.web_api as web_api
+
+        self._registry = web_api._STEP_ASSET_REGISTRY
+        self._parts_registry = web_api._STEP_ASSET_PARTS_REGISTRY
+        self._cap = web_api._STEP_ASSET_REGISTRY_CAP
+        with web_api._STEP_ASSET_REGISTRY_LOCK:
+            web_api._STEP_ASSET_REGISTRY.clear()
+            web_api._STEP_ASSET_PARTS_REGISTRY.clear()
+
+    def tearDown(self):
+        import mouse_sim.web_api as web_api
+
+        with web_api._STEP_ASSET_REGISTRY_LOCK:
+            web_api._STEP_ASSET_REGISTRY.clear()
+            web_api._STEP_ASSET_PARTS_REGISTRY.clear()
+        web_api._STEP_ASSET_REGISTRY_CAP = self._cap
+
+    def test_register_existing_assets_restores_parts_from_manifest(self):
+        import mouse_sim.web_api as web_api
+        from mouse_sim.web_api import register_existing_assets
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            asset_id = "a" * 64
+            glb = root / (asset_id + ".glb")
+            glb.write_bytes(b"glTF\x02\x00\x00\x00")
+            parts = root / (asset_id + ".parts.json")
+            parts.write_text(json.dumps({"parts": [{"id": "part-0", "name": "Shell"}]}), encoding="utf-8")
+            manifest = root / (asset_id + ".manifest.json")
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "parts": [
+                            {
+                                "id": "part-0",
+                                "name": "Shell",
+                                "color": [0.36, 1.0, 0.41],
+                                "vertex_count": 1,
+                                "triangle_count": 1,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(register_existing_assets(directory), 1)
+            with web_api._STEP_ASSET_REGISTRY_LOCK:
+                self.assertIn(asset_id, web_api._STEP_ASSET_REGISTRY)
+                self.assertIn(asset_id, web_api._STEP_ASSET_PARTS_REGISTRY)
+
+    def test_register_existing_assets_skips_incomplete_and_bad_names(self):
+        from mouse_sim.web_api import register_existing_assets
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ("b" * 64 + ".glb")).write_bytes(b"glTF\x02\x00\x00\x00")
+            (root / ("nothex" + ".glb")).write_bytes(b"glTF\x02\x00\x00\x00")
+            self.assertEqual(register_existing_assets(directory), 0)
+
+    def test_registry_eviction_is_lru(self):
+        import mouse_sim.web_api as web_api
+
+        web_api._STEP_ASSET_REGISTRY_CAP = 2
+        with tempfile.TemporaryDirectory() as directory:
+            ids = []
+            for index in range(3):
+                asset_id = format(index, "064x")
+                glb = Path(directory) / (asset_id + ".glb")
+                glb.write_bytes(b"glTF\x02\x00\x00\x00")
+                register_step_asset(
+                    {
+                        "asset_id": asset_id,
+                        "path": str(glb),
+                        "parts_path": None,
+                    }
+                )
+                ids.append(asset_id)
+            with web_api._STEP_ASSET_REGISTRY_LOCK:
+                self.assertEqual(set(web_api._STEP_ASSET_REGISTRY.keys()), {ids[1], ids[2]})
+            # Re-register the evicted id: it becomes the newest entry again.
+            glb = Path(directory) / (ids[0] + ".glb")
+            register_step_asset({"asset_id": ids[0], "path": str(glb), "parts_path": None})
+            with web_api._STEP_ASSET_REGISTRY_LOCK:
+                self.assertEqual(set(web_api._STEP_ASSET_REGISTRY.keys()), {ids[2], ids[0]})
 
 
 if __name__ == "__main__":

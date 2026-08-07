@@ -49,6 +49,32 @@ class GeometryHealthTests(unittest.TestCase):
         self.assertTrue(open_finding.evidence_blocking)
         self.assertEqual(open_finding.affected_ids, ("plate",))
 
+    def test_display_tessellation_topology_is_approximate(self):
+        mesh = TriangleMesh([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [(0, 1, 2)])
+        findings = check_geometry_health(mesh, "plate", display_tessellation=True)
+        codes = {item.code: item for item in findings}
+        self.assertEqual(codes["GEOMETRY_OPEN_MESH"].severity, "warning")
+        self.assertFalse(codes["GEOMETRY_OPEN_MESH"].evidence_blocking)
+        self.assertIn("approximate", codes["GEOMETRY_OPEN_MESH"].message)
+
+    def test_run_validation_honors_display_tessellation_option(self):
+        vertices = [
+            (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0), (1.0, 0.0, 1.0), (1.0, 1.0, 1.0), (0.0, 1.0, 1.0),
+        ]
+        triangles = [
+            (0, 3, 2), (0, 2, 1), (4, 5, 6), (4, 6, 7),
+            (0, 1, 5), (0, 5, 4), (1, 2, 6), (1, 6, 5), (3, 7, 6), (3, 6, 2),
+        ]
+        mesh = TriangleMesh(vertices, triangles)
+        strict = run_validation({"case": mesh}, {}, {}, {})
+        self.assertEqual(strict.status, "fail")
+        lax = run_validation({"case": mesh}, {}, {}, {"display_tessellation": True})
+        self.assertEqual(lax.status, "warn")
+        self.assertTrue(
+            all(item.severity != "error" for item in lax.findings if item.code.startswith("GEOMETRY_"))
+        )
+
     def test_unreviewed_repairs_warn_only_when_unreviewed(self):
         mesh = TriangleMesh([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [(0, 1, 2)])
         codes = {item.code for item in check_geometry_health(mesh, "plate", repair_records=[{"operation": "stitch", "reviewed": False}])}
@@ -196,6 +222,37 @@ class RunValidationTests(unittest.TestCase):
         )
         self.assertEqual(report.status, "pass")
         self.assertEqual(report.validity_state, "valid")
+
+
+class NonFiniteInputTests(unittest.TestCase):
+    def test_nan_density_flagged_in_basic_checks(self):
+        findings = check_material({"density": float("nan"), "approval_state": "approved"}, "case")
+        codes = {item.code for item in findings}
+        self.assertIn("MATERIAL_INVALID", codes)
+        self.assertNotIn("MAT_UNAPPROVED_PROVENANCE", codes)
+
+    def test_nan_modulus_flagged_in_basic_checks(self):
+        findings = check_material({"young_modulus": float("inf")}, "case")
+        self.assertIn("MATERIAL_INVALID", {item.code for item in findings})
+
+    def test_nan_poisson_ratio_flagged_in_basic_checks(self):
+        findings = check_material({"poissons_ratio": float("nan")}, "case")
+        self.assertIn("MATERIAL_INVALID", {item.code for item in findings})
+
+    def test_nan_wall_thickness_warns_unknown(self):
+        findings = check_wall_thickness({"wall_thickness_m": float("nan")}, "case", 0.001, 0.05)
+        self.assertEqual(findings[0].code, "THICKNESS_UNKNOWN")
+        self.assertEqual(findings[0].severity, "warning")
+
+    def test_display_tessellation_zero_volume_remains_error(self):
+        mesh = TriangleMesh([(0, 0, 0), (1, 0, 0), (2, 0, 0)], [(0, 1, 2)])
+        findings = check_geometry_health(mesh, "plate", display_tessellation=True)
+        zero = next(item for item in findings if item.code == "GEOMETRY_ZERO_VOLUME")
+        self.assertEqual(zero.severity, "error")
+        self.assertTrue(zero.evidence_blocking)
+        open_mesh = next(item for item in findings if item.code == "GEOMETRY_OPEN_MESH")
+        self.assertEqual(open_mesh.severity, "warning")
+        self.assertFalse(open_mesh.evidence_blocking)
 
 
 if __name__ == "__main__":

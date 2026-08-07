@@ -8,7 +8,6 @@ import {
 } from './state/selectors';
 import { createClient } from './api/client';
 import { errorMessage, isAbortError } from './api/errors';
-import { loadBaseline } from './lib/boot';
 import { isRecord, type Vec3 } from './api/contracts';
 import { TopBar } from './components/TopBar';
 import { ModelTree } from './components/ModelTree';
@@ -51,14 +50,6 @@ export function App(): React.ReactElement {
     window.localStorage.setItem('mouse-sim-theme', 'dark');
   }, [dispatch]);
 
-  // Boot the workspace from the server-owned baseline project. Abort the
-  // request on unmount so StrictMode remounts cannot commit stale source data.
-  React.useEffect(() => {
-    const controller = new AbortController();
-    void loadBaseline(clientRef.current, dispatch, controller.signal);
-    return () => controller.abort();
-  }, [dispatch]);
-
   // Server health check on mount.
   React.useEffect(() => {
     let cancelled = false;
@@ -95,16 +86,44 @@ export function App(): React.ReactElement {
     };
   }, [dispatch]);
 
+  // Per-part geometry for kernel-backed STEP previews (lazy fetch of the
+  // parts asset; the preview envelope only carries part metadata).
+  const partsAssetId = state.preview?.display_asset?.asset_id ?? null;
+  const needsPartGeometry =
+    partsAssetId !== null &&
+    (state.preview?.display_asset?.parts?.length ?? 0) > 0 &&
+    state.partGeometry === null;
+  React.useEffect(() => {
+    if (!needsPartGeometry || partsAssetId === null) return;
+    let cancelled = false;
+    clientRef.current
+      .getAssetParts(partsAssetId)
+      .then((response) => {
+        if (cancelled) return;
+        dispatch({ type: 'PARTS_OK', assetId: partsAssetId, parts: response.parts });
+      })
+      .catch(() => {
+        if (cancelled) return;
+        dispatch({ type: 'PARTS_ERROR', assetId: partsAssetId });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [needsPartGeometry, partsAssetId, dispatch]);
+
   // Debounced analysis runner. requestKey covers draft/project/preview
   // changes; state.mode covers mode switches. The token guard prevents
   // stale responses from overwriting newer drafts.
   const tokenRef = React.useRef(0);
   const abortRef = React.useRef<AbortController | null>(null);
   const debounceRef = React.useRef<number | null>(null);
-  const analysisRequest = selectAnalysisRequest(state);
+  // The analysis request is memoized: createAnalysisRequest builds fresh
+  // objects each call, and stringifying the per-part geometry on every render
+  // would stall the main thread for hundreds of milliseconds.
+  const analysisRequest = React.useMemo(() => selectAnalysisRequest(state), [state]);
   const analysisRequestRef = React.useRef(analysisRequest);
   analysisRequestRef.current = analysisRequest;
-  const requestKey = JSON.stringify(analysisRequest ?? null);
+  const requestKey = React.useMemo(() => JSON.stringify(analysisRequest ?? null), [analysisRequest]);
 
   React.useEffect(() => {
     const request = analysisRequestRef.current;
@@ -139,19 +158,25 @@ export function App(): React.ReactElement {
 
   const entries = React.useMemo(
     () => selectObjectEntries(state),
-    // The selector only reads these four geometry sources. Avoid rebuilding
-    // scene entries when render stats or unrelated UI state changes.
+    // The selector reads the geometry sources plus the lazily-fetched per-part
+    // geometry for kernel-backed STEP previews (state.partGeometry). Avoid
+    // rebuilding scene entries when render stats or unrelated UI state changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [state.project, state.preview, state.tempPreview, state.draft],
+    [state.project, state.preview, state.tempPreview, state.draft, state.partGeometry],
   );
 
   // Nothing loaded yet: show the geometry guide card instead of an empty scene.
   const showGuideCard = entries.length === 0 && !state.webglError;
 
-  const visibleEntries = entries.filter((entry) => state.visibility[entry.id] ?? true);
-  const shownEntries = state.isolatedId
-    ? visibleEntries.filter((entry) => entry.id === state.isolatedId)
-    : visibleEntries;
+  // Visibility is applied per object inside the scene runtime (no rebuild);
+  // isolation still filters the entry set.
+  const shownEntries = React.useMemo(
+    () =>
+      state.isolatedId
+        ? entries.filter((entry) => entry.id === state.isolatedId)
+        : entries,
+    [entries, state.isolatedId],
+  );
   const lastResult = state.lastResult;
   const findingSeveritiesRef = React.useRef(selectFindingSeverities(state));
   findingSeveritiesRef.current = selectFindingSeverities(state);
@@ -162,7 +187,6 @@ export function App(): React.ReactElement {
     const spec: OverlaySpec = {
       loadVector: null,
       fixtures: null,
-      displacementPin: null,
       stressBadge: null,
       contactPlane: null,
       severityMarkers: null,
@@ -173,9 +197,6 @@ export function App(): React.ReactElement {
     if (result) {
       const response = result.structural?.response;
       if (response) {
-        if (response.max_displacement_location) {
-          spec.displacementPin = { location: response.max_displacement_location };
-        }
         if (response.filtered_location) {
           spec.stressBadge = { location: response.filtered_location };
         }
@@ -214,22 +235,28 @@ export function App(): React.ReactElement {
       }
     }
 
-    // Severity markers from validation findings.
+    // Severity markers from validation findings. Kernel-backed STEP previews
+    // are display tessellations whose per-part topology warnings are expected
+    // approximations; rendering a marker at every part centroid would flood
+    // the scene with dots, so markers are suppressed for those previews.
+    const displayAsset = state.preview?.display_asset ?? null;
     const severities = findingSeveritiesRef.current;
     const markers: { id: string; location: Vec3; severity: string }[] = [];
-    for (const entry of shownEntries) {
-      const severity = severities.get(entry.id);
-      if (!severity) continue;
-      if (severity !== 'warning' && severity !== 'error' && severity !== 'blocker') continue;
-      markers.push({
-        id: entry.id,
-        location: boundsCenter(worldBounds(entry.geometry)),
-        severity,
-      });
+    if (!displayAsset) {
+      for (const entry of shownEntries) {
+        const severity = severities.get(entry.id);
+        if (!severity) continue;
+        if (severity !== 'warning' && severity !== 'error' && severity !== 'blocker') continue;
+        markers.push({
+          id: entry.id,
+          location: boundsCenter(worldBounds(entry.geometry)),
+          severity,
+        });
+      }
     }
     spec.severityMarkers = markers.length > 0 ? markers : null;
     return spec;
-  }, [lastResult, analysisRequest, shownEntries]);
+  }, [lastResult, analysisRequest, shownEntries, state.preview?.display_asset]);
 
   return (
     <div className="app" data-theme={state.theme}>
@@ -269,12 +296,21 @@ export function App(): React.ReactElement {
             <SceneViewport
               ref={viewportRef}
               entries={shownEntries}
+              visibility={state.visibility}
               selectedId={state.selectedId}
               explode={state.explode}
               theme={state.theme}
               quality={quality}
               overlays={overlays}
-              onPick={(id) => dispatch({ type: 'SELECT', id })}
+              onPick={(id) => {
+                dispatch({ type: 'SELECT', id });
+                // Clicking an object in the viewport is an explicit request to
+                // inspect it; open the inspector drawer instead of silently
+                // selecting and leaving it hidden.
+                if (id !== null) {
+                  dispatch({ type: 'SET_INSPECTOR_OPEN', open: true });
+                }
+              }}
               onStats={setStats}
               onWebGLUnsupported={(reason) =>
                 dispatch({ type: 'SET_WEBGL_ERROR', message: reason })

@@ -5,7 +5,6 @@ import { SELECTION_ACCENT, WARNING_ACCENT, BLOCKER_ACCENT } from './materialPale
 export interface OverlaySpec {
   loadVector: { origin: Vec3; direction: Vec3 } | null;
   fixtures: { name: string; location: Vec3 }[] | null;
-  displacementPin: { location: Vec3 } | null;
   stressBadge: { location: Vec3 } | null;
   contactPlane: { normal: Vec3; point: Vec3 } | null;
   severityMarkers: { id: string; location: Vec3; severity: string }[] | null;
@@ -159,21 +158,6 @@ export function createOverlayLayer(
           );
           container.add(sprite);
         }
-      }
-
-      // Displacement Pin
-      if (spec.displacementPin && isFiniteVec3(spec.displacementPin.location)) {
-        const loc = spec.displacementPin.location;
-        const geom = new THREE.OctahedronGeometry(r * 0.1);
-        const mat = new THREE.MeshBasicMaterial({ color: SELECTION_ACCENT });
-        mat.userData.owned = true;
-        const mesh = new THREE.Mesh(geom, mat);
-        mesh.position.set(...loc);
-        container.add(mesh);
-
-        const sprite = createLabelSprite('max displacement', r);
-        sprite.position.set(loc[0], loc[1], loc[2] + r * 0.15);
-        container.add(sprite);
       }
 
       // Stress Badge

@@ -2,12 +2,22 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { FileDropzone } from '../components/FileDropzone';
 import { ProjectProvider } from '../state/projectStore';
+import { IDENTITY_TRANSFORM, type GeometryPreview } from '../api/contracts';
 import type { ParseOk } from '../workers/workerProtocol';
 
-const { parseInWorkerMock } = vi.hoisted(() => ({ parseInWorkerMock: vi.fn() }));
+const { parseInWorkerMock, normalizeGeometryMock } = vi.hoisted(() => ({
+  parseInWorkerMock: vi.fn(),
+  normalizeGeometryMock: vi.fn(),
+}));
 
 vi.mock('../workers/workerProtocol', () => ({
   parseInWorker: parseInWorkerMock,
+}));
+
+vi.mock('../api/client', () => ({
+  createClient: () => ({
+    normalizeGeometry: normalizeGeometryMock,
+  }),
 }));
 
 function deferred<T>() {
@@ -38,8 +48,21 @@ function geometryFile(name: string): File {
   return file;
 }
 
+function supportedStepPreview(): GeometryPreview {
+  return {
+    schema_id: 'gms.geometry-preview/1',
+    supported: true,
+    format: 'step',
+    source_units: 'mm',
+    source_name: 'housing.step',
+    geometry: { type: 'box', size: [1, 1, 1], units: 'mm', transform: IDENTITY_TRANSFORM },
+    diagnostics: [],
+  };
+}
+
 afterEach(() => {
   parseInWorkerMock.mockReset();
+  normalizeGeometryMock.mockReset();
 });
 
 describe('FileDropzone preview lifecycle', () => {
@@ -82,5 +105,66 @@ describe('FileDropzone preview lifecycle', () => {
       secondParse.resolve(parseResult());
       await Promise.resolve();
     });
+  });
+
+  it('normalizes a supported STEP file immediately and closes the dropzone', async () => {
+    const onClose = vi.fn();
+    normalizeGeometryMock.mockResolvedValueOnce(supportedStepPreview());
+
+    render(
+      <ProjectProvider>
+        <FileDropzone onClose={onClose} />
+      </ProjectProvider>,
+    );
+
+    const input = screen.getByDisplayValue('') as HTMLInputElement;
+    fireEvent.change(input, {
+      target: { files: [geometryFile('housing.step')] },
+    });
+
+    await waitFor(() => expect(normalizeGeometryMock).toHaveBeenCalledTimes(1));
+    expect(normalizeGeometryMock).toHaveBeenCalledWith(
+      { format: 'step', name: 'housing.step', body: expect.any(ArrayBuffer) },
+      expect.any(AbortSignal),
+    );
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders diagnostics when a STEP preview is unsupported', async () => {
+    const onClose = vi.fn();
+    normalizeGeometryMock.mockResolvedValueOnce({
+      schema_id: 'gms.geometry-preview/1',
+      supported: false,
+      format: 'step',
+      source_units: null,
+      source_name: 'housing.step',
+      geometry: null,
+      diagnostics: [
+        {
+          code: 'unsupported_step_entities',
+          severity: 'error',
+          message: 'STEP file contains unsupported NURBS B-rep surfaces',
+          details: { entities: ['b_spline_surface'] },
+        },
+      ],
+    });
+
+    render(
+      <ProjectProvider>
+        <FileDropzone onClose={onClose} />
+      </ProjectProvider>,
+    );
+
+    const input = screen.getByDisplayValue('') as HTMLInputElement;
+    fireEvent.change(input, {
+      target: { files: [geometryFile('housing.step')] },
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByText('STEP file contains unsupported NURBS B-rep surfaces'),
+      ).toBeInTheDocument();
+    });
+    expect(onClose).not.toHaveBeenCalled();
   });
 });

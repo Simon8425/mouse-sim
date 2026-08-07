@@ -6,6 +6,7 @@ import type {
   GeometryPreview,
   WebAnalysisRequest,
   WebAnalysisResponse,
+  AssetPartsResponse,
 } from './contracts';
 import { isRecord } from './contracts';
 import {
@@ -90,6 +91,13 @@ export class ApiClient {
       return (res as WebMaterialCatalog).materials;
     }
     return [];
+  }
+
+  async getAssetParts(assetId: string, signal?: AbortSignal): Promise<AssetPartsResponse> {
+    return this.request<AssetPartsResponse>(`/api/geometry/assets/${assetId}.parts.json`, {
+      method: 'GET',
+      signal,
+    });
   }
 
   async normalizeGeometry(

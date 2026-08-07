@@ -159,7 +159,42 @@ endsolid triangle
         binary_result = load_geometry(binary, fmt="stl", units="mm")
         self.assertEqual(binary_result.geometry.vertices[1], (0.001, 0.0, 0.0))
 
-        unsupported = load_geometry(b"ISO-10303-21;", fmt="step")
+        faceted_step = (
+            b"ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n"
+            b"#1=CARTESIAN_POINT('P0',(0.,0.,0.));\n"
+            b"#2=CARTESIAN_POINT('P1',(10.,0.,0.));\n"
+            b"#3=CARTESIAN_POINT('P2',(0.,10.,0.));\n"
+            b"#4=POLY_LOOP('L',(#1,#2,#3));\n"
+            b"#5=FACE_OUTER_BOUND('B',#4);\n"
+            b"#6=FACE_SURFACE('F',(#5),#7,.T.);\n"
+            b"#7=PLANE('P',#8);\n"
+            b"#8=AXIS2_PLACEMENT_3D('A',#1,#9,#10);\n"
+            b"#9=DIRECTION('Z',(0.,0.,1.));\n"
+            b"#10=DIRECTION('X',(1.,0.,0.));\n"
+            b"#11=CLOSED_SHELL('S',(#6));\n"
+            b"#12=MANIFOLD_SOLID_BREP('Solid',#11);\n"
+            b"ENDSEC;\nEND-ISO-10303-21;"
+        )
+        faceted_result = load_geometry(faceted_step, fmt="step")
+        self.assertFalse(faceted_result.unsupported)
+        self.assertEqual(faceted_result.format, "step")
+        self.assertEqual(faceted_result.source_units, "mm")
+        self.assertEqual(len(faceted_result.geometry.vertices), 3)
+        self.assertEqual(len(faceted_result.geometry.triangles), 1)
+        self.assertEqual(faceted_result.geometry.vertices[1], (0.01, 0.0, 0.0))
+
+        advanced_step = (
+            b"ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\n"
+            b"#1=ADVANCED_BREP_SHAPE_REPRESENTATION('A',(#2),#3);\n"
+            b"#2=B_SPLINE_SURFACE('S',1,1,((#4,#5),(#6,#7)),.UNSPECIFIED.,.F.,.F.,.F.);\n"
+            b"#3=GEOMETRIC_REPRESENTATION_CONTEXT(3);\n"
+            b"#4=CARTESIAN_POINT('P',(0.,0.,0.));\n"
+            b"#5=CARTESIAN_POINT('P',(1.,0.,0.));\n"
+            b"#6=CARTESIAN_POINT('P',(0.,1.,0.));\n"
+            b"#7=CARTESIAN_POINT('P',(1.,1.,0.));\n"
+            b"ENDSEC;\nEND-ISO-10303-21;"
+        )
+        unsupported = load_geometry(advanced_step, fmt="step")
         self.assertTrue(unsupported.unsupported)
         self.assertIsNone(unsupported.geometry)
         self.assertEqual(unsupported.diagnostic.code, "unsupported_format")

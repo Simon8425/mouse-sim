@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { OutlinePass } from 'three/examples/jsm/postprocessing/OutlinePass.js';
@@ -40,6 +41,7 @@ export interface SceneRuntimeOptions {
 
 export interface SceneRuntime {
   setObjects: (entries: ObjectSceneEntry[]) => void;
+  setVisibility: (visibility: Record<string, boolean>) => void;
   setSelection: (id: string | null) => void;
   setExplode: (factor: number) => void;
   setTheme: (theme: 'light' | 'dark') => void;
@@ -99,10 +101,22 @@ export function detectQualityTier(): QualityTier {
   return 'high';
 }
 
-function entriesSignature(entries: ObjectSceneEntry[]): string {
+export function entriesSignature(entries: ObjectSceneEntry[]): string {
   try {
     return JSON.stringify(
-      entries.map((entry) => [entry.id, entry.className ?? null, entry.geometry]),
+      entries.map((entry) => [
+        entry.id,
+        entry.className ?? null,
+        entry.displayAssetUrl ?? null,
+        entry.color ?? null,
+        // Large per-part meshes are analysed/bounded from their geometry; the
+        // signature only needs identity and sizes, not the vertex payload.
+        entry.displayAssetUrl
+          ? [entry.geometry.type, entry.geometry.type === 'mesh' ? entry.geometry.triangles.length : null]
+          : entry.geometry.type === 'mesh'
+            ? [entry.geometry.type, entry.geometry.vertices.length, entry.geometry.triangles.length]
+            : entry.geometry,
+      ]),
     );
   } catch {
     // Circular data is malformed input; retain a conservative ID-based
@@ -249,9 +263,9 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
         scene,
         camera,
       );
-      outlinePass.edgeStrength = 2.5;
-      outlinePass.edgeGlow = 0;
-      outlinePass.edgeThickness = 1;
+      outlinePass.edgeStrength = 4;
+      outlinePass.edgeGlow = 0.15;
+      outlinePass.edgeThickness = 1.5;
       outlinePass.visibleEdgeColor.setHex(SELECTION_ACCENT);
       composer.addPass(outlinePass);
 
@@ -261,17 +275,86 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   };
   initComposer();
 
+  const applyVisibility = () => {
+    for (const outer of objectsGroup.children) {
+      const id = outer.userData.objectId;
+      if (typeof id === 'string') {
+        outer.visible = currentVisibility[id] ?? true;
+      }
+    }
+  };
+
   // State variables
   let currentEntries: ObjectSceneEntry[] = [];
+  let currentVisibility: Record<string, boolean> = {};
   let currentSelectionId: string | null = null;
   let currentExplodeFactor = 0;
   let currentIdSignature = '';
   let currentEntriesSignature: string | null = null;
   let disposed = false;
+  let assetLoadGeneration = 0;
+  const gltfLoader = new GLTFLoader();
 
   const overlayLayer = createOverlayLayer(scene, { planeRadius: maxDimension / 2 });
 
+  const markAssetResourcesOwned = (root: THREE.Object3D): void => {
+    root.traverse((object) => {
+      const mesh = object as THREE.Mesh;
+      if (!mesh.isMesh || !mesh.material) return;
+      const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const material of materials) material.userData.owned = true;
+    });
+  };
+
+  const loadDisplayAsset = (
+    entry: ObjectSceneEntry,
+    target: THREE.Group,
+    outer: THREE.Group,
+    generation: number,
+  ): void => {
+    if (!entry.displayAssetUrl) return;
+    gltfLoader.load(
+      entry.displayAssetUrl,
+      (gltf) => {
+        if (disposed || generation !== assetLoadGeneration || outer.parent !== objectsGroup) {
+          disposeObject3D(gltf.scene);
+          return;
+        }
+        markAssetResourcesOwned(gltf.scene);
+        // The OCCT glTF converter preserves the STEP Z-up frame. The source
+        // assembly is authored from its underside, while this scene presents
+        // the engineering top view by default; flip the complete asset once,
+        // without mutating individual assembly placements.
+        gltf.scene.rotation.x = Math.PI;
+        target.add(gltf.scene);
+        const meshes: THREE.Mesh[] = [];
+        gltf.scene.traverse((object) => {
+          const mesh = object as THREE.Mesh;
+          if (mesh.isMesh) meshes.push(mesh);
+        });
+        target.userData.meshObjects = meshes;
+        applySelection();
+      },
+      undefined,
+      () => {
+        if (disposed || generation !== assetLoadGeneration || outer.parent !== objectsGroup) return;
+        // Keep a usable fallback if a cached GLB is unavailable. This path is
+        // intentionally only a transport failure fallback, never a STEP
+        // parsing fallback.
+        const fallback = createObjectGroup(
+          { ...entry, displayAssetUrl: null },
+          { quality, materials: palette.getAll() },
+        );
+        target.add(fallback);
+        target.userData.meshObjects = fallback.userData.meshObjects ?? [];
+        applySelection();
+      },
+    );
+  };
+
   const rebuildObjects = () => {
+    assetLoadGeneration += 1;
+    const generation = assetLoadGeneration;
     // Clear old objects
     const oldChildren = [...objectsGroup.children];
     for (const child of oldChildren) {
@@ -306,7 +389,10 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       }
 
       objectsGroup.add(outerGroup);
+      loadDisplayAsset(entry, innerGroup, outerGroup, generation);
     }
+
+    applyVisibility();
 
     if (hasFiniteBounds) {
       boundsUnion = { min: [minX, minY, minZ], max: [maxX, maxY, maxZ] };
@@ -440,17 +526,27 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       if (disposed) return;
       currentEntries = entries;
       const signature = entriesSignature(entries);
-      if (currentEntriesSignature === signature) return;
+      if (currentEntriesSignature === signature) {
+        applyVisibility();
+        return;
+      }
 
       const idSignature = idsSignature(entries);
       const first = currentEntriesSignature === null;
       currentEntriesSignature = signature;
       rebuildObjects();
+      applyVisibility();
 
       if (first || idSignature !== currentIdSignature) {
         currentIdSignature = idSignature;
         fitCameraToBounds(camera, controls, boundsUnion);
       }
+    },
+
+    setVisibility(visibility: Record<string, boolean>) {
+      if (disposed) return;
+      currentVisibility = visibility;
+      applyVisibility();
     },
 
     setSelection(id: string | null) {
@@ -520,6 +616,7 @@ scene.background = new THREE.Color(theme === 'dark' ? 0x141310 : 0xf7f7f4);
     dispose() {
       if (disposed) return;
       disposed = true;
+      assetLoadGeneration += 1;
       if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
       resizeObserver?.disconnect();
       picker.dispose();

@@ -104,6 +104,11 @@ export interface WebHealth {
   max_json_bytes: number;
   max_geometry_bytes: number;
   deterministic: boolean;
+  step_backend?: string;
+  step_kernel_backend?: string;
+  step_kernel_available?: boolean;
+  advanced_step_backend?: string;
+  advanced_step_uses_kernel?: boolean;
 }
 
 export interface WebErrorEnvelope {
@@ -149,6 +154,35 @@ export interface GeometryPreview {
   geometry: GeometryJson | null;
   diagnostics: ImportDiagnostic[];
   source_name: string | null;
+  display_asset?: DisplayAsset | null;
+}
+
+export interface DisplayAsset {
+  asset_id: string;
+  url: string;
+  format: 'glb';
+  sha256?: string;
+  bytes?: number;
+  object_count?: number;
+  triangle_count?: number;
+  backend?: string;
+  tessellation_deflection_mm?: number;
+  parts?: DisplayAssetPart[];
+  parts_url?: string;
+}
+
+export interface DisplayAssetPart {
+  id: string;
+  name: string;
+  color?: [number, number, number];
+}
+
+export interface AssetPartGeometry extends DisplayAssetPart {
+  geometry: GeometryJson;
+}
+
+export interface AssetPartsResponse {
+  parts: AssetPartGeometry[];
 }
 
 export interface ProjectObject {

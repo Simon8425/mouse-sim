@@ -8,8 +8,12 @@ successful ``200`` pass-through.
 """
 
 import json
+import math
 import os
+import re
 import sys
+import threading
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -31,7 +35,10 @@ WEB_ANALYSIS_RESPONSE_SCHEMA_ID = "gms.web-analysis-response/1"
 
 BASELINE_SOURCE = "examples/mouse_baseline.json"
 
-DEFAULT_MAX_JSON_BYTES = 8 * 1024 * 1024
+# Normalized STEP meshes expand substantially when represented as JSON. Keep
+# this larger than the raw geometry limit so a validated upload can be sent
+# through the analysis endpoint without an avoidable 413 response.
+DEFAULT_MAX_JSON_BYTES = 128 * 1024 * 1024
 DEFAULT_MAX_GEOMETRY_BYTES = 64 * 1024 * 1024
 
 _ACCEPTED_FORMATS = frozenset(
@@ -46,6 +53,24 @@ _ANALYZE_MEDIA_TYPES = frozenset(("", "application/json"))
 _ENVELOPE_KEYS = frozenset(("schema_id", "request", "options"))
 _OPTION_KEYS = frozenset(("strict", "use_cache"))
 _ALLOWED_REQUEST_SCHEMA_IDS = (None, "", "gms.project/1")
+
+# Geometry normalization is CPU and memory heavy (large STEP models parse for
+# tens of seconds).  Serialize normalize requests so duplicate or concurrent
+# uploads cannot stack several full parses in memory at once.  The lock is
+# scoped to the STEP kernel path only (see handle_normalize).
+_NORMALIZE_LOCK = threading.Lock()
+# Analysis is also memory heavy; bounded concurrency prevents several large
+# pipelines from running at once.
+_ANALYZE_SEMAPHORE = threading.BoundedSemaphore(2)
+_STEP_ASSET_REGISTRY = {}
+_STEP_ASSET_PARTS_REGISTRY = {}
+_STEP_ASSET_REGISTRY_LOCK = threading.Lock()
+_STEP_ASSET_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+_STEP_ASSET_ROUTE_RE = re.compile(r"^/api/geometry/assets/([0-9a-f]{64})\.glb$")
+_STEP_ASSET_PARTS_ROUTE_RE = re.compile(r"^/api/geometry/assets/([0-9a-f]{64})\.parts\.json$")
+# Bound the in-memory asset registry; the files remain on disk and re-upload
+# re-registers.  Eviction only drops the registry entry.
+_STEP_ASSET_REGISTRY_CAP = 256
 
 _STATIC_CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -112,6 +137,89 @@ def sanitize_display_name(name, max_length=120):
     basename = text.replace("\\", "/").rsplit("/", 1)[-1]
     cleaned = "".join(char for char in basename if ord(char) >= 32 and char != "\x7f")
     return cleaned[:max_length]
+
+
+def register_step_asset(asset):
+    """Register a generated GLB (and optional per-part JSON) and return its
+    public, path-free metadata.
+
+    The parts JSON is served as ``/api/geometry/assets/<id>.parts.json`` only
+    when the asset carries a validated ``parts_path``.  ``parts`` lists
+    ``{"id", "name"}`` summaries; full part geometry stays on disk.
+    """
+    if not isinstance(asset, dict):
+        return None
+    asset_id = str(asset.get("asset_id", ""))
+    if not _STEP_ASSET_ID_RE.fullmatch(asset_id):
+        return None
+    raw_path = asset.get("path")
+    if not raw_path:
+        return None
+    try:
+        path = Path(raw_path).expanduser().resolve()
+        if path.name != asset_id + ".glb" or path.suffix.lower() != ".glb" or not path.is_file():
+            return None
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    parts_path = None
+    raw_parts_path = asset.get("parts_path")
+    if raw_parts_path:
+        try:
+            candidate = Path(raw_parts_path).expanduser().resolve()
+            if (
+                candidate.name == asset_id + ".parts.json"
+                and candidate.suffix.lower() == ".json"
+                and candidate.is_file()
+            ):
+                parts_path = candidate
+        except (OSError, RuntimeError, TypeError, ValueError):
+            parts_path = None
+    with _STEP_ASSET_REGISTRY_LOCK:
+        # Re-registering refreshes the LRU position.
+        _STEP_ASSET_REGISTRY.pop(asset_id, None)
+        _STEP_ASSET_PARTS_REGISTRY.pop(asset_id, None)
+        _STEP_ASSET_REGISTRY[asset_id] = path
+        if parts_path is not None:
+            _STEP_ASSET_PARTS_REGISTRY[asset_id] = parts_path
+        # Bound the registry: evict the oldest entry (files stay on disk).
+        while len(_STEP_ASSET_REGISTRY) > _STEP_ASSET_REGISTRY_CAP:
+            oldest = next(iter(_STEP_ASSET_REGISTRY))
+            _STEP_ASSET_REGISTRY.pop(oldest, None)
+            _STEP_ASSET_PARTS_REGISTRY.pop(oldest, None)
+    public = {
+        "asset_id": asset_id,
+        "url": "/api/geometry/assets/{}.glb".format(asset_id),
+        "format": "glb",
+    }
+    for key in (
+        "sha256",
+        "bytes",
+        "object_count",
+        "triangle_count",
+        "backend",
+        "tessellation_deflection_mm",
+    ):
+        if key in asset:
+            public[key] = asset[key]
+    if parts_path is not None:
+        parts = asset.get("parts")
+        if isinstance(parts, list):
+            summaries = []
+            for entry in parts:
+                if not (isinstance(entry, dict) and str(entry.get("id", ""))):
+                    continue
+                summary = {"id": str(entry["id"]), "name": entry.get("name")}
+                color = entry.get("color")
+                if (
+                    isinstance(color, (list, tuple))
+                    and len(color) == 3
+                    and all(isinstance(c, (int, float)) and math.isfinite(float(c)) for c in color)
+                ):
+                    summary["color"] = [float(c) for c in color]
+                summaries.append(summary)
+            public["parts"] = summaries
+        public["parts_url"] = "/api/geometry/assets/{}.parts.json".format(asset_id)
+    return public
 
 
 def _quantity_si(properties, field_name):
@@ -196,6 +304,7 @@ def handle_health(config):
     """Return the health envelope for the web API."""
     from .pipeline import ENGINE_VERSION
     from .physics import SOLVER_CAPABILITIES
+    from .step_kernel import kernel_available
 
     return (
         200,
@@ -203,12 +312,17 @@ def handle_health(config):
             "schema_id": WEB_HEALTH_SCHEMA_ID,
             "engine_version": ENGINE_VERSION,
             "api_version": API_VERSION,
-            "supported_formats": ["json", "obj", "stl"],
+            "supported_formats": ["json", "obj", "stl", "step"],
             "solver_capabilities": list(SOLVER_CAPABILITIES.to_dict()["capability_keys"]),
             "cache_active": config.cache_dir is not None,
             "max_json_bytes": config.max_json_bytes,
             "max_geometry_bytes": config.max_geometry_bytes,
             "deterministic": True,
+            "step_backend": "auto",
+            "step_kernel_backend": "freecad-occt",
+            "step_kernel_available": kernel_available(),
+            "advanced_step_backend": "kernel",
+            "advanced_step_uses_kernel": True,
         },
     )
 
@@ -296,36 +410,50 @@ def handle_normalize(config, query, body):
         )
     units = (query.get("units") or [None])[0]
     name = sanitize_display_name((query.get("name") or [None])[0])
-    try:
-        from .importers import load_geometry
-    except Exception as exc:
-        return make_web_error(500, "E_INTERNAL", "geometry importer is unavailable: {}".format(exc))
-    try:
-        result = load_geometry(body, fmt=fmt, units=units)
-    except UnitError as exc:
-        diagnostic = {
-            "code": "invalid_units",
-            "severity": "blocker",
-            "message": str(exc),
-            "details": {},
-        }
-        return _preview_failure(fmt, units, [diagnostic], name)
-    except ValueError as exc:
-        diagnostic = {
-            "code": "parse_failed",
-            "severity": "error",
-            "message": str(exc),
-            "details": {},
-        }
-        return _preview_failure(fmt, units, [diagnostic], name)
-    if result is None or not result.is_supported:
-        diagnostics = [
-            item.to_dict() for item in (result.diagnostics if result is not None else ())
-        ]
-        return _preview_failure(fmt, units, diagnostics, name)
-    return (
-        200,
-        {
+    asset_dir = Path(config.cache_dir) / "step-assets" if config.cache_dir is not None else None
+    # The serialize lock only guards the heavy STEP kernel path; lightweight
+    # formats (json/obj/stl) stay concurrent.
+    if fmt == "step":
+        lock_context = _NORMALIZE_LOCK
+    else:
+        lock_context = nullcontext()
+    with lock_context:
+        try:
+            from .importers import load_geometry
+        except Exception as exc:
+            return make_web_error(500, "E_INTERNAL", "geometry importer is unavailable: {}".format(exc))
+        try:
+            result = load_geometry(
+                body,
+                fmt=fmt,
+                units=units,
+                step_backend="auto",
+                step_asset_dir=asset_dir,
+            )
+        except UnitError as exc:
+            diagnostic = {
+                "code": "invalid_units",
+                "severity": "blocker",
+                "message": str(exc),
+                "details": {},
+            }
+            return _preview_failure(fmt, units, [diagnostic], name)
+        except ValueError as exc:
+            diagnostic = {
+                "code": "parse_failed",
+                "severity": "error",
+                "message": str(exc),
+                "details": {},
+            }
+            return _preview_failure(fmt, units, [diagnostic], name)
+        if result is None or not result.is_supported:
+            diagnostics = [
+                item.to_dict() for item in (result.diagnostics if result is not None else ())
+            ]
+            return _preview_failure(fmt, units, diagnostics, name)
+        raw_display_asset = getattr(result, "display_asset", None)
+        display_asset = register_step_asset(raw_display_asset) if raw_display_asset is not None else None
+        response = {
             "schema_id": GEOMETRY_PREVIEW_SCHEMA_ID,
             "supported": True,
             "format": result.format,
@@ -333,8 +461,13 @@ def handle_normalize(config, query, body):
             "geometry": result.geometry.to_dict(),
             "diagnostics": [item.to_dict() for item in result.diagnostics],
             "source_name": result.source_name or name,
-        },
-    )
+        }
+        if display_asset is not None:
+            response["display_asset"] = display_asset
+        return (
+            200,
+            response,
+        )
 
 
 def _validate_analysis_envelope(payload):
@@ -444,7 +577,10 @@ def handle_analyze(config, cache, payload):
         from .cache import ArtifactCache
 
         cache = ArtifactCache(config.cache_dir)
-    result = run_pipeline(pipeline_request, cache=cache, use_cache=use_cache)
+    # Bounded analysis concurrency prevents several large pipelines from
+    # exhausting memory simultaneously; excess requests queue.
+    with _ANALYZE_SEMAPHORE:
+        result = run_pipeline(pipeline_request, cache=cache, use_cache=use_cache)
     error_response = _result_error_response(result)
     if error_response is not None:
         return error_response
@@ -544,7 +680,12 @@ class WebApiHandler(BaseHTTPRequestHandler):
             for key, value in extra_headers.items():
                 self.send_header(key, value)
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # The client (e.g. the web console aborting a long geometry
+            # upload) went away before the response could be delivered.
+            self.close_connection = True
 
     def _route_api_get(self, path):
         if path == "/api/health":
@@ -554,6 +695,62 @@ class WebApiHandler(BaseHTTPRequestHandler):
         if path == "/api/materials":
             return handle_materials(self.config)
         return make_web_error(404, "E_NOT_FOUND", "unknown API path {!r}".format(path))
+
+    def _serve_registered_asset(self, path, head_only=False):
+        """Serve only a registered asset whose generated id is in the registry."""
+        decoded = unquote(path)
+        parts_match = _STEP_ASSET_PARTS_ROUTE_RE.fullmatch(decoded)
+        glb_match = _STEP_ASSET_ROUTE_RE.fullmatch(decoded)
+        if parts_match is None and glb_match is None:
+            self._send_api(*make_web_error(404, "E_NOT_FOUND", "asset not found"))
+            return
+        if parts_match is not None:
+            asset_id = parts_match.group(1)
+            expected_name = asset_id + ".parts.json"
+            content_type = "application/json; charset=utf-8"
+            with _STEP_ASSET_REGISTRY_LOCK:
+                registered = _STEP_ASSET_PARTS_REGISTRY.get(asset_id)
+        else:
+            asset_id = glb_match.group(1)
+            expected_name = asset_id + ".glb"
+            content_type = "model/gltf-binary"
+            with _STEP_ASSET_REGISTRY_LOCK:
+                registered = _STEP_ASSET_REGISTRY.get(asset_id)
+        if registered is None:
+            self._send_api(*make_web_error(404, "E_NOT_FOUND", "asset not found"))
+            return
+        try:
+            path = registered.resolve()
+            if path.name != expected_name or not path.is_file():
+                raise OSError("registered asset is unavailable")
+            stream = path.open("rb")
+            length = stream.seek(0, os.SEEK_END)
+            stream.seek(0)
+        except (OSError, RuntimeError, ValueError):
+            if "stream" in locals():
+                stream.close()
+            self._send_api(*make_web_error(404, "E_NOT_FOUND", "asset not found"))
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self._apply_cors()
+        self.end_headers()
+        if head_only:
+            stream.close()
+            return
+        try:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            self.close_connection = True
+        finally:
+            stream.close()
 
     def _post_normalize(self, config):
         content_type = self.headers.get("Content-Type") or ""
@@ -630,7 +827,9 @@ class WebApiHandler(BaseHTTPRequestHandler):
     def _handle_get(self, head_only=False):
         try:
             path = urlparse(self.path).path
-            if path.startswith("/api/"):
+            if path.startswith("/api/geometry/assets/"):
+                self._serve_registered_asset(path, head_only=head_only)
+            elif path.startswith("/api/"):
                 status, payload = self._route_api_get(path)
                 self._send_api(status, payload)
             else:
@@ -639,6 +838,7 @@ class WebApiHandler(BaseHTTPRequestHandler):
             extra = {"Connection": "close"} if exc.status == 413 else None
             self._send_api(exc.status, exc.envelope(), extra_headers=extra)
         except Exception as exc:
+            self.log_message("internal error: %r", exc)
             self._send_api(*make_web_error(500, "E_INTERNAL", str(exc)))
 
     def _handle_post(self):
@@ -660,6 +860,7 @@ class WebApiHandler(BaseHTTPRequestHandler):
             extra = {"Connection": "close"} if exc.status == 413 else None
             self._send_api(exc.status, exc.envelope(), extra_headers=extra)
         except Exception as exc:
+            self.log_message("internal error: %r", exc)
             self._send_api(*make_web_error(500, "E_INTERNAL", str(exc)))
 
     def do_GET(self):
@@ -692,10 +893,76 @@ def build_server(config):
     return server
 
 
+def register_existing_assets(asset_dir):
+    """Re-register cached STEP assets after a server restart.
+
+    The asset registry is process-local; files persist on disk, so scan the
+    asset directory for complete triples (GLB + parts JSON + manifest) and
+    re-register them.  Only strictly validated, hex-id-named files are served.
+    """
+    if asset_dir is None:
+        return 0
+    try:
+        root = Path(asset_dir).expanduser().resolve()
+        if not root.is_dir():
+            return 0
+    except (OSError, RuntimeError):
+        return 0
+    registered = 0
+    for glb_path in sorted(root.glob("*.glb")):
+        asset_id = glb_path.name[:-4]
+        if not _STEP_ASSET_ID_RE.fullmatch(asset_id):
+            continue
+        parts_path = root / (asset_id + ".parts.json")
+        if not parts_path.is_file():
+            continue
+        # Restore part summaries from the manifest (small) rather than the
+        # full parts JSON (tens of megabytes).
+        parts = []
+        manifest_path = root / (asset_id + ".manifest.json")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            raw_parts = manifest.get("parts")
+            if isinstance(raw_parts, list):
+                for entry in raw_parts:
+                    if not (isinstance(entry, dict) and str(entry.get("id", ""))):
+                        continue
+                    summary = {"id": str(entry["id"]), "name": entry.get("name")}
+                    color = entry.get("color")
+                    if (
+                        isinstance(color, (list, tuple))
+                        and len(color) == 3
+                        and all(isinstance(c, (int, float)) and math.isfinite(float(c)) for c in color)
+                    ):
+                        summary["color"] = [float(c) for c in color]
+                    parts.append(summary)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            parts = []
+        asset = {
+            "asset_id": asset_id,
+            "path": str(glb_path),
+            "parts_path": str(parts_path),
+            "parts": parts,
+        }
+        if register_step_asset(asset) is not None:
+            registered += 1
+    return registered
+
+
 def serve(config, server=None):
     """Serve the web API until interrupted, printing the listening line."""
     if server is None:
         server = build_server(config)
+    try:
+        from .step_kernel import default_asset_dir
+
+        if config.cache_dir is not None:
+            asset_dir = Path(config.cache_dir) / "step-assets"
+        else:
+            asset_dir = default_asset_dir()
+        register_existing_assets(asset_dir)
+    except Exception:
+        pass
     sys.stdout.write(
         "mouse-sim web API listening on http://{}:{}\n".format(config.host, config.port)
     )
@@ -718,6 +985,7 @@ __all__ = [
     "WebConfig",
     "WebRequestError",
     "sanitize_display_name",
+    "register_step_asset",
     "material_catalog_projection",
     "make_web_error",
     "parse_json_object",

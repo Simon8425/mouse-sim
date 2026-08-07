@@ -46,7 +46,7 @@ carried as a machine-readable unsupported-failure-mode code on the result:
   (`UNSUPPORTED_DELAMINATION`), screw pull-out (`UNSUPPORTED_SCREW_PULLOUT`)
 - Shell: buckling, yield localization, crack propagation, snap-through, vibration fatigue
 - Beam: buckling, fatigue crack, joint failure, torsion buckling
-- STEP/OCCT import (rejected with a structured `unsupported_format` diagnostic)
+ - STEP B-rep display uses the isolated FreeCAD/OCCT worker for arbitrary assemblies; the worker preserves native placements, colors, holes, voids, and curved surfaces in a deterministic GLB tessellation. The original STEP remains the CAD source of truth; the display mesh is not CAD-exact and is not automatically safe for mass properties. The stdlib parser remains limited to small faceted fixtures, while kernel-unavailable/failed advanced files block instead of degrading silently.
 - Point loads (flagged as singularities; responses marked approximate)
 
 ## Accuracy claims require physical calibration

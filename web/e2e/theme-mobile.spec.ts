@@ -32,11 +32,13 @@ test.describe('mobile viewport', () => {
     expect(hasOverflow).toBe(false);
 
     const navToggle = page.getByRole('button', { name: 'Toggle model navigator' });
-    await navToggle.click();
-    await expect(page.locator('.drawer--nav')).toHaveClass(/is-open/);
-
+    // The navigator auto-opens once geometry is uploaded; toggle it closed,
+    // then back open, asserting both states.
     await navToggle.click();
     await expect(page.locator('.drawer--nav')).not.toHaveClass(/is-open/);
+
+    await navToggle.click();
+    await expect(page.locator('.drawer--nav')).toHaveClass(/is-open/);
 
     await expectNoConsoleErrors(page, errors);
   });

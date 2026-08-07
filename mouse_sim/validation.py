@@ -77,7 +77,7 @@ def _repair_reviewed(record):
     return bool(getattr(record, "reviewed", False))
 
 
-def check_geometry_health(geometry, object_id, repair_records=None):
+def check_geometry_health(geometry, object_id, repair_records=None, display_tessellation=False):
     """Flag open, nonmanifold, degenerate, inconsistent, or zero-volume meshes.
 
     Geometry errors make results uninterpretable, so they are evidence_blocking;
@@ -97,14 +97,16 @@ def check_geometry_health(geometry, object_id, repair_records=None):
             mesh = candidate
     if mesh is not None:
         diagnostics = mesh.diagnostics()
+        approximate = " (display tessellation; approximate)" if display_tessellation else ""
+        severity = "warning" if display_tessellation else "error"
         if not diagnostics.closed:
-            findings.append(_finding("GEOMETRY_OPEN_MESH", "error", "geometry_health", "mesh is open with {} boundary edge(s)".format(diagnostics.boundary_edges), object_id, evidence_blocking=True))
+            findings.append(_finding("GEOMETRY_OPEN_MESH", severity, "geometry_health", "mesh is open with {} boundary edge(s){}".format(diagnostics.boundary_edges, approximate), object_id, evidence_blocking=not display_tessellation))
         if diagnostics.nonmanifold_edges:
-            findings.append(_finding("GEOMETRY_NONMANIFOLD_EDGES", "error", "geometry_health", "mesh has {} nonmanifold edge(s)".format(diagnostics.nonmanifold_edges), object_id, evidence_blocking=True))
+            findings.append(_finding("GEOMETRY_NONMANIFOLD_EDGES", severity, "geometry_health", "mesh has {} nonmanifold edge(s){}".format(diagnostics.nonmanifold_edges, approximate), object_id, evidence_blocking=not display_tessellation))
         if diagnostics.degenerate_triangles:
             findings.append(_finding("GEOMETRY_DEGENERATE_TRIANGLES", "warning", "geometry_health", "mesh has {} degenerate triangle(s)".format(diagnostics.degenerate_triangles), object_id))
         if diagnostics.inconsistent_winding:
-            findings.append(_finding("GEOMETRY_INCONSISTENT_WINDING", "error", "geometry_health", "mesh has inconsistent triangle winding", object_id, evidence_blocking=True))
+            findings.append(_finding("GEOMETRY_INCONSISTENT_WINDING", severity, "geometry_health", "mesh has inconsistent triangle winding{}".format(approximate), object_id, evidence_blocking=not display_tessellation))
         if abs(diagnostics.signed_volume_m3) <= _ZERO_VOLUME_TOLERANCE:
             findings.append(_finding("GEOMETRY_ZERO_VOLUME", "error", "geometry_health", "mesh has zero signed volume", object_id, evidence_blocking=True))
     if repair_records:
@@ -141,14 +143,14 @@ def _property_value(value, name):
 def _basic_material_errors(value):
     errors = []
     density = _property_value(value, "density")
-    if density is not None and density <= 0:
-        errors.append("density must be positive")
+    if density is not None and (not math.isfinite(density) or density <= 0):
+        errors.append("density must be positive and finite")
     modulus = _property_value(value, "young_modulus")
-    if modulus is not None and modulus <= 0:
-        errors.append("young_modulus must be positive")
+    if modulus is not None and (not math.isfinite(modulus) or modulus <= 0):
+        errors.append("young_modulus must be positive and finite")
     ratio = _property_value(value, "poissons_ratio")
-    if ratio is not None and not (-1.0 < ratio < 0.5):
-        errors.append("poissons_ratio must be between -1 and 0.5")
+    if ratio is not None and (not math.isfinite(ratio) or not (-1.0 < ratio < 0.5)):
+        errors.append("poissons_ratio must be finite and between -1 and 0.5")
     return tuple(errors)
 
 
@@ -229,6 +231,8 @@ def check_wall_thickness(geometry, object_id, min_thickness_m, max_thickness_m):
             try:
                 thickness = float(raw)
             except (TypeError, ValueError):
+                thickness = None
+            if thickness is not None and not math.isfinite(thickness):
                 thickness = None
     if thickness is None:
         return (_finding("THICKNESS_UNKNOWN", "warning", "wall_thickness", "no exact thickness available for this representation", object_id),)
@@ -314,8 +318,16 @@ def run_validation(geometry_objs, material_map, classifications, options):
     repair_records = options.get("repair_records", {})
     if isinstance(repair_records, (list, tuple)):
         repair_records = {object_id: repair_records for object_id in geometry_objs}
+    display_tessellation = bool(options.get("display_tessellation", False))
     for object_id, geometry in geometry_objs.items():
-        findings.extend(check_geometry_health(geometry, object_id, repair_records=repair_records.get(object_id)))
+        findings.extend(
+            check_geometry_health(
+                geometry,
+                object_id,
+                repair_records=repair_records.get(object_id),
+                display_tessellation=display_tessellation,
+            )
+        )
         if object_id in material_map:
             findings.extend(check_material(material_map[object_id], object_id))
         if object_id in classifications:

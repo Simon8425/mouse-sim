@@ -72,7 +72,7 @@ export function ViewportToolbar({ viewport, stats }: ViewportToolbarProps) {
         <ul>
           <li>
             <span className="legend-swatch legend-swatch--selection" aria-hidden="true" />
-            Selection / load vector / max displacement pin
+             Selection / load vector
           </li>
           <li>
             <span className="legend-swatch legend-swatch--warn" aria-hidden="true" />

@@ -12,8 +12,9 @@ Built bottom-up so each layer rests on verified foundations:
   `schemas/mouse_sim.schema.json`): typed exceptions, SI conversion, deterministic hashing, versioned
   dataclass models, and dependency-free document validation. `__init__.py` exports every public name.
 2. **Geometry & mass** — `geometry.py` (analytic primitives, transforms, mesh diagnostics,
-  closed-mesh solid properties), `importers.py` (JSON/OBJ/STL loading; STEP rejected with a
-  diagnostic), `mass.py` (calculated mass, measured overrides, aggregate inertia).
+  closed-mesh solid properties), `importers.py` and `step_kernel.py` (JSON/OBJ/STL plus
+  FreeCAD/OCCT-backed STEP tessellation), `mass.py` (calculated mass, measured
+  overrides, aggregate inertia).
 3. **Materials** — `materials.py`: builtin catalog (ABS, PC/ABS, FR4, LiPo, POM, PTFE, steel),
   tolerant JSON catalog loading, assignment resolution, approval/provenance helpers.
 4. **Collision / validation / qualification** — `collision.py` (AABB clearance, tolerances, pair
@@ -161,8 +162,10 @@ python3 -S -m unittest discover -s tests -p 'test_*.py'
   fractions beyond `maximum_error_fraction`, failing or unmeasurable structured requirement
   targets, and unsubstantiated convergence/force-balance claims. Requirements without structured
   targets evaluate to `not_evaluated` and never pretend to pass.
-- **STEP/OCCT and UI deferred**: STEP/STP input is rejected with a structured `unsupported_format`
-  diagnostic; there is no geometry viewer or other UI; no cloud deployment.
+- **STEP display uses an isolated CAD worker**: simple fixtures may use the stdlib parser, while
+  arbitrary STEP assemblies use FreeCAD/OCCT to preserve placements, colors, holes, voids, and
+  curved surfaces in a deterministic GLB display asset. The display mesh is tessellated, not CAD-
+  exact; the original STEP remains the source of truth. There is no cloud deployment.
 - **Point loads flagged**: point loads set `POINT_LOAD_SINGULARITY` and mark the response
   approximate — local contact stress is not resolved.
 - **Manifest has no `run_id`**: the run manifest intentionally omits it (top-level only), by design

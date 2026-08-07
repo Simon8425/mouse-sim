@@ -227,7 +227,7 @@ function validityTone(validity: string): Tone {
  * mass properties and validation findings.
  */
 export function InspectorPanel() {
-  const { state } = useProjectStore();
+  const { state, dispatch } = useProjectStore();
 
   const entry =
     state.selectedId === null ? null : selectObjectById(state, state.selectedId);
@@ -247,7 +247,8 @@ export function InspectorPanel() {
   const transform = isRecord(g.transform) ? g.transform : null;
   const units = readString(g.units) ?? 'm';
 
-  const materialName = findMaterial(state, entry.id);
+  const materialName = state.objectMaterials[entry.id] ?? findMaterial(state, entry.id);
+  const displayName = entry.name ?? entry.id;
   const material =
     materialName !== null
       ? state.materials?.find((m) => m.key.toLowerCase() === materialName.toLowerCase()) ?? null
@@ -299,7 +300,7 @@ export function InspectorPanel() {
       <div className="inspector-panel__header">
         <div>
           <span className="panel-eyebrow">Selected component</span>
-          <h2 className="inspector-panel__object">{entry.id}</h2>
+          <h2 className="inspector-panel__object">{displayName}</h2>
         </div>
         {entry.className ? <StatusBadge tone="neutral">{entry.className}</StatusBadge> : null}
       </div>
@@ -461,6 +462,28 @@ export function InspectorPanel() {
       </section>
 
       <h3 className="section-title">Material</h3>
+      {state.materials && state.materials.length > 0 ? (
+        <label className="inspector-material-select">
+          <span>Assign for analysis</span>
+          <select
+            value={materialName ?? ''}
+            onChange={(event) =>
+              dispatch({
+                type: 'SET_OBJECT_MATERIAL',
+                objectId: entry.id,
+                materialKey: event.target.value === '' ? null : event.target.value,
+              })
+            }
+          >
+            <option value="">No material</option>
+            {state.materials.map((m) => (
+              <option key={m.key} value={m.key}>
+                {m.key}
+              </option>
+            ))}
+          </select>
+        </label>
+      ) : null}
       <table className="dense-table">
         <tbody>
           <tr>

@@ -15,7 +15,7 @@ The test suite is divided by the engineering question it answers. A green test r
 | Pipeline and reports | `tests/test_pipeline.py`, `tests/test_reports.py`, `tests/test_cli.py` | End-to-end orchestration, advanced impact input forwarding, deterministic reports, exit codes, manifests, and cache reuse. |
 | HTTP API | `tests/test_web_api.py` | Request envelopes, body limits, diagnostics, CORS, static serving, and API-to-pipeline parity. |
 | Frontend unit and accessibility | `web/src/__tests__/` | Reducer race guards, study presets, API contracts, scene safety, result rendering, gate-count reporting, keyboard access, and polite run-status announcements. |
-| Browser workflow | `web/e2e/` | Baseline boot, geometry upload, model selection, result tabs, mode switching, responsive layout, single-origin serving, and unsupported STEP diagnostics. |
+| Browser workflow | `web/e2e/` | Baseline boot, geometry upload (OBJ/STEP/JSON normalization, kernel-backed STEP diagnostics, malformed-input diagnostics), model selection, result tabs, mode switching, responsive layout, single-origin serving. |
 
 ## Commands
 

@@ -17,10 +17,10 @@ describe('geometry preview API handling', () => {
       geometry: null,
       diagnostics: [
         {
-          code: 'cad_converter_missing',
+          code: 'unsupported_step_entities',
           severity: 'error',
-          message: 'STEP conversion is unavailable',
-          details: { plugin: 'server-cad' },
+          message: 'STEP file contains unsupported B-rep entities',
+          details: { entities: ['b_spline_surface'] },
         },
       ],
       source_name: 'housing.step',
@@ -41,7 +41,7 @@ describe('geometry preview API handling', () => {
 
     expect(result).toEqual(preview);
     expect(isUnsupportedGeometryPreview(result)).toBe(true);
-    expect(result.diagnostics[0].details).toEqual({ plugin: 'server-cad' });
+    expect(result.diagnostics[0].details).toEqual({ entities: ['b_spline_surface'] });
   });
 
   it('still converts a non-preview 422 envelope into ApiError', async () => {

@@ -15,6 +15,7 @@ from .errors import UnitError
 from .units import to_si
 
 SERIES_NOT_CONVERGED = "SERIES_NOT_CONVERGED"
+NUMERIC_OVERFLOW = "NUMERIC_OVERFLOW"
 THIN_SHELL_OUT_OF_RANGE = "THIN_SHELL_OUT_OF_RANGE"
 POINT_LOAD_SINGULARITY = "POINT_LOAD_SINGULARITY"
 UNSUPPORTED_STIFFNESS_REDUCTION = "UNSUPPORTED_STIFFNESS_REDUCTION"
@@ -23,6 +24,11 @@ INVALID_LOAD_UNITS = "INVALID_LOAD_UNITS"
 INVALID_LOAD_VALUE = "INVALID_LOAD_VALUE"
 INVALID_LOAD_LOCATION = "INVALID_LOAD_LOCATION"
 INVALID_POISSON_RATIO = "INVALID_POISSON_RATIO"
+
+# The Navier double-sine series is capped so a hostile ``series_order``
+# cannot trigger an effectively unbounded loop; 49 keeps 25x25 terms, far
+# beyond screening accuracy needs.
+SERIES_ORDER_CAP = 49
 
 SCREENING_SURROGATE_MODEL_ID = "screening_surrogate_v1"
 _STRUCTURAL_SOLVER_METADATA = {
@@ -170,6 +176,13 @@ def _vm(sx, sy, txy):
 def _safety(allowable, stress):
     if allowable is None or stress is None or stress <= 0.0:
         return None, "not_available"
+    try:
+        allowable = _finite(allowable, "allowable")
+        stress = _finite(stress, "stress")
+    except ValueError:
+        return None, "not_available"
+    if stress <= 0.0:
+        return None, "not_available"
     factor = allowable / stress
     return factor, ("pass" if factor >= 1.0 else "warn")
 
@@ -181,6 +194,31 @@ def _blank_response(flags, assumptions, validity="inconclusive", method_id=CLOSE
         assumptions=tuple(assumptions),
         validity=validity,
     )
+
+
+def _overflow_response(method_id):
+    return _blank_response(
+        (NUMERIC_OVERFLOW,),
+        (
+            "closed-form evaluation overflowed or produced non-finite values; "
+            "dimensions or loads out of range for the screening surrogate",
+        ),
+        validity="inconclusive",
+        method_id=method_id,
+    )
+
+
+def _series_fields_finite(w, stress):
+    for row in w:
+        for value in row:
+            if not math.isfinite(value):
+                return False
+    for face in stress:
+        for row in face:
+            for value in row:
+                if not math.isfinite(value):
+                    return False
+    return True
 
 
 def _shell_dims(structure):
@@ -343,12 +381,18 @@ def shell_panel_response(a_m, b_m, t_m, E_pa, nu, pressure_pa, series_order=9, a
     order = max(1, int(series_order))
     if order % 2 == 0:
         order -= 1
+    order = min(order, SERIES_ORDER_CAP)
     D = E * t ** 3 / (12.0 * (1.0 - nu * nu))
 
     def wmn(m, n):
         return 16.0 * p / (D * math.pi ** 6 * m * n * (m * m / (a * a) + n * n / (b * b)) ** 2)
 
-    w, stress = _shell_fields(a, b, t, E, nu, wmn, order)
+    try:
+        w, stress = _shell_fields(a, b, t, E, nu, wmn, order)
+    except (OverflowError, ZeroDivisionError):
+        return _overflow_response(SHELL_PANEL_METHOD)
+    if not _series_fields_finite(w, stress):
+        return _overflow_response(SHELL_PANEL_METHOD)
     flags = []
     validity = "valid"
     ratio = t / min(a, b)
@@ -357,7 +401,10 @@ def shell_panel_response(a_m, b_m, t_m, E_pa, nu, pressure_pa, series_order=9, a
         validity = "approximate" if ratio <= 0.25 else "inconclusive"
     order_low = order - 4
     if order_low >= 1:
-        w_low, _ = _shell_fields(a, b, t, E, nu, wmn, order_low)
+        try:
+            w_low, _ = _shell_fields(a, b, t, E, nu, wmn, order_low)
+        except (OverflowError, ZeroDivisionError):
+            return _overflow_response(SHELL_PANEL_METHOD)
         w_high = _grid_max(w)[0]
         w_low_max = _grid_max(w_low)[0]
         if abs(w_high - w_low_max) / max(w_high, 1e-30) > 0.05:
@@ -365,6 +412,8 @@ def shell_panel_response(a_m, b_m, t_m, E_pa, nu, pressure_pa, series_order=9, a
             if validity == "valid":
                 validity = "approximate"
     total = p * a * b
+    if not math.isfinite(total):
+        return _overflow_response(SHELL_PANEL_METHOD)
     corner = total / 4.0
     reactions = {"R1": corner, "R2": corner, "R3": corner, "R4": corner}
     force_residual = total - sum(reactions.values())
@@ -397,17 +446,25 @@ def _shell_point_load_response(a, b, t, E, nu, force_n, location, allowable_pa=N
     order = max(1, int(series_order))
     if order % 2 == 0:
         order -= 1
+    order = min(order, SERIES_ORDER_CAP)
 
     def wmn(m, n):
         den = (m * m / (a * a) + n * n / (b * b)) ** 2
         return (4.0 * force_n * math.sin(m * math.pi * x0 / a)
                 * math.sin(n * math.pi * y0 / b)) / (D * a * b * math.pi ** 4 * den)
 
-    w, stress = _shell_fields(a, b, t, E, nu, wmn, order)
+    try:
+        w, stress = _shell_fields(a, b, t, E, nu, wmn, order)
+    except (OverflowError, ZeroDivisionError):
+        return _overflow_response(SHELL_PANEL_METHOD)
+    if not _series_fields_finite(w, stress):
+        return _overflow_response(SHELL_PANEL_METHOD)
     corner = force_n / 4.0
     reactions = {"R1": corner, "R2": corner, "R3": corner, "R4": corner}
     force_residual = force_n - sum(reactions.values())
     moment_residual = math.hypot(force_n * (y0 - b / 2.0), force_n * (x0 - a / 2.0))
+    if not math.isfinite(force_residual) or not math.isfinite(moment_residual):
+        return _overflow_response(SHELL_PANEL_METHOD)
     assumptions = SHELL_PANEL_ASSUMPTIONS + (
         "point load applied at ({:.6g}, {:.6g}) via Navier point-load series".format(x0, y0),
         "point-load series converges slowly; stresses are screening-quality only",
@@ -426,7 +483,7 @@ def beam_response(load_type, L_m, E_pa, I_m4, A_m2, nu, force_n=None,
     E = _positive(E_pa, "E_pa")
     I = _positive(I_m4, "I_m4")
     A = _positive(A_m2, "A_m2")
-    nu = _finite(nu, "nu")
+    nu = _poisson(nu)
     Z = _positive(section_modulus_m3, "section_modulus_m3") if section_modulus_m3 is not None else None
     specs = {
         "cantilever_point": ("point", "cantilever"),
@@ -438,31 +495,39 @@ def beam_response(load_type, L_m, E_pa, I_m4, A_m2, nu, force_n=None,
         raise ValueError("unknown load_type {!r}".format(load_type))
     shape, support = specs[load_type]
     cantilever = support == "cantilever"
-    if shape == "point":
-        if force_n is None:
-            raise ValueError("force_n required for a point load")
-        P = _finite(force_n, "force_n")
-        deflection = P * L ** 3 / (3.0 * E * I) if cantilever else P * L ** 3 / (48.0 * E * I)
-        moment = P * L if cantilever else P * L / 4.0
-        shear = P if cantilever else P / 2.0
-        reactions = {"R1": P, "R2": 0.0} if cantilever else {"R1": P / 2.0, "R2": P / 2.0}
-        applied = P
-        formula = "w = P*L^3/(3*E*I), Mmax = P*L" if cantilever else "w = P*L^3/(48*E*I), Mmax = P*L/4"
-    else:
-        if q_n_per_m is None:
-            raise ValueError("q_n_per_m required for a uniform load")
-        q = _finite(q_n_per_m, "q_n_per_m")
-        deflection = q * L ** 4 / (8.0 * E * I) if cantilever else 5.0 * q * L ** 4 / (384.0 * E * I)
-        moment = q * L * L / 2.0 if cantilever else q * L * L / 8.0
-        shear = q * L if cantilever else q * L / 2.0
-        reactions = {"R1": q * L, "R2": 0.0} if cantilever else {"R1": q * L / 2.0, "R2": q * L / 2.0}
-        applied = q * L
-        formula = "w = q*L^4/(8*E*I), Mmax = q*L^2/2" if cantilever else "w = 5*q*L^4/(384*E*I), Mmax = q*L^2/8"
+    try:
+        if shape == "point":
+            if force_n is None:
+                raise ValueError("force_n required for a point load")
+            P = _finite(force_n, "force_n")
+            deflection = P * L ** 3 / (3.0 * E * I) if cantilever else P * L ** 3 / (48.0 * E * I)
+            moment = P * L if cantilever else P * L / 4.0
+            shear = P if cantilever else P / 2.0
+            reactions = {"R1": P, "R2": 0.0} if cantilever else {"R1": P / 2.0, "R2": P / 2.0}
+            applied = P
+            formula = "w = P*L^3/(3*E*I), Mmax = P*L" if cantilever else "w = P*L^3/(48*E*I), Mmax = P*L/4"
+        else:
+            if q_n_per_m is None:
+                raise ValueError("q_n_per_m required for a uniform load")
+            q = _finite(q_n_per_m, "q_n_per_m")
+            deflection = q * L ** 4 / (8.0 * E * I) if cantilever else 5.0 * q * L ** 4 / (384.0 * E * I)
+            moment = q * L * L / 2.0 if cantilever else q * L * L / 8.0
+            shear = q * L if cantilever else q * L / 2.0
+            reactions = {"R1": q * L, "R2": 0.0} if cantilever else {"R1": q * L / 2.0, "R2": q * L / 2.0}
+            applied = q * L
+            formula = "w = q*L^4/(8*E*I), Mmax = q*L^2/2" if cantilever else "w = 5*q*L^4/(384*E*I), Mmax = q*L^2/8"
+    except OverflowError:
+        return _overflow_response(BEAM_METHOD)
     if cantilever:
         reactions["M1"] = -moment
     stress = moment / Z if Z is not None else None
     tau = 1.5 * shear / A
     vm = math.sqrt(stress * stress + 3.0 * tau * tau) if stress is not None else None
+    computed = (deflection, moment, shear, applied, stress, tau, vm)
+    if any(
+        value is not None and not math.isfinite(value) for value in computed
+    ) or any(not math.isfinite(value) for value in reactions.values()):
+        return _overflow_response(BEAM_METHOD)
     factor, status = _safety(allowable_pa, vm)
     peak_loc = (0.0, 0.0, 0.0) if cantilever else (L / 2.0, 0.0, 0.0)
     tip_loc = (L, 0.0, 0.0) if cantilever else (L / 2.0, 0.0, 0.0)
@@ -581,10 +646,14 @@ def solve_load_case(load_case_dict, structure_dict, material_dict, fixtures=None
         else:
             L, I, A, Z = _beam_dims(structure)
             width = structure.get("width_m")
-            if not width:
+            if width is None:
                 flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
                 return _blank_response(flags, assumptions + ["beam pressure load requires width_m",])
-            q = p * _positive(width, "width_m")
+            try:
+                q = p * _positive(width, "width_m")
+            except (TypeError, ValueError) as exc:
+                flags.append(INVALID_LOAD_VALUE)
+                return _blank_response(flags, assumptions + [str(exc)])
             support = structure.get("support", "cantilever")
             beam_type = "cantilever_uniform" if support == "cantilever" else "simply_supported_uniform"
             result = beam_response(beam_type, L, E, I, A, nu, q_n_per_m=q,
@@ -804,9 +873,11 @@ __all__ = [
     "INVALID_LOAD_UNITS",
     "INVALID_POISSON_RATIO",
     "MOUSE_LOAD_TEMPLATES",
+    "NUMERIC_OVERFLOW",
     "POINT_LOAD_SINGULARITY",
     "SCREENING_SURROGATE_MODEL_ID",
     "SERIES_NOT_CONVERGED",
+    "SERIES_ORDER_CAP",
     "SHELL_PANEL_ASSUMPTIONS",
     "SHELL_PANEL_METHOD",
     "SHELL_UNSUPPORTED_FAILURE_MODES",

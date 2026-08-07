@@ -1,3 +1,4 @@
+import json
 import math
 import unittest
 
@@ -12,6 +13,7 @@ from mouse_sim.impact import (
     INVALID_CONTACT_OFFSET,
     INVALID_INERTIA_TENSOR,
     INVALID_KINEMATICS,
+    INVALID_LOAD_PATH,
     INVALID_MASS,
     INVALID_RESTITUTION,
     INVALID_STIFFNESS,
@@ -508,6 +510,91 @@ class SolverMetadataTests(unittest.TestCase):
             "not a component stress prediction",
             result.solver_metadata["load_path_stress_pa_limitation"],
         )
+
+
+class ExtremeMagnitudeTests(unittest.TestCase):
+    """Degenerate magnitudes must fail loudly instead of emitting inf/NaN
+    that would corrupt JSON serialization downstream."""
+
+    def test_huge_magnitudes_return_failed_not_inf(self):
+        result = estimate_impact(
+            mass_kg=1e308, velocity_m_s=1e308, contact_stiffness_n_per_m=1e308
+        )
+        self.assertEqual(result.validity, "failed")
+        self.assertIn(INVALID_KINEMATICS, result.flags)
+        payload = result.to_dict()
+        for value in payload.values():
+            if isinstance(value, float):
+                self.assertTrue(math.isfinite(value))
+        text = json.dumps(payload)
+        self.assertNotIn("Infinity", text)
+        self.assertNotIn("NaN", text)
+
+    def test_huge_gravity_fails(self):
+        result = estimate_impact(mass_kg=0.1, fall_height_m=1.0, g=1e308)
+        self.assertEqual(result.validity, "failed")
+        self.assertIn(INVALID_KINEMATICS, result.flags)
+
+    def test_huge_fall_height_fails(self):
+        result = estimate_impact(mass_kg=0.1, fall_height_m=1e308)
+        self.assertEqual(result.validity, "failed")
+        self.assertIn(INVALID_KINEMATICS, result.flags)
+
+    def test_tiny_magnitudes_underflow_flagged_not_valid(self):
+        result = estimate_impact(mass_kg=1e-320, velocity_m_s=1e-320)
+        self.assertEqual(result.validity, "failed")
+        self.assertIn(INVALID_KINEMATICS, result.flags)
+
+    def test_tiny_stopping_distance_overflow_fails(self):
+        result = estimate_impact(mass_kg=1e308, velocity_m_s=1e308, stopping_distance_m=1e-320)
+        self.assertEqual(result.validity, "failed")
+        self.assertIn(INVALID_KINEMATICS, result.flags)
+
+    def test_huge_load_path_stress_fails(self):
+        result = estimate_impact(
+            mass_kg=1e100, velocity_m_s=1e100, contact_stiffness_n_per_m=1e200,
+            load_path_area_m2=1e-308,
+        )
+        self.assertEqual(result.validity, "failed")
+        self.assertIn(INVALID_LOAD_PATH, result.flags)
+
+    def test_energy_partition_never_emits_non_finite_fractions(self):
+        result = estimate_impact(
+            mass_kg=1e154,
+            velocity_m_s=1e154,
+            contact_stiffness_n_per_m=1e308,
+            inertia_tensor_kg_m2=[[1e-6, 0.0, 0.0], [0.0, 1e-6, 0.0], [0.0, 0.0, 1e-6]],
+            contact_location_m=(0.01, 0.0, 0.0),
+            total_mass_kg=1e154,
+        )
+        self.assertEqual(result.validity, "failed")
+        self.assertIn(INVALID_KINEMATICS, result.flags)
+
+    def test_fatigue_tiny_stress_never_overflows(self):
+        summary = repeat_impact_cycles(cycles_n=100, stress_amplitude_pa=1e-300)
+        life = summary["levels"][0]["cycles_to_failure"]
+        self.assertTrue(math.isfinite(life))
+        self.assertTrue(math.isfinite(summary["damage_sum"]))
+
+    def test_fatigue_astronomical_stress_caps_life(self):
+        summary = repeat_impact_cycles(cycles_n=100, stress_amplitude_pa=1e300)
+        self.assertEqual(summary["levels"][0]["cycles_to_failure"], 1.0)
+
+    def test_fatigue_outputs_json_clean(self):
+        summary = repeat_impact_cycles(cycles_n=100, stress_amplitude_pa=1e-300)
+        text = json.dumps(summary)
+        self.assertNotIn("Infinity", text)
+        self.assertNotIn("NaN", text)
+
+    def test_valid_results_remain_json_clean(self):
+        result = estimate_impact(
+            mass_kg=0.1, velocity_m_s=4.0, contact_stiffness_n_per_m=1e5,
+            inertia_tensor_kg_m2=[[1e-6, 0.0, 0.0], [0.0, 1e-6, 0.0], [0.0, 0.0, 1e-6]],
+            contact_location_m=(0.01, 0.0, 0.0),
+        )
+        text = json.dumps(result.to_dict())
+        self.assertNotIn("Infinity", text)
+        self.assertNotIn("NaN", text)
 
 
 if __name__ == "__main__":

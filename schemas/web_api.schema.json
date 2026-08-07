@@ -62,9 +62,14 @@
           "items": { "type": "string" }
         },
         "cache_active": { "type": "boolean" },
-        "max_json_bytes": { "type": "integer" },
-        "max_geometry_bytes": { "type": "integer" },
-        "deterministic": { "const": true }
+         "max_json_bytes": { "type": "integer" },
+         "max_geometry_bytes": { "type": "integer" },
+         "deterministic": { "const": true },
+         "step_backend": { "type": "string" },
+         "step_kernel_backend": { "type": "string" },
+         "step_kernel_available": { "type": "boolean" },
+         "advanced_step_backend": { "type": "string" },
+         "advanced_step_uses_kernel": { "const": true }
       }
     },
     "web_baseline": {
@@ -144,10 +149,57 @@
               "details": { "type": "object" }
             }
           }
-        },
-        "source_name": { "type": ["string", "null"] }
-      }
-    },
+         },
+         "source_name": { "type": ["string", "null"] },
+         "display_asset": { "$ref": "#/$defs/display_asset" }
+       }
+     },
+      "display_asset": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "asset_id",
+          "url",
+          "format",
+          "sha256",
+          "bytes",
+          "object_count",
+          "triangle_count",
+          "backend",
+          "tessellation_deflection_mm"
+        ],
+        "properties": {
+          "asset_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "url": { "type": "string" },
+          "format": { "const": "glb" },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "bytes": { "type": "integer", "minimum": 1 },
+          "object_count": { "type": "integer", "minimum": 0 },
+          "triangle_count": { "type": "integer", "minimum": 1 },
+          "backend": { "type": "string" },
+          "tessellation_deflection_mm": { "type": "number", "exclusiveMinimum": 0 },
+          "parts": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/display_asset_part" }
+          },
+          "parts_url": { "type": "string" }
+        }
+      },
+      "display_asset_part": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^part-[0-9]+$" },
+          "name": { "type": "string" },
+          "color": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 3,
+            "items": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        }
+      },
     "web_analysis_request": {
       "type": "object",
       "additionalProperties": false,

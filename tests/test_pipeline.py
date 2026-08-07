@@ -433,5 +433,95 @@ class QualificationIntegrityPipelineTests(unittest.TestCase):
         self.assertIsNotNone(estimate["energy_partition"])
 
 
+class PipelineRobustnessTests(unittest.TestCase):
+    def test_run_pipeline_never_raises_on_non_mapping_request(self):
+        result = run_pipeline("not-a-mapping")
+        self.assertEqual(result["lifecycle_state"], "failed")
+        self.assertEqual(result["errors"][0]["code"], "INVALID_REQUEST")
+        self.assertTrue(result["run_id"])
+
+    def test_run_pipeline_never_raises_on_none_request(self):
+        result = run_pipeline(None)
+        self.assertEqual(result["lifecycle_state"], "completed")
+        self.assertEqual(result["errors"], [])
+
+    def test_non_mapping_options_are_ignored_not_crashing(self):
+        result = run_pipeline({"objects": [], "options": "not-an-object"})
+        self.assertEqual(result["lifecycle_state"], "completed")
+        self.assertEqual(result["errors"], [])
+
+    def test_unknown_mode_falls_back_to_exploration(self):
+        result = run_pipeline(mouse_project_request(mode="quantum"))
+        self.assertEqual(result["mode"], "exploration")
+        self.assertEqual(result["errors"], [])
+
+    def test_missing_units_default_to_meters(self):
+        request = mouse_project_request()
+        del request["units"]
+        result = run_pipeline(request)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["geometry_summary"]["objects"][0]["units"], "m")
+        self.assertTrue(result["geometry_summary"]["objects"][0]["parsed"])
+
+    def test_bad_load_case_is_contained_and_run_completes(self):
+        request = mouse_project_request(
+            load_case={"kind": "pressure", "magnitude": {"value": 1, "unit": "bogus"}},
+            structure={"type": "shell_panel", "a_m": 0.06, "b_m": 0.04, "t_m": 0.002},
+        )
+        result = run_pipeline(request)
+        codes = [item["code"] for item in result["errors"]]
+        self.assertIn("STRUCTURAL_EVALUATION_FAILED", codes)
+        self.assertIsNone(result["structural"])
+        self.assertIsNotNone(result["mass"])
+        self.assertEqual(result["lifecycle_state"], "failed")
+
+    def test_bad_impact_section_is_contained_and_run_completes(self):
+        request = mouse_project_request(impact="not-an-object")
+        result = run_pipeline(request)
+        codes = [item["code"] for item in result["errors"]]
+        self.assertIn("IMPACT_EVALUATION_FAILED", codes)
+        self.assertIsNone(result["impact"])
+        self.assertIsNotNone(result["mass"])
+        self.assertEqual(result["lifecycle_state"], "failed")
+
+    def test_bad_structure_section_is_contained(self):
+        request = mouse_project_request(
+            load_case={"kind": "pressure", "magnitude_pa": 1000.0},
+            structure="not-an-object",
+        )
+        result = run_pipeline(request)
+        codes = [item["code"] for item in result["errors"]]
+        self.assertIn("STRUCTURAL_EVALUATION_FAILED", codes)
+        self.assertIsNone(result["structural"])
+        self.assertEqual(result["lifecycle_state"], "failed")
+
+    def test_empty_objects_run_completes(self):
+        result = run_pipeline({"objects": [], "mode": "qualification"})
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["lifecycle_state"], "completed")
+        self.assertIsNotNone(result["qualification"])
+        self.assertIsNone(result["mass"]["mass_kg"])
+
+    def test_object_without_geometry_does_not_crash_other_objects(self):
+        request = mouse_project_request(
+            objects=[
+                {"id": "shell", "geometry": SHELL, "material": "ABS"},
+                {"id": "nogeo", "material": "ABS"},
+            ]
+        )
+        result = run_pipeline(request)
+        codes = [item["code"] for item in result["issues"]]
+        self.assertIn("GEOMETRY_MISSING", codes)
+        self.assertEqual(result["lifecycle_state"], "failed")
+        self.assertIsNotNone(result["mass"]["mass_kg"])
+        self.assertEqual(result["mass"]["mass_status"], "calculated")
+
+    def test_run_id_deterministic_across_requests_with_different_key_order(self):
+        first = run_pipeline(mouse_project_request())
+        second = run_pipeline(mouse_project_request())
+        self.assertEqual(first["run_id"], second["run_id"])
+        self.assertEqual(canonical_json(first), canonical_json(second))
+
+
 if __name__ == "__main__":
     unittest.main()
