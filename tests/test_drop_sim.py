@@ -110,14 +110,81 @@ class DropSimulationPhysicsTests(unittest.TestCase):
         self.assertGreater(steel_settle, foam_settle)
 
     def test_energy_conservation_never_exceeds_initial(self):
-        # Reported impact energies are the pre-impact SYSTEM kinetic energies
-        # and must never exceed the drop's initial potential energy on the
-        # real simulation path.
-        drop_energy = 0.1 * 9.81 * 0.5
+        # Reported impact energies are the pre-impact SYSTEM kinetic energies,
+        # capped at the drop's potential energy; they must never exceed it on
+        # the real simulation path, including jittered drops at the top of the
+        # allowed height range.
+        for height in (0.5, 1.5, 2.0):
+            drop_energy = 0.1 * 9.81 * height
+            for surface in ("foam", "concrete", "steel"):
+                result = simulate(
+                    0.1, CUBE_INERTIA, CUBE_SUPPORT, height, surface=surface, drop_count=2
+                )
+                for impact in result["impacts"]:
+                    self.assertLessEqual(impact["kinetic_energy_j"], drop_energy * 1.0001)
+        # Jittered drops 1+ carry a tiny rotational seed; the total mechanical
+        # energy at impact is still bounded by the drop energy (spin budget is
+        # ~2e-5 J, four orders below the 1% margin).
         for surface in ("foam", "concrete", "steel"):
-            result = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, surface=surface)
+            result = simulate(
+                0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, surface=surface, drop_count=2
+            )
             for impact in result["impacts"]:
                 self.assertLessEqual(impact["kinetic_energy_j"], drop_energy * 1.01)
+
+    def test_drop_zero_is_reference(self):
+        result = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, drop_count=3)
+        self.assertEqual(result["drops"][0]["tilt_deg"], 0.0)
+        self.assertEqual(result["drops"][0]["lateral_offset_m"], [0.0, 0.0])
+        freefall = math.sqrt(2.0 * 9.81 * 0.5)
+        self.assertAlmostEqual(result["impacts"][0]["impact_speed_m_s"], freefall, delta=0.05)
+
+    def test_repeated_drops_are_unique_but_deterministic(self):
+        first = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, drop_count=3, orientation="flat")
+        second = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, drop_count=3, orientation="flat")
+        # Drop 0 is the pristine reference; drops 1+ get distinct variation.
+        self.assertEqual(first["drops"][0]["tilt_deg"], 0.0)
+        self.assertEqual(first["drops"][0]["lateral_offset_m"], [0.0, 0.0])
+        tilts = [drop["tilt_deg"] for drop in first["drops"]]
+        offsets = [tuple(drop["lateral_offset_m"]) for drop in first["drops"]]
+        self.assertGreater(tilts[1], 0.0)
+        self.assertGreater(tilts[2], 0.0)
+        self.assertNotEqual(tilts[1], tilts[2])
+        self.assertNotEqual(offsets[1], offsets[2])
+        self.assertNotEqual(offsets[0], offsets[1])
+        # The seeded release spin makes the first-contact velocity differ
+        # slightly between drops, while each stays near the free-fall speed.
+        freefall = math.sqrt(2.0 * 9.81 * 0.5)
+        first_speeds = []
+        for drop in first["drops"]:
+            for impact in first["impacts"]:
+                if impact["drop"] == drop["index"]:
+                    first_speeds.append(impact["impact_speed_m_s"])
+                    break
+        self.assertEqual(len(first_speeds), 3)
+        for speed in first_speeds:
+            self.assertAlmostEqual(speed, freefall, delta=0.2)
+        self.assertGreater(len(set(first_speeds)), 1)
+        # Fully deterministic: two runs produce bit-identical output.
+        self.assertEqual(first["trajectory"], second["trajectory"])
+        self.assertEqual(first["impacts"], second["impacts"])
+        self.assertEqual(first["drops"], second["drops"])
+        self.assertEqual(first["model"]["jitter"], second["model"]["jitter"])
+        self.assertEqual(first["model"]["jitter"]["max_tilt_deg"], 6.0)
+        self.assertEqual(first["model"]["jitter"]["max_lateral_fraction"], 0.03)
+
+    def test_lateral_offset_bounded(self):
+        for seed in (1, 7, 42, 12345):
+            result = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, drop_count=3, seed=seed)
+            self.assertEqual(result["model"]["jitter"]["seed"], seed)
+            for drop in result["drops"]:
+                self.assertLessEqual(drop["tilt_deg"], 6.0)
+                offset = drop["lateral_offset_m"]
+                magnitude = math.hypot(offset[0], offset[1])
+                self.assertLessEqual(magnitude, 0.03 * 0.5 + 1e-9)
+            # Drop 0 stays the pristine reference for every seed.
+            self.assertEqual(result["drops"][0]["tilt_deg"], 0.0)
+            self.assertEqual(result["drops"][0]["lateral_offset_m"], [0.0, 0.0])
 
     def test_tumble_with_spin_impacts_multiple_times(self):
         result = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, test="tumble", spin_rps=6.0)

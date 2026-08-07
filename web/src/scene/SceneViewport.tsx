@@ -9,7 +9,26 @@ import type { CameraPreset } from './camera';
 import type { QualityTier } from './materialPalette';
 import type { OverlaySpec } from './overlays';
 import type { ObjectSceneEntry } from './geometryFactory';
-import type { DropSimulationResult } from '../api/contracts';
+import type { DropSimulationDrop, DropSimulationResult } from '../api/contracts';
+
+/**
+ * Resolve the drop active at a playback time.
+ *
+ * The counter is monotonic: the drop with the largest ``start_s <= t`` is
+ * active even during the inter-drop gaps (no samples), so the readout never
+ * jumps ahead to the last drop prematurely.
+ */
+export function resolveActiveDrop(
+  drops: DropSimulationDrop[],
+  dropTime: number,
+): DropSimulationDrop | null {
+  let active: DropSimulationDrop | null = null;
+  for (const drop of drops) {
+    if (drop.start_s <= dropTime) active = drop;
+    else break;
+  }
+  return active ?? (drops.length > 0 ? drops[0] : null);
+}
 
 export interface SceneViewportHandle {
   fit: () => void;
@@ -134,10 +153,11 @@ export const SceneViewport = React.forwardRef<
   }, [props.dropSimulation]);
 
   const dropEndedRef = React.useRef<() => void>(() => {});
+  const { onDropEnded: onDropEndedProp } = props;
   const handleDropEnded = React.useCallback(() => {
     setDropPlaying(false);
-    props.onDropEnded?.();
-  }, [props.onDropEnded]);
+    onDropEndedProp?.();
+  }, [onDropEndedProp]);
   dropEndedRef.current = handleDropEnded;
 
   const [dropPlaying, setDropPlaying] = React.useState(false);
@@ -151,12 +171,9 @@ export const SceneViewport = React.forwardRef<
   }, [props.dropSimulation]);
 
   const dropSimulation = props.dropSimulation;
-  const activeDrop =
-    dropSimulation && dropSimulation.drops.length > 0
-      ? dropSimulation.drops.find(
-          (drop) => dropTime >= drop.start_s && dropTime <= drop.end_s,
-        ) ?? dropSimulation.drops[dropSimulation.drops.length - 1]
-      : null;
+  const activeDrop = dropSimulation
+    ? resolveActiveDrop(dropSimulation.drops, dropTime)
+    : null;
 
   React.useEffect(() => {
     runtimeRef.current?.setSelection(props.selectedId);

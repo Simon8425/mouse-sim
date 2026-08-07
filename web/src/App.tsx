@@ -42,6 +42,7 @@ export function App(): React.ReactElement {
 
   const [stats, setStats] = React.useState<RenderStats | null>(null);
   const [uploadOpen, setUploadOpen] = React.useState(false);
+  const [resultsOpen, setResultsOpen] = React.useState(false);
 
   // Theme is locked to neutral dark (#141414).
   React.useEffect(() => {
@@ -338,8 +339,13 @@ export function App(): React.ReactElement {
         >
           <InspectorPanel />
         </aside>
+        <div className={`results-rail-dock${resultsOpen ? ' is-open' : ''}`}>
+          <ResultsRail
+            open={resultsOpen}
+            onToggleOpen={() => setResultsOpen((open) => !open)}
+          />
+        </div>
       </div>
-      <ResultsRail />
       {state.controlOpen ? (
         <MissionControl
           onClose={() => dispatch({ type: 'SET_CONTROL_OPEN', open: false })}

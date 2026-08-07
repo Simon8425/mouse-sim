@@ -138,11 +138,6 @@ export function ModelTree(): React.ReactElement {
           aria-label="Filter models"
         />
       </div>
-      {state.preview?.display_asset ? (
-        <p className="model-tree__colors-note">
-          Part colors are pseudo-colors for identification; the CAD file defines no material colors.
-        </p>
-      ) : null}
 
       <div className="model-tree__chips" role="group" aria-label="Filter by severity">
         <button

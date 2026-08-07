@@ -388,33 +388,43 @@ function gateTone(gate: { passed: boolean; evaluable: boolean; blocker: boolean 
 
 /**
  * Side rail showing the latest pipeline result, organized into tabs.
+ * Collapses to a slim vertical strip on the right edge; the strip toggles
+ * the expanded panel, whose width is adjustable via the left-edge handle.
+ * @param open - Whether the panel is expanded (false = collapsed strip).
+ * @param onToggleOpen - Callback toggling the expanded state.
  * @returns The results rail element.
  */
-export function ResultsRail(): JSX.Element {
+export function ResultsRail({
+  open,
+  onToggleOpen,
+}: {
+  open: boolean;
+  onToggleOpen: () => void;
+}): JSX.Element {
   const { state, dispatch } = useProjectStore();
   const result = state.lastResult;
   const activeTab: TabId = (TABS as readonly string[]).includes(state.resultsTab)
     ? (state.resultsTab as TabId)
     : 'overview';
 
-  const [railHeight, setRailHeight] = useState<number>(240);
+  const [railWidth, setRailWidth] = useState<number>(420);
   const [isDragging, setIsDragging] = useState<boolean>(false);
-  const dragStartYRef = useRef<number>(0);
-  const startHeightRef = useRef<number>(240);
+  const dragStartXRef = useRef<number>(0);
+  const startWidthRef = useRef<number>(420);
 
   const handleMouseDown = (e: React.MouseEvent) => {
     e.preventDefault();
     setIsDragging(true);
-    dragStartYRef.current = e.clientY;
-    startHeightRef.current = railHeight;
+    dragStartXRef.current = e.clientX;
+    startWidthRef.current = railWidth;
   };
 
   useEffect(() => {
     if (!isDragging) return;
     const handleMouseMove = (e: MouseEvent) => {
-      const deltaY = dragStartYRef.current - e.clientY;
-      const newHeight = Math.min(Math.max(startHeightRef.current + deltaY, 140), 650);
-      setRailHeight(newHeight);
+      const deltaX = dragStartXRef.current - e.clientX;
+      const newWidth = Math.min(Math.max(startWidthRef.current + deltaX, 260), 720);
+      setRailWidth(newWidth);
     };
     const handleMouseUp = () => {
       setIsDragging(false);
@@ -428,86 +438,97 @@ export function ResultsRail(): JSX.Element {
   }, [isDragging]);
 
   const handleToggleExpand = () => {
-    setRailHeight((prev) => (prev > 320 ? 240 : 480));
+    setRailWidth((prev) => (prev > 300 ? 260 : 420));
   };
 
-  if (result === null) {
-    return (
-      <aside className="results-rail" style={{ height: `${railHeight}px` }}>
+  const toggle = (
+    <button
+      type="button"
+      className="results-rail__toggle"
+      aria-label={open ? 'Hide results rail' : 'Show results rail'}
+      aria-expanded={open}
+      onClick={onToggleOpen}
+    >
+      <span className="results-rail__toggle-label">RESULTS</span>
+    </button>
+  );
+
+  if (!open) {
+    return <aside className="results-rail results-rail--collapsed">{toggle}</aside>;
+  }
+
+  return (
+    <aside className="results-rail" style={{ width: `${railWidth}px` }}>
+      {toggle}
+      <div className="results-rail__body">
         <div
           className="results-rail__resize-handle"
           onMouseDown={handleMouseDown}
           onDoubleClick={handleToggleExpand}
-          title="Drag up/down or double-click to resize/expand results panel"
+          title="Drag left/right or double-click to resize results panel"
         >
           <span className="resize-handle-bar" />
         </div>
-        <div className="results-rail__deck-header">
-          <div className="results-rail__deck-title">
-            <span className="panel-eyebrow">Analysis deck</span>
-            <strong>Awaiting result</strong>
-          </div>
-          <span className="results-rail__deck-id">NO RUN</span>
-        </div>
-        <div className="results-rail__empty-container">
-          <p className="results-rail__empty muted">
-            No result yet — run an analysis to populate the deck.
-          </p>
-        </div>
-      </aside>
-    );
-  }
-
-  return (
-    <aside className="results-rail" style={{ height: `${railHeight}px` }}>
-      <div
-        className="results-rail__resize-handle"
-        onMouseDown={handleMouseDown}
-        onDoubleClick={handleToggleExpand}
-        title="Drag up/down or double-click to resize/expand results panel"
-      >
-        <span className="resize-handle-bar" />
-      </div>
-      <div className="results-rail__deck-header">
-        <div className="results-rail__deck-title">
-          <span className="panel-eyebrow">Analysis deck</span>
-          <strong>{state.mode === 'qualification' ? 'Qualification review' : 'Exploration study'}</strong>
-        </div>
-        <span className="results-rail__deck-id">RUN {result.run_id.slice(0, 12)}</span>
-      </div>
-      <MetricStrip result={result} />
-      {selectHasStaleResult(state) && (
-        <div className="stale-banner">Result is stale — rerun to refresh.</div>
-      )}
-      {selectUnsupportedModes(state).length > 0 ? (
-        <details className="results-rail__disclosure">
-          <summary>Unsupported modes disclosed ({selectUnsupportedModes(state).length})</summary>
-          <ul>
-            {selectUnsupportedModes(state).map((mode) => <li key={mode}>{mode}</li>)}
-          </ul>
-        </details>
-      ) : null}
-      <div className="results-rail__tabs" role="tablist" aria-label="Results">
-        {TABS.map((tab) => (
-          <button
-            key={tab}
-            type="button"
-            role="tab"
-            aria-selected={tab === activeTab}
-            className={`results-rail__tab${tab === activeTab ? ' is-active' : ''}`}
-            onClick={() => dispatch({ type: 'SET_TAB', tab })}
-          >
-            {TAB_LABELS[tab]}
-          </button>
-        ))}
-      </div>
-      <SeverityFilter
-        result={result}
-        value={state.severityFilter}
-        onChange={(severity) => dispatch({ type: 'SET_SEVERITY_FILTER', severity })}
-      />
-      <div className="results-rail__panel" role="tabpanel">
-        {renderTab(activeTab, result, state)}
+        {result === null ? (
+          <>
+            <div className="results-rail__deck-header">
+              <div className="results-rail__deck-title">
+                <span className="panel-eyebrow">Analysis deck</span>
+                <strong>Awaiting result</strong>
+              </div>
+              <span className="results-rail__deck-id">NO RUN</span>
+            </div>
+            <div className="results-rail__empty-container">
+              <p className="results-rail__empty muted">
+                No result yet — run an analysis to populate the deck.
+              </p>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="results-rail__deck-header">
+              <div className="results-rail__deck-title">
+                <span className="panel-eyebrow">Analysis deck</span>
+                <strong>{state.mode === 'qualification' ? 'Qualification review' : 'Exploration study'}</strong>
+              </div>
+              <span className="results-rail__deck-id">RUN {result.run_id.slice(0, 12)}</span>
+            </div>
+            <MetricStrip result={result} />
+            {selectHasStaleResult(state) && (
+              <div className="stale-banner">Result is stale — rerun to refresh.</div>
+            )}
+            {selectUnsupportedModes(state).length > 0 ? (
+              <details className="results-rail__disclosure">
+                <summary>Unsupported modes disclosed ({selectUnsupportedModes(state).length})</summary>
+                <ul>
+                  {selectUnsupportedModes(state).map((mode) => <li key={mode}>{mode}</li>)}
+                </ul>
+              </details>
+            ) : null}
+            <div className="results-rail__tabs" role="tablist" aria-label="Results">
+              {TABS.map((tab) => (
+                <button
+                  key={tab}
+                  type="button"
+                  role="tab"
+                  aria-selected={tab === activeTab}
+                  className={`results-rail__tab${tab === activeTab ? ' is-active' : ''}`}
+                  onClick={() => dispatch({ type: 'SET_TAB', tab })}
+                >
+                  {TAB_LABELS[tab]}
+                </button>
+              ))}
+            </div>
+            <SeverityFilter
+              result={result}
+              value={state.severityFilter}
+              onChange={(severity) => dispatch({ type: 'SET_SEVERITY_FILTER', severity })}
+            />
+            <div className="results-rail__panel" role="tabpanel">
+              {renderTab(activeTab, result, state)}
+            </div>
+          </>
+        )}
       </div>
     </aside>
   );

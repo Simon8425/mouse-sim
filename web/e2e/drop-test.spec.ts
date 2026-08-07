@@ -1,7 +1,19 @@
 import { test, expect } from '@playwright/test';
 import { collectPageErrors, expectNoConsoleErrors, fixturePath } from './helpers';
 
-function dropSimulationResponse(): Record<string, unknown> {
+function dropSimulationResponse(dropCount = 2): Record<string, unknown> {
+  const settle = 0.6;
+  const interval = 0.35;
+  const drops = Array.from({ length: dropCount }, (_, index) => ({
+    index,
+    start_s: index * (settle + interval),
+    end_s: index * (settle + interval) + settle,
+    settled_s: settle,
+    impact_count: 2,
+    peak_impact_speed_m_s: 3.13,
+    peak_kinetic_energy_j: 0.49,
+    orientation: 'flat',
+  }));
   return {
     schema_id: 'gms.web-analysis-response/1',
     run_id: 'a'.repeat(64),
@@ -47,23 +59,23 @@ function dropSimulationResponse(): Record<string, unknown> {
       drop_simulation: {
         config: { test: 'drop', height_m: 0.5, surface: 'concrete', drop_count: 2, orientation: 'flat' },
         model: { mass_kg: 0.1, inertia_kg_m2: [[1e-4, 0, 0], [0, 1e-4, 0], [0, 0, 1e-4]], support_model: 'mesh_extreme_points', support_point_count: 14, integrator: 'semi_implicit_euler', timestep_s: 1 / 240, gravity_m_s2: 9.81, surface: 'concrete' },
-        drops: [
-          { index: 0, start_s: 0, end_s: 0.6, settled_s: 0.6, impact_count: 2, peak_impact_speed_m_s: 3.13, peak_kinetic_energy_j: 0.49, orientation: 'flat' },
-          { index: 1, start_s: 0.95, end_s: 1.55, settled_s: 0.6, impact_count: 2, peak_impact_speed_m_s: 3.13, peak_kinetic_energy_j: 0.49, orientation: 'flat' },
-        ],
-        impacts: [
-          { drop: 0, t_s: 0.32, impact_speed_m_s: 3.13, kinetic_energy_j: 0.49 },
-          { drop: 1, t_s: 1.27, impact_speed_m_s: 3.13, kinetic_energy_j: 0.49 },
-        ],
+        drops,
+        impacts: drops.map((drop) => ({
+          drop: drop.index,
+          t_s: drop.start_s + 0.32,
+          impact_speed_m_s: 3.13,
+          kinetic_energy_j: 0.49,
+        })),
         peak: { drop: 0, t_s: 0.32, impact_speed_m_s: 3.13, kinetic_energy_j: 0.49 },
         peak_force_estimate_n: 313,
-        trajectory: Array.from({ length: 240 }, (_, i) => {
-          const t = i / 60;
-          const local = t >= 0.95 ? t - 0.95 : t;
-          const startZ = 0.5;
-          const dz = 0.5 * Math.min(1, Math.max(0, (local - 0.25) / 0.15));
-          return [t, 0, 0, startZ - dz, 1, 0, 0, 0];
-        }),
+        trajectory: drops.flatMap((drop) =>
+          Array.from({ length: settle * 60 }, (_, i) => {
+            const t = drop.start_s + i / 60;
+            const startZ = 0.5;
+            const dz = 0.5 * Math.min(1, Math.max(0, ((i / 60) - 0.25) / 0.15));
+            return [t, 0, 0, startZ - dz, 1, 0, 0, 0];
+          }),
+        ),
       },
       qualification: null,
       manifest: null,
@@ -115,16 +127,78 @@ test.describe('drop simulation playback', () => {
     await page.waitForTimeout(400);
     const pausedAgain = parseTime(await page.locator('.drop-sim-controls__status').innerText());
     expect(Math.abs(pausedAgain - paused)).toBeLessThanOrEqual(0.05);
+
+    // PLAY resumes from the exact paused moment, not from 0.00s.
     await page.getByRole('button', { name: 'Play drop simulation' }).click();
+    await page.waitForTimeout(250);
+    const resumed = parseTime(await page.locator('.drop-sim-controls__status').innerText());
+    expect(resumed).toBeGreaterThan(paused - 0.1);
+    expect(resumed).toBeLessThan(paused + 0.3);
+
+    // The counter is monotonic: it passes through Drop 1/2 before Drop 2/2.
+    await page.waitForTimeout(300);
+    const counterAfterResume = await page.locator('.drop-sim-controls__status').innerText();
+    expect(counterAfterResume).toMatch(/Drop [12]\/2/);
+
+    // Restart returns to the beginning of the sequence.
     await page.getByRole('button', { name: 'Restart drop simulation' }).click();
     await expect(page.locator('.drop-sim-controls__status')).toContainText('Drop 1/2');
 
     // The results rail shows the drop simulation table on the Impact tab.
+    // The rail defaults to a collapsed right-edge strip; expand it first.
+    await page.getByRole('button', { name: 'Show results rail' }).click();
     await page.locator('.results-rail').waitFor({ state: 'visible', timeout: 5000 });
     await page.getByRole('tab', { name: 'impact' }).click();
     await expect(page.locator('.results-rail')).toContainText('Drop Simulation');
     await expect(page.locator('.results-rail')).toContainText('Worst impact: 3.13 m/s');
     await expect(page.locator('.results-rail')).toContainText('estimated peak force 313 N');
+
+    await expectNoConsoleErrors(page, errors);
+  });
+
+  test('performs exactly the configured number of drops', async ({ browser }) => {
+    const page = await browser.newPage();
+    const errors = await collectPageErrors(page);
+
+    await page.route('**/api/analyze', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(dropSimulationResponse(7)),
+      });
+    });
+
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Choose geometry file' }).click();
+    await page.locator('input[type="file"]').setInputFiles(fixturePath('analytic.json'));
+    await page.locator('.model-row__name', { hasText: 'analytic' }).waitFor({ state: 'attached', timeout: 15000 });
+
+    await page.getByRole('button', { name: 'Control panel' }).click();
+    await page.getByRole('button', { name: 'Run Drop Test' }).click();
+
+    await page.locator('.drop-sim-controls').waitFor({ state: 'visible', timeout: 15000 });
+    if (await page.locator('.drawer--nav.is-open').count()) {
+      await page.getByRole('button', { name: 'Toggle model navigator' }).click();
+    }
+    await page.getByRole('button', { name: 'Restart drop simulation' }).click();
+
+    // Poll the counter: it must visit every drop in order and reach 7/7.
+    const seen: string[] = [];
+    for (let i = 0; i < 40; i += 1) {
+      const text = await page.locator('.drop-sim-controls__status').innerText();
+      const match = /Drop (\d+)\/7/.exec(text);
+      if (match) seen.push(match[1]);
+      if (seen.includes('7') && i > 5) break;
+      await page.waitForTimeout(300);
+    }
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen[seen.length - 1]).toBe('7');
+    const unique = [...new Set(seen)];
+    // The counter advances monotonically through the drops (no premature 7/7).
+    expect(unique[0]).toBe('1');
+    for (let i = 1; i < unique.length; i += 1) {
+      expect(Number(unique[i])).toBeGreaterThanOrEqual(Number(unique[i - 1]));
+    }
 
     await expectNoConsoleErrors(page, errors);
   });

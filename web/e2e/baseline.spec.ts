@@ -58,6 +58,13 @@ test.describe('model workspace', () => {
   test('result rail renders tabs and qualification disposition', async () => {
     await modelLoaded(page);
     await expectRunComplete(page);
+    // The navigator auto-opens after upload; on narrow viewports the open
+    // drawer overlays the rail, so close it before interacting with tabs.
+    if (await page.locator('.drawer--nav.is-open').count()) {
+      await page.getByRole('button', { name: 'Toggle model navigator' }).click();
+    }
+    // The rail defaults to a collapsed right-edge strip; expand it to reach the tabs.
+    await page.getByRole('button', { name: 'Show results rail' }).click();
     await page.getByRole('tab', { name: 'qualification' }).click();
     await expect(
       page.getByRole('row', { name: 'Evidence disposition' }).getByRole('status'),
@@ -71,9 +78,42 @@ test.describe('model workspace', () => {
   test('mode switch triggers rerun and qualification gate view', async () => {
     await modelLoaded(page);
     await expectRunComplete(page);
-    await page.getByRole('button', { name: 'RUN QUALIFICATION' }).click();
+    await page.getByRole('button', { name: 'Run test menu' }).click();
+    await page.getByRole('menuitem', { name: 'Run Qualification' }).click();
     await expectRunComplete(page);
+    if (await page.locator('.drawer--nav.is-open').count()) {
+      await page.getByRole('button', { name: 'Toggle model navigator' }).click();
+    }
+    await page.getByRole('button', { name: 'Show results rail' }).click();
     await expect(page.locator('.results-rail')).toContainText(/blocked|pending review|exploration only/i);
+    await expectNoConsoleErrors(page, errors);
+  });
+
+  test('canvas picking works with the results rail collapsed', async () => {
+    await modelLoaded(page);
+    // The navigator auto-opens after upload; on narrow viewports the open
+    // drawer overlays the viewport, so close it before interacting with
+    // viewport actions.
+    if (await page.locator('.drawer--nav.is-open').count()) {
+      await page.getByRole('button', { name: 'Toggle model navigator' }).click();
+    }
+    const viewport = page.locator('.scene-viewport');
+    await expect(viewport).toBeVisible();
+    // The rail must sit as a slim right-edge strip, never over the canvas.
+    await expect(page.locator('.results-rail--collapsed')).toBeVisible();
+
+    const box = await viewport.boundingBox();
+    expect(box).not.toBeNull();
+    if (!box) return;
+
+    // Click the canvas center; the picker must hit the framed object.
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    await expect(page.locator('.model-row[aria-selected="true"]')).toHaveCount(1, { timeout: 5000 });
+
+    // Near the bottom-center of the viewport the click must still reach the
+    // canvas (the collapsed rail strip must not intercept pointer events).
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height * 0.78);
+    await expect(page.locator('.model-row[aria-selected="true"]')).toHaveCount(1, { timeout: 5000 });
     await expectNoConsoleErrors(page, errors);
   });
 });

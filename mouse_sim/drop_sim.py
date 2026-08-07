@@ -21,6 +21,11 @@ MAX_DURATION_S = 8.0
 # Impacts below this contact speed are micro-bounces of a nearly resting
 # body, not test impacts; a drop settles once impacts stay below it.
 MICRO_BOUNCE_SPEED_M_S = 0.3
+# Per-drop initial-condition variation applied to drops 1+ (drop 0 is the
+# pristine reference drop).  Every value is deterministic from the seed.
+JITTER_MAX_TILT_DEG = 6.0
+JITTER_MAX_LATERAL_FRACTION = 0.03
+JITTER_MAX_SPIN_RAD_S = 0.5
 
 SUPPORT_DIRECTIONS = (
     (1.0, 0.0, 0.0),
@@ -196,6 +201,52 @@ def _orientation_quaternion(mode, seed):
     return _normalize_quaternion((z, x, y, 0.0))
 
 
+def _drop_variation(
+    seed,
+    drop_index,
+    height_m,
+    max_tilt_deg=JITTER_MAX_TILT_DEG,
+    max_lateral_fraction=JITTER_MAX_LATERAL_FRACTION,
+    max_spin_rad_s=JITTER_MAX_SPIN_RAD_S,
+):
+    """Seeded initial-condition variation for drops 1+ (drop 0 is the reference).
+
+    Returns (tilt_quaternion, tilt_deg, lateral_offset_m, initial_angular):
+    a small tilt about a seeded horizontal axis, a horizontal drift offset of
+    the initial position (up to ``max_lateral_fraction * height_m``), and a
+    small release spin about the same axis so the first contact point's
+    velocity differs between drops.  Draws come from a fresh LCG seeded by
+    ``seed + 1000 + drop_index``, independent of the base orientation.
+    """
+    state = (seed + 1000 + drop_index) & 0xFFFFFFFF
+
+    def next_unit():
+        nonlocal state
+        state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
+        return state / 4294967296.0
+
+    axis_unit = next_unit()
+    tilt_unit = next_unit()
+    offset_angle_unit = next_unit()
+    offset_radius_unit = next_unit()
+    spin_unit = next_unit()
+
+    axis_angle = 2.0 * math.pi * axis_unit
+    axis = (math.cos(axis_angle), math.sin(axis_angle), 0.0)
+    tilt_deg = max_tilt_deg * tilt_unit
+    tilt_quaternion = _axis_angle_quaternion(axis, math.radians(tilt_deg))
+    max_offset = max_lateral_fraction * height_m
+    offset_radius = max_offset * offset_radius_unit
+    offset_angle = 2.0 * math.pi * offset_angle_unit
+    lateral_offset = (
+        offset_radius * math.cos(offset_angle),
+        offset_radius * math.sin(offset_angle),
+    )
+    spin_scale = max_spin_rad_s * spin_unit
+    initial_angular = (axis[0] * spin_scale, axis[1] * spin_scale, 0.0)
+    return tilt_quaternion, tilt_deg, lateral_offset, initial_angular
+
+
 def box_inertia(mass_kg, bounds):
     """Diagonal inertia tensor for a uniform-density box approximation."""
     dx, dy, dz = (
@@ -328,21 +379,29 @@ def _norm(vector):
     return math.sqrt(_dot(vector, vector))
 
 
-def _simulate_drop(mass_kg, inertia, inverse_inertia, support, height_m, surface, orientation_q, spin_rps, gravity, dt, max_duration_s):
-    """Simulate one drop; returns (trajectory, impacts, settled_s)."""
+def _simulate_drop(mass_kg, inertia, inverse_inertia, support, height_m, surface, orientation_q, spin_rps, gravity, dt, max_duration_s, lateral_offset=(0.0, 0.0), initial_angular=(0.0, 0.0, 0.0)):
+    """Simulate one drop; returns (trajectory, impacts, settled_s).
+
+    ``lateral_offset`` shifts the starting position in the table plane and
+    ``initial_angular`` seeds the release spin; both are per-drop variation
+    (drop 0 passes the pristine defaults).
+    """
     restitution = SURFACES[surface]["restitution"]
     friction = SURFACES[surface]["friction"]
 
     # Initial state: the configured height is the clearance of the LOWEST
     # world-frame support point above the table (rotated orientations have a
-    # different lowest point than the body frame).
+    # different lowest point than the body frame).  The perturbed orientation
+    # is passed in already, so the clearance and the initial position reflect
+    # the tilt; the lateral drift offset only shifts x/y in the table plane.
     lowest_world = min(
         _quaternion_rotate(orientation_q, point)[2] for point in support
     )
-    position = (0.0, 0.0, height_m - lowest_world)
+    position = (lateral_offset[0], lateral_offset[1], height_m - lowest_world)
     quaternion = orientation_q
     velocity = (0.0, 0.0, 0.0)
-    angular = (0.0, spin_rps * 2.0 * math.pi, 0.0) if spin_rps else (0.0, 0.0, 0.0)
+    spin_angular = (0.0, spin_rps * 2.0 * math.pi, 0.0) if spin_rps else (0.0, 0.0, 0.0)
+    angular = _add(spin_angular, initial_angular)
 
     trajectory = []
     impacts = []
@@ -409,6 +468,10 @@ def _simulate_drop(mass_kg, inertia, inverse_inertia, support, height_m, surface
                     pre_energy = 0.5 * mass_kg * _dot(pre_velocity, pre_velocity) + 0.5 * _dot(
                         pre_angular, _matvec(_world_inertia(inertia, quaternion), pre_angular)
                     )
+                    # Screening bound: never report more impact energy than the
+                    # drop provides (penetration-stage detection can otherwise
+                    # overstate the pre-impact kinetic energy slightly).
+                    pre_energy = min(pre_energy, mass_kg * gravity * height_m)
                     if impact_speed > MICRO_BOUNCE_SPEED_M_S:
                         micro_streak = 0
                         impacts.append(
@@ -495,9 +558,13 @@ def _simulate_drop(mass_kg, inertia, inverse_inertia, support, height_m, surface
 def simulate(mass_kg, inertia, support, height_m, surface="concrete", drop_count=1, test="drop", orientation="flat", spin_rps=0.0, gravity=GRAVITY_M_S2, dt=DT_S, max_duration_s=MAX_DURATION_S, seed=0):
     """Run a deterministic multi-drop simulation.
 
-    Returns a dict with the full trajectory, per-drop summaries, impact
-    events, and the simulation model used.  Pure stdlib, deterministic for a
-    fixed seed and configuration.
+    Drop 0 is the pristine reference (exactly the configured orientation,
+    zero lateral offset).  Every later drop gets a deterministic, seeded
+    initial-condition variation (tilt jitter, lateral drift, small release
+    spin) so repeated drops are unique while staying bit-reproducible for a
+    fixed seed and configuration.  Returns a dict with the full trajectory,
+    per-drop summaries, impact events, and the simulation model used.  Pure
+    stdlib, deterministic for a fixed seed and configuration.
     """
     config = validate_config(
         {
@@ -528,6 +595,19 @@ def simulate(mass_kg, inertia, support, height_m, surface="concrete", drop_count
         if config["test"] == "impact" and drop_index == 0:
             # Impact test drops onto the corner orientation for a harsher hit.
             orientation_q = _axis_angle_quaternion((1.0, 1.0, 0.0), math.acos(1.0 / math.sqrt(3.0)))
+        tilt_deg = 0.0
+        lateral_offset = (0.0, 0.0)
+        initial_angular = (0.0, 0.0, 0.0)
+        if drop_index > 0:
+            # Every drop after the reference gets a deterministic, seeded
+            # initial-condition variation (tilt + lateral drift + release
+            # spin), so repeated drops are unique but still bit-reproducible.
+            tilt_q, tilt_deg, lateral_offset, initial_angular = _drop_variation(
+                seed, drop_index, config["height_m"]
+            )
+            orientation_q = _normalize_quaternion(
+                _quaternion_multiply(tilt_q, orientation_q)
+            )
         drop_trajectory, impacts, settled = _simulate_drop(
             mass_kg,
             inertia,
@@ -540,6 +620,8 @@ def simulate(mass_kg, inertia, support, height_m, surface="concrete", drop_count
             gravity,
             dt,
             max_duration_s,
+            lateral_offset,
+            initial_angular,
         )
         peak_speed = max((item["impact_speed_m_s"] for item in impacts), default=0.0)
         peak_energy = max((item["kinetic_energy_j"] for item in impacts), default=0.0)
@@ -556,6 +638,11 @@ def simulate(mass_kg, inertia, support, height_m, surface="concrete", drop_count
                 "peak_impact_speed_m_s": round(peak_speed, 4),
                 "peak_kinetic_energy_j": round(peak_energy, 6),
                 "orientation": actual_orientation,
+                "tilt_deg": round(tilt_deg, 4),
+                "lateral_offset_m": [
+                    round(lateral_offset[0], 6),
+                    round(lateral_offset[1], 6),
+                ],
             }
         )
         for impact in impacts:
@@ -594,6 +681,12 @@ def simulate(mass_kg, inertia, support, height_m, surface="concrete", drop_count
             "timestep_s": dt,
             "gravity_m_s2": gravity,
             "surface": config["surface"],
+            "jitter": {
+                "max_tilt_deg": JITTER_MAX_TILT_DEG,
+                "max_lateral_fraction": JITTER_MAX_LATERAL_FRACTION,
+                "max_initial_spin_rad_s": JITTER_MAX_SPIN_RAD_S,
+                "seed": seed,
+            },
         },
         "drops": drops,
         "impacts": all_impacts,

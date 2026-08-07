@@ -6,7 +6,7 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { OutlinePass } from 'three/examples/jsm/postprocessing/OutlinePass.js';
 import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 
-import type { Vec3, DropSimulationResult } from '../api/contracts';
+import type { Vec3, DropSimulationResult, DropTrajectorySample } from '../api/contracts';
 import {
   MaterialPalette,
   type QualityTier,
@@ -141,6 +141,41 @@ function idsSignature(entries: ObjectSceneEntry[]): string {
 
 function finiteBounds(bounds: { min: Vec3; max: Vec3 }): boolean {
   return bounds.min.every((value) => Number.isFinite(value)) && bounds.max.every((value) => Number.isFinite(value));
+}
+
+// Trajectory samples are written at a fixed 60 Hz by the simulator.
+export const TRAJECTORY_HZ = 60;
+
+/**
+ * Resolve the bracketing trajectory samples for a playback time.
+ *
+ * Trajectory samples exist only during each drop's active sim time; the
+ * ~0.35 s inter-drop gaps contain no samples.  During a gap the pose holds
+ * the previous drop's final (rest) sample, and the model teleports up at
+ * the next drop's first sample — matching the physics reset.
+ */
+export function resolveDropSample(
+  t: number,
+  samples: DropTrajectorySample[],
+): { a: DropTrajectorySample; b: DropTrajectorySample; alpha: number } | null {
+  if (samples.length === 0) return null;
+  if (t <= samples[0][0]) return { a: samples[0], b: samples[0], alpha: 0 };
+  let low = 0;
+  let high = samples.length - 1;
+  while (low < high) {
+    const mid = (low + high + 1) >> 1;
+    if (samples[mid][0] <= t) low = mid;
+    else high = mid - 1;
+  }
+  const a = samples[low];
+  if (low === samples.length - 1) return { a, b: a, alpha: 0 };
+  const b = samples[low + 1];
+  if (b[0] - a[0] > 2 / TRAJECTORY_HZ) {
+    return { a, b: a, alpha: 0 };
+  }
+  const span = Math.max(1e-9, b[0] - a[0]);
+  const alpha = Math.min(1, Math.max(0, (t - a[0]) / span));
+  return { a, b, alpha };
 }
 
 export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
@@ -299,8 +334,6 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   let dropPlaying = false;
   let lastFrameTime: number | null = null;
 
-  // Trajectory samples are written at a fixed 60 Hz by the simulator.
-  const TRAJECTORY_HZ = 60;
   const applyDropTransform = (): void => {
     if (!currentDropSimulation || currentDropSimulation.trajectory.length === 0) {
       objectsGroup.position.set(0, 0, 0);
@@ -310,12 +343,9 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     const samples = currentDropSimulation.trajectory;
     const total = samples[samples.length - 1][0];
     const t = Math.min(dropTime, total);
-    const rate = TRAJECTORY_HZ;
-    const index = Math.min(samples.length - 2, Math.max(0, Math.floor(t * rate)));
-    const a = samples[index];
-    const b = samples[Math.min(index + 1, samples.length - 1)];
-    const span = Math.max(1e-9, b[0] - a[0]);
-    const alpha = Math.min(1, Math.max(0, (t - a[0]) / span));
+    const resolved = resolveDropSample(t, samples);
+    if (!resolved) return;
+    const { a, b, alpha } = resolved;
     objectsGroup.position.set(
       a[1] + (b[1] - a[1]) * alpha,
       a[2] + (b[2] - a[2]) * alpha,
@@ -329,8 +359,8 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   };
 
   const dropTrajectoryBounds = (simulation: DropSimulationResult): { min: Vec3; max: Vec3 } => {
-    let min = [Infinity, Infinity, Infinity] as Vec3;
-    let max = [-Infinity, -Infinity, -Infinity] as Vec3;
+    const min = [Infinity, Infinity, Infinity] as Vec3;
+    const max = [-Infinity, -Infinity, -Infinity] as Vec3;
     for (const sample of simulation.trajectory) {
       for (let axis = 0; axis < 3; axis += 1) {
         const value = sample[axis + 1];
@@ -567,11 +597,17 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       const samples = currentDropSimulation.trajectory;
       const total = samples.length > 0 ? samples[samples.length - 1][0] : 0;
       const previous = dropTime;
-      dropTime = Math.min(dropTime + delta, total);
-      if (dropTime >= total && previous < total) {
+      if (total <= 0) {
         dropPlaying = false;
         lastFrameTime = null;
         opts.onDropEnded?.();
+      } else {
+        dropTime = Math.min(dropTime + delta, total);
+        if (dropTime >= total && previous < total) {
+          dropPlaying = false;
+          lastFrameTime = null;
+          opts.onDropEnded?.();
+        }
       }
     } else {
       lastFrameTime = null;
@@ -692,7 +728,18 @@ scene.background = new THREE.Color(theme === 'dark' ? 0x141310 : 0xf7f7f4);
 
     setDropPlayback(playing: boolean) {
       if (disposed) return;
-      dropPlaying = playing && currentDropSimulation !== null;
+      if (!playing || currentDropSimulation === null) {
+        dropPlaying = false;
+        return;
+      }
+      const samples = currentDropSimulation.trajectory;
+      const total = samples.length > 0 ? samples[samples.length - 1][0] : 0;
+      // Resume from the exact paused moment; a play press at the end of the
+      // playback restarts the whole sequence from the beginning.
+      if (dropTime >= total) {
+        dropTime = 0;
+      }
+      dropPlaying = true;
     },
 
     restartDropPlayback() {
