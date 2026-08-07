@@ -1,6 +1,15 @@
 import * as React from 'react';
-import { useProjectStore } from '../state/projectStore';
-import { STUDY_PRESETS, type StudyPreset } from '../lib/studies';
+import { useProjectStore, type ProjectAction } from '../state/projectStore';
+import {
+  DROP_ORIENTATIONS,
+  DROP_SURFACES,
+  DROP_TESTS,
+  clampDropConfig,
+  persistedConfigForTest,
+  persistConfigForTest,
+  type DropTestConfigState,
+} from '../lib/studies';
+import type { DropOrientation, DropSurface } from '../api/contracts';
 import {
   selectEvidenceCount,
   selectRunStatusLabel,
@@ -66,13 +75,6 @@ function sourceLabel(status: string): string {
   }
 }
 
-function formatStudyMethod(method: string): string {
-  return method
-    .replace('impact · energy_quasi_static_v1', 'Impact Screening (Drop Contact)')
-    .replace('load_case · shell_navier_v1', 'Structural Flex (Uniform Pressure)')
-    .replace('impact · orientation', 'Drop Test Suite (Multi-Axis)');
-}
-
 function Chips({ items }: { items: string[] }): React.ReactElement {
   if (items.length === 0) {
     return <span className="muted">—</span>;
@@ -102,15 +104,6 @@ export function MissionControl({ onClose, onUpload }: MissionControlProps): Reac
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [onClose]);
-
-  const handleStudy = (preset: StudyPreset) => {
-    dispatch({ type: 'UPDATE_DRAFT', patch: preset.patch });
-    onClose();
-  };
-
-  const handleRunStudy = () => {
-    dispatch({ type: 'RUN_STUDY' });
-  };
 
   const health = state.health;
   const result = state.lastResult;
@@ -229,28 +222,16 @@ export function MissionControl({ onClose, onUpload }: MissionControlProps): Reac
             </div>
           </div>
 
-          {/* CARD 2: STUDY LAUNCHER & QUICK ACTIONS */}
+          {/* CARD 2: DROP SIMULATION TESTS */}
           <div className="mc-card">
             <div className="mc-card__header-row">
-              <h3 className="mc-card__heading">Preset Studies & Actions</h3>
-              <button type="button" className="btn btn--primary btn--sm" onClick={handleRunStudy}>
-                Run study
-              </button>
+              <h3 className="mc-card__heading">Durability Tests</h3>
+              <span className="mc-subtext">3D rigid-body drop simulation</span>
             </div>
             <div className="mc-card__content">
-              <div className="mc-studies-grid">
-                {STUDY_PRESETS.map((preset) => (
-                  <button
-                    key={preset.id}
-                    type="button"
-                    className="mc-study-item"
-                    aria-label={`${preset.title} study`}
-                    onClick={() => handleStudy(preset)}
-                    >
-                      <span className="mc-study-item__title">{preset.title}</span>
-                      <span className="mc-study-item__method">{formatStudyMethod(preset.method)}</span>
-                      <span className="mc-study-item__description">{preset.description}</span>
-                    </button>
+              <div className="mc-tests-grid">
+                {DROP_TESTS.map((test) => (
+                  <DropTestCard key={test.id} test={test} dispatch={dispatch} onClose={onClose} />
                 ))}
               </div>
 
@@ -263,6 +244,146 @@ export function MissionControl({ onClose, onUpload }: MissionControlProps): Reac
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+interface DropTestCardProps {
+  test: (typeof DROP_TESTS)[number];
+  dispatch: React.Dispatch<ProjectAction>;
+  onClose: () => void;
+}
+
+function DropTestCard({ test, dispatch, onClose }: DropTestCardProps): React.ReactElement {
+  const { state } = useProjectStore();
+  const [config, setConfig] = React.useState<DropTestConfigState>(() =>
+    persistedConfigForTest(test),
+  );
+  const hasGeometry = state.project !== null || state.preview !== null;
+
+  const update = (patch: Partial<DropTestConfigState>) => {
+    const next = clampDropConfig({ ...config, ...patch });
+    setConfig(next);
+    persistConfigForTest(test, next);
+  };
+
+  const run = () => {
+    const finalConfig = clampDropConfig(config);
+    dispatch({
+      type: 'RUN_DROP_TEST',
+      test: test.test,
+      config: {
+        height_m: finalConfig.height_m,
+        surface: finalConfig.surface,
+        drop_count: finalConfig.drop_count,
+        orientation: finalConfig.orientation,
+        spin_rps: finalConfig.spin_rps,
+        mass_kg: finalConfig.mass_kg,
+      },
+    });
+    // Close the panel so the 3D drop animation is visible immediately.
+    onClose();
+  };
+
+  return (
+    <div className="mc-test-item">
+      <div className="mc-test-item__header">
+        <span className="mc-test-item__title">{test.title}</span>
+        <span className="mc-test-item__badge">{test.test.toUpperCase()}</span>
+      </div>
+      <p className="mc-test-item__description">{test.description}</p>
+      <div className="mc-test-item__controls">
+        <label className="mc-field">
+          <span>Drop height (m)</span>
+          <input
+            type="number"
+            min={0.02}
+            max={3}
+            step={0.05}
+            value={config.height_m}
+            aria-label={`${test.title} height`}
+            onChange={(e) => update({ height_m: Number(e.target.value) })}
+          />
+        </label>
+        <label className="mc-field">
+          <span>Drops</span>
+          <input
+            type="number"
+            min={1}
+            max={20}
+            step={1}
+            value={config.drop_count}
+            aria-label={`${test.title} drop count`}
+            onChange={(e) => update({ drop_count: Number(e.target.value) })}
+          />
+        </label>
+        <label className="mc-field">
+          <span>Surface</span>
+          <select
+            value={config.surface}
+            aria-label={`${test.title} surface`}
+            onChange={(e) => update({ surface: e.target.value as DropSurface })}
+          >
+            {DROP_SURFACES.map((surface) => (
+              <option key={surface.value} value={surface.value}>
+                {surface.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="mc-field">
+          <span>Orientation</span>
+          <select
+            value={config.orientation}
+            aria-label={`${test.title} orientation`}
+            onChange={(e) => update({ orientation: e.target.value as DropOrientation })}
+          >
+            {DROP_ORIENTATIONS.map((orientation) => (
+              <option key={orientation.value} value={orientation.value}>
+                {orientation.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        {test.test === 'tumble' ? (
+          <label className="mc-field">
+            <span>Spin (rev/s)</span>
+            <input
+              type="number"
+              min={0}
+              max={20}
+              step={0.5}
+              value={config.spin_rps}
+              aria-label={`${test.title} spin`}
+              onChange={(e) => update({ spin_rps: Number(e.target.value) })}
+            />
+          </label>
+        ) : null}
+        <label className="mc-field">
+          <span>Mass (kg, optional)</span>
+          <input
+            type="number"
+            min={0.01}
+            max={10}
+            step={0.01}
+            placeholder="auto"
+            value={config.mass_kg ?? ''}
+            aria-label={`${test.title} mass`}
+            onChange={(e) =>
+              update({ mass_kg: e.target.value === '' ? null : Number(e.target.value) })
+            }
+          />
+        </label>
+      </div>
+      <button
+        type="button"
+        className="btn btn--primary btn--sm"
+        onClick={run}
+        disabled={!hasGeometry}
+        title={hasGeometry ? `Run ${test.title}` : 'Upload a model first'}
+      >
+        Run {test.title}
+      </button>
     </div>
   );
 }

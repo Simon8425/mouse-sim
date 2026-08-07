@@ -793,6 +793,18 @@ class TriangleMesh(Geometry):
     def _world_vertices(self):
         return tuple(self.transform.apply_point(vertex) for vertex in self.vertices)
 
+    def _integrals(self):
+        """Volume integrals, computed once per mesh instance.
+
+        The pipeline runs diagnostics, classification, mass, and validation
+        over the same meshes; caching removes repeated O(V) integral passes.
+        """
+        cached = getattr(self, "_integrals_cache", None)
+        if cached is None:
+            cached = _mesh_integrals(self._world_vertices(), self.triangles)
+            object.__setattr__(self, "_integrals_cache", cached)
+        return cached
+
     def bounds(self):
         return Bounds.from_points(self._world_vertices())
 
@@ -819,7 +831,7 @@ class TriangleMesh(Geometry):
 
     def diagnostics(self):
         boundary, nonmanifold, degenerate, inconsistent = self._topology()
-        volume, first, _ = _mesh_integrals(self._world_vertices(), self.triangles)
+        volume, first, _ = self._integrals()
         centroid = _scale(first, 1.0 / volume) if abs(volume) > 1e-15 else None
         closed = boundary == 0 and nonmanifold == 0 and bool(self.triangles)
         issues = []
@@ -852,7 +864,7 @@ class TriangleMesh(Geometry):
         diagnostics = self.diagnostics()
         if not diagnostics.safe_for_mass_properties:
             raise ValueError("mesh is not safe for mass properties: {}".format(", ".join(diagnostics.issues)))
-        volume, first, second = _mesh_integrals(self._world_vertices(), self.triangles)
+        volume, first, second = self._integrals()
         _, tensor = _mesh_inertia_from_integrals(volume, first, second, _validate_positive(density, "density"))
         return tensor
 

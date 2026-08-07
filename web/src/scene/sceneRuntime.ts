@@ -6,7 +6,7 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { OutlinePass } from 'three/examples/jsm/postprocessing/OutlinePass.js';
 import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 
-import type { Vec3 } from '../api/contracts';
+import type { Vec3, DropSimulationResult } from '../api/contracts';
 import {
   MaterialPalette,
   type QualityTier,
@@ -36,7 +36,9 @@ export interface SceneRuntimeOptions {
   theme: 'light' | 'dark';
   quality: QualityTier;
   onPick: (id: string | null) => void;
+  onDoublePick?: (id: string | null) => void;
   onStats?: (stats: RenderStats) => void;
+  onDropEnded?: () => void;
 }
 
 export interface SceneRuntime {
@@ -47,6 +49,10 @@ export interface SceneRuntime {
   setTheme: (theme: 'light' | 'dark') => void;
   setQuality: (quality: QualityTier) => void;
   setOverlays: (overlays: OverlaySpec | null) => void;
+  setDropSimulation: (simulation: DropSimulationResult | null) => void;
+  setDropPlayback: (playing: boolean) => void;
+  restartDropPlayback: () => void;
+  getDropTime: () => number;
   fit: () => void;
   preset: (name: CameraPreset) => void;
   getStats: () => RenderStats;
@@ -288,6 +294,54 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   let currentEntries: ObjectSceneEntry[] = [];
   let currentVisibility: Record<string, boolean> = {};
   let currentSelectionId: string | null = null;
+  let currentDropSimulation: DropSimulationResult | null = null;
+  let dropTime = 0;
+  let dropPlaying = false;
+  let lastFrameTime: number | null = null;
+
+  // Trajectory samples are written at a fixed 60 Hz by the simulator.
+  const TRAJECTORY_HZ = 60;
+  const applyDropTransform = (): void => {
+    if (!currentDropSimulation || currentDropSimulation.trajectory.length === 0) {
+      objectsGroup.position.set(0, 0, 0);
+      objectsGroup.quaternion.identity();
+      return;
+    }
+    const samples = currentDropSimulation.trajectory;
+    const total = samples[samples.length - 1][0];
+    const t = Math.min(dropTime, total);
+    const rate = TRAJECTORY_HZ;
+    const index = Math.min(samples.length - 2, Math.max(0, Math.floor(t * rate)));
+    const a = samples[index];
+    const b = samples[Math.min(index + 1, samples.length - 1)];
+    const span = Math.max(1e-9, b[0] - a[0]);
+    const alpha = Math.min(1, Math.max(0, (t - a[0]) / span));
+    objectsGroup.position.set(
+      a[1] + (b[1] - a[1]) * alpha,
+      a[2] + (b[2] - a[2]) * alpha,
+      a[3] + (b[3] - a[3]) * alpha,
+    );
+    objectsGroup.quaternion.slerpQuaternions(
+      new THREE.Quaternion(a[4], a[5], a[6], a[7]),
+      new THREE.Quaternion(b[4], b[5], b[6], b[7]),
+      alpha,
+    );
+  };
+
+  const dropTrajectoryBounds = (simulation: DropSimulationResult): { min: Vec3; max: Vec3 } => {
+    let min = [Infinity, Infinity, Infinity] as Vec3;
+    let max = [-Infinity, -Infinity, -Infinity] as Vec3;
+    for (const sample of simulation.trajectory) {
+      for (let axis = 0; axis < 3; axis += 1) {
+        const value = sample[axis + 1];
+        if (value < min[axis]) min[axis] = value;
+        if (value > max[axis]) max[axis] = value;
+      }
+    }
+    return { min, max };
+  };
+
+
   let currentExplodeFactor = 0;
   let currentIdSignature = '';
   let currentEntriesSignature: string | null = null;
@@ -502,6 +556,28 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     animationFrameId = requestAnimationFrame(renderLoop);
     controls.update();
 
+    // Drive the model along the simulated drop trajectory (real physics
+    // data, not a decorative animation), advancing in wall-clock time so
+    // the playback rate is real-time on any display refresh rate.
+    if (currentDropSimulation && dropPlaying) {
+      const now = performance.now();
+      if (lastFrameTime === null) lastFrameTime = now;
+      const delta = Math.min(0.1, (now - lastFrameTime) / 1000);
+      lastFrameTime = now;
+      const samples = currentDropSimulation.trajectory;
+      const total = samples.length > 0 ? samples[samples.length - 1][0] : 0;
+      const previous = dropTime;
+      dropTime = Math.min(dropTime + delta, total);
+      if (dropTime >= total && previous < total) {
+        dropPlaying = false;
+        lastFrameTime = null;
+        opts.onDropEnded?.();
+      }
+    } else {
+      lastFrameTime = null;
+    }
+    applyDropTransform();
+
     if (composer) {
       composer.render();
     } else {
@@ -585,6 +661,49 @@ scene.background = new THREE.Color(theme === 'dark' ? 0x141310 : 0xf7f7f4);
     setOverlays(spec: OverlaySpec | null) {
       if (disposed) return;
       overlayLayer.apply(spec);
+    },
+
+    setDropSimulation(simulation: DropSimulationResult | null) {
+      if (disposed) return;
+      currentDropSimulation = simulation;
+      dropTime = 0;
+      dropPlaying = simulation !== null;
+      lastFrameTime = null;
+      applyDropTransform();
+      if (simulation) {
+        // Frame the whole drop envelope (trajectory AABB ∪ model bounds) so
+        // the fall is visible instead of happening off-screen.
+        const trajectory = dropTrajectoryBounds(simulation);
+        const combined: { min: Vec3; max: Vec3 } = {
+          min: [
+            Math.min(trajectory.min[0], boundsUnion.min[0]),
+            Math.min(trajectory.min[1], boundsUnion.min[1]),
+            Math.min(trajectory.min[2], boundsUnion.min[2]),
+          ],
+          max: [
+            Math.max(trajectory.max[0], boundsUnion.max[0]),
+            Math.max(trajectory.max[1], boundsUnion.max[1]),
+            Math.max(trajectory.max[2], boundsUnion.max[2]),
+          ],
+        };
+        fitCameraToBounds(camera, controls, combined);
+      }
+    },
+
+    setDropPlayback(playing: boolean) {
+      if (disposed) return;
+      dropPlaying = playing && currentDropSimulation !== null;
+    },
+
+    restartDropPlayback() {
+      if (disposed) return;
+      dropTime = 0;
+      dropPlaying = currentDropSimulation !== null;
+      applyDropTransform();
+    },
+
+    getDropTime() {
+      return dropTime;
     },
 
     fit() {

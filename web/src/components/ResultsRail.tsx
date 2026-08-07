@@ -885,96 +885,143 @@ function renderStructural(result: PipelineResult): JSX.Element {
  * @returns The impact panel content.
  */
 function renderImpact(result: PipelineResult): JSX.Element {
-  if (result.impact === null) {
+  const simulation = result.drop_simulation;
+  const estimate = result.impact?.result ?? null;
+  if (estimate === null && simulation === null) {
     return <Empty>No impact estimate was requested.</Empty>;
-  }
-  const estimate = result.impact.result;
-  if (estimate === null) {
-    return <Empty>{result.impact.reason ?? 'No impact estimate was produced.'}</Empty>;
   }
   return (
     <>
-      <RailSection title="Impact Estimate">
-        <table className="dense-table">
-          <thead>
-            <tr>
-              <th style={{ width: '30%' }}>Metric</th>
-              <th style={{ width: '30%' }}>Value</th>
-              <th style={{ width: '40%' }}>Description</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <th scope="row">Closing velocity</th>
-              <td className="num-mid">{formatNumber(estimate.closing_velocity_m_s)} m/s</td>
-              <td className="muted">Free fall impact velocity</td>
-            </tr>
-            <tr>
-              <th scope="row">Impact energy</th>
-              <td className="num-mid">{formatEnergy(estimate.impact_energy_j)}</td>
-              <td className="muted">Quasi-static impact kinetic energy</td>
-            </tr>
-            <tr>
-              <th scope="row">Effective mass</th>
-              <td className="num-mid">{formatMass(estimate.effective_mass_kg)}</td>
-              <td className="muted">Effective falling assembly mass</td>
-            </tr>
-            <tr>
-              <th scope="row">Impulse</th>
-              <td className="num-mid">{formatNumber(estimate.impulse_n_s)} N·s</td>
-              <td className="muted">Total impact momentum change</td>
-            </tr>
-            <tr>
-              <th scope="row">Peak force</th>
-              <td className="num-mid">{formatForce(estimate.peak_force_n)}</td>
-              <td className="muted">Peak contact force</td>
-            </tr>
-            <tr>
-              <th scope="row">Peak acceleration</th>
-              <td className="num-mid">{formatAcceleration(estimate.peak_acceleration_m_s2)}</td>
-              <td className="muted">Peak deceleration Gs</td>
-            </tr>
-            <tr>
-              <th scope="row">Contact duration</th>
-              <td className="num-mid">{formatDuration(estimate.contact_duration_s)}</td>
-              <td className="muted">Impact contact duration window</td>
-            </tr>
-            <tr>
-              <th scope="row">Contact compression</th>
-              <td className="num-mid">{formatLength(estimate.contact_compression_m)}</td>
-              <td className="muted">Peak bumper deformation</td>
-            </tr>
-            <tr>
-              <th scope="row">Validity</th>
-              <td>
-                <StatusBadge tone={validityTone(estimate.validity)}>{validityLabel(estimate.validity)}</StatusBadge>
-              </td>
-              <td className="muted">Impact solver validity state</td>
-            </tr>
-            <tr>
-              <th scope="row">Qualification blocked</th>
-              <td className="num-mid">{estimate.qualification_blocked ? 'yes' : 'no'}</td>
-              <td className="muted">Impact qualification gate blocker</td>
-            </tr>
-            <tr>
-              <th scope="row">Safety factor</th>
-              <td className="num-mid">
-                {typeof estimate.safety_factor === 'number' ? formatNumber(estimate.safety_factor) : estimate.safety_factor}
-              </td>
-              <td className="muted">Impact safety factor limit</td>
-            </tr>
-          </tbody>
-        </table>
-      </RailSection>
-      {estimate.flags.includes('CONTACT_PATCH_ASSUMPTION') && (
+      {simulation ? (
+        <RailSection title="Drop Simulation">
+          <p className="muted" style={{ fontSize: '11px' }}>
+            3D rigid-body simulation · {simulation.config.test} test ·{' '}
+            {simulation.config.height_m.toFixed(2)} m · {simulation.config.surface} ·{' '}
+            {simulation.config.drop_count} drop(s) · {simulation.config.orientation} orientation
+            {simulation.model.support_model === 'mesh_extreme_points'
+              ? ` · ${simulation.model.support_point_count} support points`
+              : ''}
+          </p>
+          <table className="dense-table">
+            <thead>
+              <tr>
+                <th>Drop</th>
+                <th>Settled</th>
+                <th>Impacts</th>
+                <th>Peak speed</th>
+                <th>Peak energy</th>
+              </tr>
+            </thead>
+            <tbody>
+              {simulation.drops.map((drop) => (
+                <tr key={drop.index}>
+                  <td>#{drop.index + 1}</td>
+                  <td className="num-mid">{drop.settled_s.toFixed(2)} s</td>
+                  <td className="num-mid">{drop.impact_count}</td>
+                  <td className="num-mid">{drop.peak_impact_speed_m_s.toFixed(2)} m/s</td>
+                  <td className="num-mid">{formatEnergy(drop.peak_kinetic_energy_j)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {simulation.peak ? (
+            <p className="muted" style={{ fontSize: '11px' }}>
+              Worst impact: {simulation.peak.impact_speed_m_s.toFixed(2)} m/s at{' '}
+              {simulation.peak.t_s.toFixed(2)} s
+              {simulation.peak_force_estimate_n
+                ? ` · estimated peak force ${formatForce(simulation.peak_force_estimate_n)}`
+                : ''}
+            </p>
+          ) : null}
+        </RailSection>
+      ) : null}
+      {estimate ? (
+        <RailSection title="Impact Estimate">
+          <table className="dense-table">
+            <thead>
+              <tr>
+                <th style={{ width: '30%' }}>Metric</th>
+                <th style={{ width: '30%' }}>Value</th>
+                <th style={{ width: '40%' }}>Description</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <th scope="row">Closing velocity</th>
+                <td className="num-mid">{formatNumber(estimate.closing_velocity_m_s)} m/s</td>
+                <td className="muted">Free fall impact velocity</td>
+              </tr>
+              <tr>
+                <th scope="row">Impact energy</th>
+                <td className="num-mid">{formatEnergy(estimate.impact_energy_j)}</td>
+                <td className="muted">Quasi-static impact kinetic energy</td>
+              </tr>
+              <tr>
+                <th scope="row">Effective mass</th>
+                <td className="num-mid">{formatMass(estimate.effective_mass_kg)}</td>
+                <td className="muted">Effective falling assembly mass</td>
+              </tr>
+              <tr>
+                <th scope="row">Impulse</th>
+                <td className="num-mid">{formatNumber(estimate.impulse_n_s)} N·s</td>
+                <td className="muted">Total impact momentum change</td>
+              </tr>
+              <tr>
+                <th scope="row">Peak force</th>
+                <td className="num-mid">{formatForce(estimate.peak_force_n)}</td>
+                <td className="muted">Peak contact force</td>
+              </tr>
+              <tr>
+                <th scope="row">Peak acceleration</th>
+                <td className="num-mid">{formatNumber(estimate.peak_acceleration_m_s2)} m/s²</td>
+                <td className="muted">Peak deceleration at impact</td>
+              </tr>
+              <tr>
+                <th scope="row">Contact duration</th>
+                <td className="num-mid">{formatNumber(estimate.contact_duration_s)} s</td>
+                <td className="muted">Impulse contact duration</td>
+              </tr>
+              <tr>
+                <th scope="row">Contact compression</th>
+                <td className="num-mid">{formatLength(estimate.contact_compression_m)}</td>
+                <td className="muted">Peak bumper deformation</td>
+              </tr>
+              <tr>
+                <th scope="row">Validity</th>
+                <td>
+                  <StatusBadge tone={validityTone(estimate.validity)}>{validityLabel(estimate.validity)}</StatusBadge>
+                </td>
+                <td className="muted">Impact solver validity state</td>
+              </tr>
+              <tr>
+                <th scope="row">Qualification blocked</th>
+                <td className="num-mid">{estimate.qualification_blocked ? 'yes' : 'no'}</td>
+                <td className="muted">Impact qualification gate blocker</td>
+              </tr>
+              <tr>
+                <th scope="row">Safety factor</th>
+                <td className="num-mid">
+                  {typeof estimate.safety_factor === 'number' ? formatNumber(estimate.safety_factor) : estimate.safety_factor}
+                </td>
+                <td className="muted">Impact safety factor limit</td>
+              </tr>
+            </tbody>
+          </table>
+        </RailSection>
+      ) : null}
+      {estimate && estimate.flags.includes('CONTACT_PATCH_ASSUMPTION') ? (
         <p className="results-rail__note muted">Energy-based quasi-static estimate; local contact stress not resolved.</p>
-      )}
-      <DisclosureCard title="Solver assumptions" count={estimate.assumptions.length}>
-        <UnifiedAssumptionsTable items={estimate.assumptions} />
-      </DisclosureCard>
-      <DisclosureCard title="Unsupported failure modes" count={estimate.unsupported_failure_modes.length}>
-        <UnifiedUnsupportedTable items={estimate.unsupported_failure_modes} />
-      </DisclosureCard>
+      ) : null}
+      {estimate ? (
+        <DisclosureCard title="Solver assumptions" count={estimate.assumptions.length}>
+          <UnifiedAssumptionsTable items={estimate.assumptions} />
+        </DisclosureCard>
+      ) : null}
+      {estimate ? (
+        <DisclosureCard title="Unsupported failure modes" count={estimate.unsupported_failure_modes.length}>
+          <UnifiedUnsupportedTable items={estimate.unsupported_failure_modes} />
+        </DisclosureCard>
+      ) : null}
     </>
   );
 }

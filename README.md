@@ -187,7 +187,7 @@ expected validity semantics, and the complete validation command matrix.
 
 ## Web console — Mission Control dashboard
 
-`mouse_sim` includes a web-based 3D engineering console in the `web/` directory built with React 18, TypeScript, and Three.js. It acts as a **Mission Control dashboard**: a centralized control panel that combines **system monitoring** (engine/API versions, cache status, supported formats, health) with a **study launcher** (upload a part or run an analysis) in one screen. It connects to the Python API (`mouse_sim/web_api.py`) to deliver interactive model navigation, physical property inspection, and real-time visualization of analysis findings and structural overlays.
+`mouse_sim` includes a web-based 3D engineering console in the `web/` directory built with React 18, TypeScript, and Three.js. It acts as a **Mission Control dashboard**: a centralized control panel that combines **system monitoring** (engine/API versions, cache status, supported formats, health) with a **study launcher** (upload a part or run a durability test) in one screen. Three 3D rigid-body drop tests (Drop, Impact, Tumble) simulate the model falling, bouncing, and settling from real physics data, with configurable height, surface, drop count, orientation, spin, and mass — and play back the trajectory in the viewport. It connects to the Python API (`mouse_sim/web_api.py`) to deliver interactive model navigation, physical property inspection, and real-time visualization of analysis findings and structural overlays.
 
 ### Baseline boot flow
 

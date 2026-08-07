@@ -149,8 +149,7 @@ const mockResult: PipelineResult = {
       contact_compression_m: 0.0003,
       method_id: 'energy_quasi_static_v1',
       flags: [],
-      assumptions: [],
-      unsupported_failure_modes: ['fatigue'],
+      assumptions: [],      unsupported_failure_modes: ['fatigue'],
       validity: 'valid',
       load_path_stress_pa: null,
       safety_factor: 'not_available',
@@ -160,6 +159,7 @@ const mockResult: PipelineResult = {
     reason: null,
     unsupported_failure_modes: ['fatigue', 'creep'],
   },
+  drop_simulation: null,
   qualification: {
     mode: 'exploration',
     qualified: false,
@@ -186,41 +186,51 @@ describe('MissionControl dashboard', () => {
     expect(screen.getByText('shell_navier_v1')).toBeInTheDocument();
     expect(screen.getByText('on')).toBeInTheDocument();
 
-    expect(screen.getByRole('button', { name: 'Slam Impact study' })).toBeInTheDocument();
-    expect(screen.getByText(/drop or slam-to-table event/i)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Downforce study' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Drop Suite study' })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Run study' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Durability Tests' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Run Drop Test' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Run Impact Test' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Run Tumble Test' })).toBeInTheDocument();
+    expect(screen.getByText(/free-fall rigid-body simulation/i)).toBeInTheDocument();
 
     expect(screen.getAllByText('Idle').length).toBeGreaterThan(0);
     expect(screen.getByRole('button', { name: 'Upload geometry' })).toBeInTheDocument();
   });
 
-  it('prefills the draft with the selected study and closes the panel', async () => {
+  it('runs the drop test through RUN_DROP_TEST', async () => {
     const user = userEvent.setup();
-    const onClose = vi.fn();
-    let captured: ProjectState | undefined;
+    let runNonce = -1;
+    let capturedDraft: Record<string, unknown> | null | undefined;
 
-    renderPanel([], onClose, vi.fn(), (state) => {
-      captured = state;
+    renderPanel([], vi.fn(), vi.fn(), (state) => {
+      runNonce = state.runNonce;
+      capturedDraft = state.draft;
     });
+    // Without a loaded model the run buttons are disabled.
+    expect(screen.getAllByRole('button', { name: 'Run Drop Test' })[0]).toBeDisabled();
 
-    await user.click(screen.getByRole('button', { name: 'Downforce study' }));
+    // Load the baseline so the test can run.
+    renderPanel(
+      [{ type: 'LOAD_BASELINE_OK', project: mockBaselineProject, name: 'mouse_baseline' }],
+      vi.fn(),
+      vi.fn(),
+      (state) => {
+        runNonce = state.runNonce;
+        capturedDraft = state.draft;
+      },
+    );
+    expect(runNonce).toBe(0);
+    const enabledButtons = screen.getAllByRole('button', { name: 'Run Drop Test' });
+    expect(enabledButtons[enabledButtons.length - 1]).toBeEnabled();
 
-    expect(onClose).toHaveBeenCalledTimes(1);
-    expect(captured?.draft?.load_case).toEqual({
-      name: 'shell_flex',
-      kind: 'pressure',
-      magnitude: { value: 5, unit: 'kPa' },
+    await user.click(enabledButtons[enabledButtons.length - 1]);
+    expect(runNonce).toBe(1);
+    expect(capturedDraft?.drop_simulation).toMatchObject({
+      test: 'drop',
+      height_m: 0.75,
+      surface: 'concrete',
+      drop_count: 3,
     });
-    expect(captured?.draft?.structure).toEqual({
-      type: 'shell_panel',
-      a_m: 0.11,
-      b_m: 0.065,
-      t_m: 0.002,
-      material: 'ABS',
-    });
-    expect(captured?.draft?.impact).toBeNull();
+    expect(capturedDraft?.impact).toBeNull();
   });
 
   it('closes on Escape and on the close button', async () => {
@@ -235,16 +245,21 @@ describe('MissionControl dashboard', () => {
     expect(onClose).toHaveBeenCalledTimes(2);
   });
 
-  it('dispatches RUN_STUDY from the Run study action', async () => {
+  it('runs the tumble test through RUN_DROP_TEST', async () => {
     const user = userEvent.setup();
     let runNonce = -1;
 
-    renderPanel([], vi.fn(), vi.fn(), (state) => {
-      runNonce = state.runNonce;
-    });
+    renderPanel(
+      [{ type: 'LOAD_BASELINE_OK', project: mockBaselineProject, name: 'mouse_baseline' }],
+      vi.fn(),
+      vi.fn(),
+      (state) => {
+        runNonce = state.runNonce;
+      },
+    );
     expect(runNonce).toBe(0);
 
-    await user.click(screen.getByRole('button', { name: 'Run study' }));
+    await user.click(screen.getByRole('button', { name: 'Run Tumble Test' }));
     expect(runNonce).toBe(1);
   });
 

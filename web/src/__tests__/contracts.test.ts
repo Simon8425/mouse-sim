@@ -122,6 +122,7 @@ describe('contracts runtime type guards', () => {
       validation: null,
       structural: null,
       impact: null,
+  drop_simulation: null,
       qualification: null,
       manifest: null,
       errors: [],

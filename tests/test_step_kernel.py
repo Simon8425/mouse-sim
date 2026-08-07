@@ -260,7 +260,7 @@ class StepKernelPartsTests(unittest.TestCase):
     def test_asset_id_marks_parts_format_version(self):
         from mouse_sim.step_kernel import ASSET_FORMAT_VERSION, _asset_id, _settings
 
-        self.assertEqual(ASSET_FORMAT_VERSION, "parts-v6")
+        self.assertEqual(ASSET_FORMAT_VERSION, "parts-v7")
         settings = _settings("mm")
         legacy = hashlib.sha256(
             json.dumps(

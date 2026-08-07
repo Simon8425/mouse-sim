@@ -9,7 +9,6 @@ import {
   selectEvidenceCount,
   selectSolverModelBadge,
 } from '../state/selectors';
-import { STUDY_PRESETS } from '../lib/studies';
 import {
   IDENTITY_TRANSFORM,
   type PipelineResult,
@@ -52,6 +51,7 @@ const mockPipelineResult: PipelineResult = {
   validation: null,
   structural: null,
   impact: null,
+  drop_simulation: null,
   qualification: {
     mode: 'exploration',
     qualified: true,
@@ -593,29 +593,30 @@ describe('mission control store actions and selectors', () => {
     expect(state.runNonce).toBe(1);
   });
 
-  it('prefills study sections through UPDATE_DRAFT with exclusive nulls', () => {
+  it('prefills drop test configs through RUN_DROP_TEST with exclusive nulls', () => {
     let state = reducer(initialState, {
       type: 'LOAD_BASELINE_OK',
       project: mockBaselineProject,
       name: 'mouse_baseline',
     });
 
-    state = reducer(state, { type: 'UPDATE_DRAFT', patch: STUDY_PRESETS[0].patch });
-    expect(state.draft?.impact).toEqual({
-      fall_height_m: 0.75,
-      restitution: 0.3,
-      contact_stiffness_n_per_m: 100000,
+    state = reducer(state, { type: 'RUN_DROP_TEST', test: 'drop', config: { height_m: 0.75, surface: 'concrete', drop_count: 1, orientation: 'flat' } });
+    expect(state.draft?.drop_simulation).toMatchObject({
+      test: 'drop',
+      height_m: 0.75,
+      surface: 'concrete',
+      drop_count: 1,
+      orientation: 'flat',
     });
+    expect(state.draft?.impact).toBeNull();
     expect(state.draft?.load_case).toBeNull();
     expect(state.draft?.structure).toBeNull();
 
-    state = reducer(state, { type: 'UPDATE_DRAFT', patch: STUDY_PRESETS[1].patch });
-    expect(state.draft?.load_case).toEqual({ name: 'shell_flex', kind: 'pressure', magnitude: { value: 5, unit: 'kPa' } });
-    expect(state.draft?.structure).toEqual({ type: 'shell_panel', a_m: 0.11, b_m: 0.065, t_m: 0.002, material: 'ABS' });
-    expect(state.draft?.impact).toBeNull();
+    state = reducer(state, { type: 'RUN_DROP_TEST', test: 'tumble', config: { height_m: 0.75, surface: 'foam', drop_count: 2, orientation: 'random', spin_rps: 3 } });
+    expect(state.draft?.drop_simulation).toMatchObject({ test: 'tumble', spin_rps: 3, surface: 'foam' });
 
-    state = reducer(state, { type: 'UPDATE_DRAFT', patch: STUDY_PRESETS[2].patch });
-    expect(state.draft?.impact).toMatchObject({ orientation: 'face', contact_normal: [0, 0, 1] });
+    state = reducer(state, { type: 'RUN_DROP_TEST', test: 'impact', config: { height_m: 1.0, surface: 'steel', drop_count: 1, orientation: 'corner' } });
+    expect(state.draft?.drop_simulation).toMatchObject({ test: 'impact', surface: 'steel' });
   });
 
   it('counts qualification gates as reported evidence', () => {

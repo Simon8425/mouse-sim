@@ -9,10 +9,12 @@ import type { CameraPreset } from './camera';
 import type { QualityTier } from './materialPalette';
 import type { OverlaySpec } from './overlays';
 import type { ObjectSceneEntry } from './geometryFactory';
+import type { DropSimulationResult } from '../api/contracts';
 
 export interface SceneViewportHandle {
   fit: () => void;
   preset: (name: CameraPreset) => void;
+  setDropPlayback: (playing: boolean) => void;
 }
 
 export interface SceneViewportProps {
@@ -23,9 +25,11 @@ export interface SceneViewportProps {
   theme: 'light' | 'dark';
   quality: QualityTier;
   overlays: OverlaySpec | null;
+  dropSimulation?: DropSimulationResult | null;
   onPick: (id: string | null) => void;
   onDoublePick?: (id: string | null) => void;
   onStats?: (stats: RenderStats) => void;
+  onDropEnded?: () => void;
   onWebGLUnsupported?: (reason: string) => void;
 }
 
@@ -93,8 +97,8 @@ export const SceneViewport = React.forwardRef<
         quality: propsRef.current.quality,
         onPick: (id) => propsRef.current.onPick(id),
         onStats: (stats) => propsRef.current.onStats?.(stats),
-      });
-    } catch (error: unknown) {
+        onDropEnded: () => dropEndedRef.current(),
+      });    } catch (error: unknown) {
       propsRef.current.onWebGLUnsupported?.(webGLFailureReason(error));
       return;
     }
@@ -122,6 +126,37 @@ export const SceneViewport = React.forwardRef<
   React.useEffect(() => {
     runtimeRef.current?.setVisibility(props.visibility);
   }, [props.visibility]);
+
+  React.useEffect(() => {
+    runtimeRef.current?.setDropSimulation(props.dropSimulation ?? null);
+    setDropPlaying(props.dropSimulation !== null && props.dropSimulation !== undefined);
+    setDropTime(0);
+  }, [props.dropSimulation]);
+
+  const dropEndedRef = React.useRef<() => void>(() => {});
+  const handleDropEnded = React.useCallback(() => {
+    setDropPlaying(false);
+    props.onDropEnded?.();
+  }, [props.onDropEnded]);
+  dropEndedRef.current = handleDropEnded;
+
+  const [dropPlaying, setDropPlaying] = React.useState(false);
+  const [dropTime, setDropTime] = React.useState(0);
+  React.useEffect(() => {
+    if (!props.dropSimulation) return;
+    const interval = window.setInterval(() => {
+      setDropTime(runtimeRef.current?.getDropTime() ?? 0);
+    }, 100);
+    return () => window.clearInterval(interval);
+  }, [props.dropSimulation]);
+
+  const dropSimulation = props.dropSimulation;
+  const activeDrop =
+    dropSimulation && dropSimulation.drops.length > 0
+      ? dropSimulation.drops.find(
+          (drop) => dropTime >= drop.start_s && dropTime <= drop.end_s,
+        ) ?? dropSimulation.drops[dropSimulation.drops.length - 1]
+      : null;
 
   React.useEffect(() => {
     runtimeRef.current?.setSelection(props.selectedId);
@@ -152,6 +187,9 @@ export const SceneViewport = React.forwardRef<
       preset(name: CameraPreset) {
         runtimeRef.current?.preset(name);
       },
+      setDropPlayback(playing: boolean) {
+        runtimeRef.current?.setDropPlayback(playing);
+      },
     }),
     [],
   );
@@ -163,6 +201,44 @@ export const SceneViewport = React.forwardRef<
       aria-label="3D engineering viewport"
     >
       <canvas ref={canvasRef} aria-hidden="true" />
+      {dropSimulation ? (
+        <div className="drop-sim-controls" role="group" aria-label="Drop simulation playback">
+          <button
+            type="button"
+            className="btn btn--sm"
+            aria-label={dropPlaying ? 'Pause drop simulation' : 'Play drop simulation'}
+            onClick={() => {
+              const next = !dropPlaying;
+              setDropPlaying(next);
+              runtimeRef.current?.setDropPlayback(next);
+            }}
+          >
+            {dropPlaying ? 'PAUSE' : 'PLAY'}
+          </button>
+          <button
+            type="button"
+            className="btn btn--sm"
+            aria-label="Restart drop simulation"
+            onClick={() => {
+              setDropTime(0);
+              runtimeRef.current?.restartDropPlayback();
+            }}
+          >
+            RESTART
+          </button>
+          <span className="drop-sim-controls__status">
+            {activeDrop ? `Drop ${activeDrop.index + 1}/${dropSimulation.drops.length}` : 'Simulation'}
+            {' · '}
+            {dropTime.toFixed(2)}s
+            {dropSimulation.peak ? (
+              <>
+                {' · peak '}
+                {dropSimulation.peak.impact_speed_m_s.toFixed(2)} m/s
+              </>
+            ) : null}
+          </span>
+        </div>
+      ) : null}
     </div>
   );
 });

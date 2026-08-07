@@ -201,17 +201,80 @@ export interface ProjectObject {
   [key: string]: unknown;
 }
 
+export type DropTestKind = 'drop' | 'impact' | 'tumble';
+export type DropSurface = 'concrete' | 'wood' | 'foam' | 'steel';
+export type DropOrientation = 'flat' | 'edge' | 'corner' | 'random';
+
+export interface DropSimulationConfig {
+  test: DropTestKind;
+  height_m: number;
+  surface: DropSurface;
+  drop_count: number;
+  orientation: DropOrientation;
+  spin_rps?: number;
+  mass_kg?: number | null;
+}
+
+export interface DropSimulationDrop {
+  index: number;
+  start_s: number;
+  end_s: number;
+  settled_s: number;
+  impact_count: number;
+  peak_impact_speed_m_s: number;
+  peak_kinetic_energy_j: number;
+  orientation: DropOrientation;
+}
+
+export interface DropSimulationImpact {
+  drop: number;
+  t_s: number;
+  impact_speed_m_s: number;
+  kinetic_energy_j: number;
+}
+
+export type DropTrajectorySample = [
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+];
+
+export interface DropSimulationResult {
+  config: DropSimulationConfig;
+  model: {
+    mass_kg: number;
+    inertia_kg_m2: number[][];
+    support_model: string;
+    support_point_count: number;
+    integrator: string;
+    timestep_s: number;
+    gravity_m_s2: number;
+    surface: DropSurface;
+  };
+  drops: DropSimulationDrop[];
+  impacts: DropSimulationImpact[];
+  peak: DropSimulationImpact | null;
+  peak_force_estimate_n: number | null;
+  trajectory: DropTrajectorySample[];
+}
+
 export interface PipelineRequest {
   schema_id?: string;
   mode?: string;
   units?: string;
   objects?: ProjectObject[] | Record<string, unknown>;
   materials?: unknown;
-  load_case?: Record<string, unknown>;
-  structure?: Record<string, unknown>;
+  load_case?: Record<string, unknown> | null;
+  structure?: Record<string, unknown> | null;
   fixtures?: unknown;
-  impact?: Record<string, unknown>;
-  tolerance_profile?: Record<string, unknown>;
+  impact?: Record<string, unknown> | null;
+  drop_simulation?: Partial<DropSimulationConfig> | null;
+  tolerance_profile?: Record<string, unknown> | null;
   options?: Record<string, unknown>;
   [key: string]: unknown;
 }
@@ -371,6 +434,7 @@ export interface ImpactEstimate {
 }
 
 export interface ImpactSection {
+  source?: string;
   mass_kg: number | null;
   result: ImpactEstimate | null;
   reason: string | null;
@@ -409,6 +473,7 @@ export interface PipelineResult {
   validation: ValidationReport | null;
   structural: StructuralSection | null;
   impact: ImpactSection | null;
+  drop_simulation: DropSimulationResult | null;
   qualification: QualificationResult | null;
   manifest: Record<string, unknown> | null;
   errors: ErrorEntry[];

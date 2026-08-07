@@ -523,5 +523,82 @@ class PipelineRobustnessTests(unittest.TestCase):
         self.assertEqual(canonical_json(first), canonical_json(second))
 
 
+class DropSimulationPipelineTests(unittest.TestCase):
+    def _box_project(self):
+        request = mouse_project_request()
+        request["objects"] = [
+            {
+                "id": "box",
+                "material": "ABS",
+                "geometry": {
+                    "type": "box",
+                    "size": [0.1, 0.1, 0.1],
+                    "units": "m",
+                    "transform": {
+                        "rotation": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                        "translation": [0, 0, 0.05],
+                        "units": "m",
+                    },
+                },
+            }
+        ]
+        return request
+
+    def test_drop_simulation_runs_and_wires_impact_evidence(self):
+        request = self._box_project()
+        request["impact"] = None
+        request["drop_simulation"] = {
+            "test": "drop",
+            "height_m": 0.5,
+            "surface": "concrete",
+            "drop_count": 1,
+            "orientation": "flat",
+        }
+        result = run_pipeline(request)
+        self.assertEqual(result["errors"], [])
+        simulation = result["drop_simulation"]
+        self.assertIsNotNone(simulation)
+        self.assertEqual(simulation["config"]["test"], "drop")
+        self.assertEqual(len(simulation["drops"]), 1)
+        self.assertGreaterEqual(len(simulation["impacts"]), 1)
+        self.assertGreater(simulation["peak"]["impact_speed_m_s"], 2.0)
+        self.assertGreater(simulation["peak_force_estimate_n"], 0.0)
+        self.assertGreater(len(simulation["trajectory"]), 20)
+        # Impact section derived from the drop so qualification can evaluate.
+        self.assertIsNotNone(result["impact"])
+        self.assertEqual(result["impact"]["source"], "drop_simulation")
+        self.assertIsNotNone(result["impact"]["result"]["peak_force_n"])
+        # Mass properties of the analytic box are safe, so no approximation
+        # diagnostics.
+        codes = [item["code"] for item in result["issues"]]
+        self.assertNotIn("DROP_SIMULATION_MASS_ASSUMED", codes)
+        self.assertNotIn("DROP_SIMULATION_INERTIA_APPROXIMATED", codes)
+
+    def test_drop_simulation_mesh_mass_approximation_diagnostics(self):
+        request = self._box_project()
+        request["drop_simulation"] = {"height_m": 0.3}
+        result = run_pipeline(request)
+        codes = [item["code"] for item in result["issues"]]
+        self.assertNotIn("DROP_SIMULATION_FAILED", codes)
+
+    def test_drop_simulation_invalid_config_fails_cleanly(self):
+        request = self._box_project()
+        request["drop_simulation"] = {"height_m": 50.0}
+        result = run_pipeline(request)
+        self.assertIsNone(result["drop_simulation"])
+        codes = [item["code"] for item in result["issues"]]
+        self.assertIn("DROP_SIMULATION_FAILED", codes)
+        self.assertEqual(result["lifecycle_state"], "failed")
+
+    def test_drop_simulation_deterministic(self):
+        first = run_pipeline(self._box_project() | {"drop_simulation": {"height_m": 0.4}})
+        second = run_pipeline(self._box_project() | {"drop_simulation": {"height_m": 0.4}})
+        self.assertEqual(first["run_id"], second["run_id"])
+        self.assertEqual(
+            first["drop_simulation"]["trajectory"],
+            second["drop_simulation"]["trajectory"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,7 +3,7 @@ import * as THREE from 'three';
 export type QualityTier = 'high' | 'medium' | 'low';
 export type PaletteKey = 'shell' | 'pcb' | 'battery' | 'metal' | 'skate' | 'default';
 
-export const SELECTION_ACCENT = 0x26251e;
+export const SELECTION_ACCENT = 0xffffff;
 export const WARNING_ACCENT = 0x8a6d3b;
 export const BLOCKER_ACCENT = 0xb3402e;
 

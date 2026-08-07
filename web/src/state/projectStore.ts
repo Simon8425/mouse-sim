@@ -100,6 +100,18 @@ export type ProjectAction =
   | { type: 'ANALYZE_ERROR'; version: number; message: string }
   | { type: 'SET_THEME'; theme: 'light' | 'dark' }
   | { type: 'UPDATE_DRAFT'; patch: Partial<PipelineRequest> }
+  | {
+      type: 'RUN_DROP_TEST';
+      test: 'drop' | 'impact' | 'tumble';
+      config: {
+        height_m: number;
+        surface: 'concrete' | 'wood' | 'foam' | 'steel';
+        drop_count: number;
+        orientation: 'flat' | 'edge' | 'corner' | 'random';
+        spin_rps?: number;
+        mass_kg?: number | null;
+      };
+    }
   | { type: 'START_EDIT_DRAFT' }
   | { type: 'DISCARD_DRAFT' }
   | { type: 'APPLY_DRAFT' }
@@ -259,6 +271,29 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
     case 'UPDATE_DRAFT': {
       const base: PipelineRequest = state.draft ?? state.project ?? {};
       return { ...state, draft: { ...base, ...action.patch } };
+    }
+    case 'RUN_DROP_TEST': {
+      const base: PipelineRequest = state.draft ?? state.project ?? {};
+      const config: Record<string, unknown> = {
+        test: action.test,
+        height_m: action.config.height_m,
+        surface: action.config.surface,
+        drop_count: action.config.drop_count,
+        orientation: action.config.orientation,
+      };
+      if (action.config.spin_rps) config.spin_rps = action.config.spin_rps;
+      if (action.config.mass_kg && action.config.mass_kg > 0) config.mass_kg = action.config.mass_kg;
+      return {
+        ...state,
+        draft: {
+          ...base,
+          impact: null,
+          load_case: null,
+          structure: null,
+          drop_simulation: config,
+        },
+        runNonce: state.runNonce + 1,
+      };
     }
     case 'START_EDIT_DRAFT':
       return { ...state, draft: state.draft ?? { ...(state.project ?? {}) } };

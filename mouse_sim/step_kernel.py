@@ -17,13 +17,13 @@ from .geometry import TriangleMesh, geometry_from_dict
 FREECADCMD_ENV = "MOUSE_SIM_FREECADCMD"
 DEFAULT_FREECADCMD = "/Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd"
 DEFAULT_TIMEOUT = 300.0
-DEFAULT_MESH_DEFLECTION_MM = 0.5
-DEFAULT_GLB_DEFLECTION_MM = 0.10
+DEFAULT_MESH_DEFLECTION_MM = 0.3
+DEFAULT_GLB_DEFLECTION_MM = 0.06
 DEFAULT_STEP_SCALE = 0.001
 BACKEND_NAME = "freecad-occt"
 # Format marker embedded in the asset id.  Bumped whenever the worker output
 # layout changes so previously cached assets rebuild (parts export added).
-ASSET_FORMAT_VERSION = "parts-v6"
+ASSET_FORMAT_VERSION = "parts-v7"
 
 # Per-user asset directory; never a shared world-writable path.
 _PROCESS_ASSET_DIR = Path(tempfile.gettempdir()) / (

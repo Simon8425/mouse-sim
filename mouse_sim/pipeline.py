@@ -8,6 +8,7 @@ errors never raise: they are collected into the result's ``errors`` list and
 the lifecycle is marked ``failed``.
 """
 
+import math
 import traceback
 from typing import Mapping, Optional
 
@@ -94,6 +95,7 @@ def _new_result(mode):
         "validation": None,
         "structural": None,
         "impact": None,
+        "drop_simulation": None,
         "collision": {
             "status": "skipped",
             "configured": False,
@@ -768,6 +770,145 @@ def _execute(request, mode, options, result):
                 _issue("IMPACT_EVALUATION_FAILED", "error", "impact", message, evidence_blocking=True)
             )
             result["errors"].append({"code": "IMPACT_EVALUATION_FAILED", "message": message})
+
+    result["drop_simulation"] = None
+    drop_request = request.get("drop_simulation")
+    if drop_request is not None:
+        try:
+            if not isinstance(drop_request, Mapping):
+                raise ValueError("drop_simulation must be an object")
+            from . import drop_sim as drop_module
+
+            config = drop_module.validate_config(dict(drop_request))
+            mass_kg = config.get("mass_kg")
+            if mass_kg is None and result["mass"] is not None:
+                mass_kg = result["mass"].get("mass_kg")
+            assumed_mass = mass_kg is None
+            if mass_kg is None:
+                mass_kg = 0.1
+            vertices = []
+            for geometry in geometry_objs.values():
+                # Prefer world-frame vertices so assembly placements and
+                # transforms feed the support model.
+                mesh_vertices = getattr(geometry, "vertices", None)
+                world_vertices = None
+                if mesh_vertices:
+                    try:
+                        world_vertices = getattr(geometry, "_world_vertices", None)
+                    except Exception:
+                        world_vertices = None
+                    if callable(world_vertices):
+                        try:
+                            vertices.extend(world_vertices())
+                        except Exception:
+                            vertices.extend(mesh_vertices)
+                    else:
+                        vertices.extend(mesh_vertices)
+                    continue
+                try:
+                    geometry_bounds = geometry.bounds()
+                    geometry_bounds = (
+                        (geometry_bounds.minimum[0], geometry_bounds.maximum[0]),
+                        (geometry_bounds.minimum[1], geometry_bounds.maximum[1]),
+                        (geometry_bounds.minimum[2], geometry_bounds.maximum[2]),
+                    )
+                except Exception:
+                    geometry_bounds = None
+                if geometry_bounds is not None:
+                    vertices.extend(drop_module.box_corners(geometry_bounds))
+            if not vertices:
+                raise ValueError("drop simulation requires geometry")
+            bounds = [
+                (min(vertex[index] for vertex in vertices), max(vertex[index] for vertex in vertices))
+                for index in range(3)
+            ]
+            inertia = None
+            if result["mass"] is not None:
+                inertia = result["mass"].get("inertia_tensor_kg_m2")
+            if inertia is None:
+                inertia = drop_module.box_inertia(mass_kg, bounds)
+                result["issues"].append(
+                    _issue(
+                        "DROP_SIMULATION_INERTIA_APPROXIMATED",
+                        "warning",
+                        "drop_simulation",
+                        "drop simulation uses a uniform-density box inertia model",
+                    )
+                )
+            if assumed_mass:
+                result["issues"].append(
+                    _issue(
+                        "DROP_SIMULATION_MASS_ASSUMED",
+                        "warning",
+                        "drop_simulation",
+                        "drop simulation mass assumed to be 0.1 kg (mesh has no safe mass properties)",
+                    )
+                )
+            support = drop_module.support_points(vertices)
+            stiffness = float(drop_request.get("contact_stiffness_n_per_m", 1e5))
+            if not math.isfinite(stiffness) or stiffness <= 0.0:
+                raise ValueError("drop_simulation.contact_stiffness_n_per_m must be positive")
+            surface_restitution = drop_module.SURFACES[config["surface"]]["restitution"]
+            simulation = drop_module.simulate(
+                mass_kg,
+                inertia,
+                support,
+                config["height_m"],
+                surface=config["surface"],
+                drop_count=config["drop_count"],
+                test=config["test"],
+                orientation=config["orientation"],
+                spin_rps=config["spin_rps"],
+            )
+            peak = simulation["peak"]
+            peak_force = None
+            if peak is not None:
+                estimate = impact.estimate_impact(
+                    mass_kg,
+                    velocity_m_s=peak["impact_speed_m_s"],
+                    restitution=surface_restitution,
+                    contact_stiffness_n_per_m=stiffness,
+                )
+                peak_force = estimate.to_dict().get("peak_force_n")
+            result["drop_simulation"] = {
+                "config": simulation["config"],
+                "model": simulation["model"],
+                "drops": simulation["drops"],
+                "impacts": simulation["impacts"],
+                "peak": simulation["peak"],
+                "peak_force_estimate_n": peak_force,
+                "trajectory": simulation["trajectory"],
+            }
+            # Wire drop evidence into the impact section so the qualification
+            # gates evaluate the simulated drop as impact evidence.
+            impact_section = result["impact"]
+            impact_missing = impact_section is None or impact_section.get("result") is None
+            if impact_missing and peak is not None:
+                estimate = impact.estimate_impact(
+                    mass_kg,
+                    velocity_m_s=peak["impact_speed_m_s"],
+                    restitution=surface_restitution,
+                    contact_stiffness_n_per_m=stiffness,
+                )
+                result["impact"] = {
+                    "mass_kg": mass_kg,
+                    "result": estimate.to_dict(),
+                    "reason": None,
+                    "unsupported_failure_modes": list(impact.IMPACT_UNSUPPORTED_FAILURE_MODES),
+                    "source": "drop_simulation",
+                }
+        except Exception as exc:
+            message = str(exc) or "drop simulation failed"
+            result["issues"].append(
+                _issue(
+                    "DROP_SIMULATION_FAILED",
+                    "error",
+                    "drop_simulation",
+                    message,
+                    evidence_blocking=True,
+                )
+            )
+            result["errors"].append({"code": "DROP_SIMULATION_FAILED", "message": message})
 
     if result["structural"] is not None:
         qual_load_case = result["structural"]["load_case"]

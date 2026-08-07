@@ -117,10 +117,22 @@ export function App(): React.ReactElement {
   const tokenRef = React.useRef(0);
   const abortRef = React.useRef<AbortController | null>(null);
   const debounceRef = React.useRef<number | null>(null);
-  // The analysis request is memoized: createAnalysisRequest builds fresh
-  // objects each call, and stringifying the per-part geometry on every render
-  // would stall the main thread for hundreds of milliseconds.
-  const analysisRequest = React.useMemo(() => selectAnalysisRequest(state), [state]);
+  // The analysis request is memoized on the state fields the selector reads:
+  // createAnalysisRequest builds fresh objects each call, and stringifying the
+  // per-part geometry on every dispatch would stall the main thread.
+  const analysisRequest = React.useMemo(
+    () => selectAnalysisRequest(state),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [
+      state.project,
+      state.preview,
+      state.tempPreview,
+      state.draft,
+      state.mode,
+      state.objectMaterials,
+      state.partGeometry,
+    ],
+  );
   const analysisRequestRef = React.useRef(analysisRequest);
   analysisRequestRef.current = analysisRequest;
   const requestKey = React.useMemo(() => JSON.stringify(analysisRequest ?? null), [analysisRequest]);
@@ -302,6 +314,8 @@ export function App(): React.ReactElement {
               theme={state.theme}
               quality={quality}
               overlays={overlays}
+              dropSimulation={state.lastResult?.drop_simulation ?? null}
+              onDropEnded={() => viewportRef.current?.setDropPlayback?.(false)}
               onPick={(id) => {
                 dispatch({ type: 'SELECT', id });
                 // Clicking an object in the viewport is an explicit request to
