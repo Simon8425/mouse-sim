@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 
-export type QualityTier = 'high' | 'medium' | 'low';
+export type QualityTier = 'ultra' | 'high' | 'medium' | 'low';
 export type PaletteKey = 'shell' | 'pcb' | 'battery' | 'metal' | 'skate' | 'default';
 
 export const SELECTION_ACCENT = 0xffffff;

@@ -63,6 +63,8 @@ export function createOverlayLayer(
 
   const textureCache = new Map<string, THREE.CanvasTexture>();
   let planeRadius = safePlaneRadius(options.planeRadius);
+  let contactPlaneRadius = planeRadius;
+  let contactPlaneRadiusExplicit = false;
   let currentSpec: OverlaySpec | null = null;
   let appliedKey = '';
   let disposed = false;
@@ -105,7 +107,7 @@ export function createOverlayLayer(
   const apply = (spec: OverlaySpec | null): void => {
       if (disposed) return;
 
-      const nextKey = `${planeRadius}:${overlaySignature(spec)}`;
+      const nextKey = `${planeRadius}:${contactPlaneRadius}:${overlaySignature(spec)}`;
       if (nextKey === appliedKey) return;
 
       // Clear existing overlays
@@ -181,7 +183,7 @@ export function createOverlayLayer(
         if (normal) {
           const pt = new THREE.Vector3(...spec.contactPlane.point);
 
-          const geom = new THREE.PlaneGeometry(r * 2, r * 2);
+          const geom = new THREE.PlaneGeometry(contactPlaneRadius * 2, contactPlaneRadius * 2);
           const mat = new THREE.MeshBasicMaterial({
             color: WARNING_ACCENT,
             transparent: true,
@@ -237,8 +239,21 @@ export function createOverlayLayer(
     const next = safePlaneRadius(nextRadius);
     if (next === planeRadius) return;
     planeRadius = next;
+    // Keep the contact plane tracking the marker scale unless it has been
+    // pinned to the floor explicitly via setContactPlaneRadius.
+    if (!contactPlaneRadiusExplicit) contactPlaneRadius = next;
     // Reapply the last spec so all radius-dependent geometry and labels track
     // the current model bounds without requiring callers to retain the spec.
+    appliedKey = '';
+    apply(currentSpec);
+  };
+
+  const setContactPlaneRadius = (nextRadius: number): void => {
+    if (disposed) return;
+    const next = safePlaneRadius(nextRadius);
+    contactPlaneRadiusExplicit = true;
+    if (next === contactPlaneRadius) return;
+    contactPlaneRadius = next;
     appliedKey = '';
     apply(currentSpec);
   };
@@ -246,6 +261,7 @@ export function createOverlayLayer(
   return {
     apply,
     setPlaneRadius,
+    setContactPlaneRadius,
     dispose() {
       if (disposed) return;
       disposed = true;

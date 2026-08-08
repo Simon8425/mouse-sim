@@ -1,15 +1,5 @@
 import * as React from 'react';
-import { useProjectStore, type ProjectAction } from '../state/projectStore';
-import {
-  DROP_ORIENTATIONS,
-  DROP_SURFACES,
-  DROP_TESTS,
-  clampDropConfig,
-  persistedConfigForTest,
-  persistConfigForTest,
-  type DropTestConfigState,
-} from '../lib/studies';
-import type { DropOrientation, DropSurface } from '../api/contracts';
+import { useProjectStore } from '../state/projectStore';
 import {
   selectEvidenceCount,
   selectRunStatusLabel,
@@ -28,11 +18,19 @@ import type { SeverityTone } from '../lib/status';
 import { formatForce, formatLength, formatMass } from '../lib/units';
 import { formatVector3 } from '../lib/format';
 import { StatusBadge } from './StatusBadge';
+import { useDetectedQuality } from '../scene/SceneViewport';
+import type { QualityTier } from '../scene/materialPalette';
 
 export interface MissionControlProps {
   onClose: () => void;
-  onUpload: () => void;
 }
+
+const QUALITY_OPTIONS: { tier: QualityTier; label: string }[] = [
+  { tier: 'low', label: 'LOW' },
+  { tier: 'medium', label: 'MEDIUM' },
+  { tier: 'high', label: 'HIGH' },
+  { tier: 'ultra', label: 'ULTRA' },
+];
 
 function validityTone(validity: string): SeverityTone {
   switch (validity.toLowerCase()) {
@@ -90,9 +88,12 @@ function Chips({ items }: { items: string[] }): React.ReactElement {
   );
 }
 
-export function MissionControl({ onClose, onUpload }: MissionControlProps): React.ReactElement {
+export function MissionControl({ onClose }: MissionControlProps): React.ReactElement {
   const { state, dispatch } = useProjectStore();
   const panelRef = React.useRef<HTMLDivElement | null>(null);
+
+  const detectedTier = useDetectedQuality();
+  const activeTier = state.qualityTier ?? detectedTier;
 
   React.useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -113,6 +114,8 @@ export function MissionControl({ onClose, onUpload }: MissionControlProps): Reac
   const modelBadge = selectSolverModelBadge(state);
   const evidence = selectEvidenceCount(state);
   const sourceReadyLabel = selectSourceLabel(state);
+  const hasGeometry = state.project !== null || state.preview !== null;
+  const isRunning = state.runStatus === 'running';
 
   return (
     <div className="mission-control">
@@ -123,16 +126,16 @@ export function MissionControl({ onClose, onUpload }: MissionControlProps): Reac
         tabIndex={-1}
         role="dialog"
         aria-modal="true"
-        aria-label="Mission control"
+        aria-label="Settings"
       >
         <header className="mission-control__header">
           <div className="mission-control__title">
-            <h2>Mission Control</h2>
+            <h2>Settings</h2>
           </div>
           <button
             type="button"
             className="btn btn--ghost"
-            aria-label="Close control panel"
+            aria-label="Close settings panel"
             onClick={onClose}
           >
             CLOSE
@@ -222,168 +225,95 @@ export function MissionControl({ onClose, onUpload }: MissionControlProps): Reac
             </div>
           </div>
 
-          {/* CARD 2: DROP SIMULATION TESTS */}
+          {/* CARD 2: MODEL QUALITY (RENDERING ONLY) */}
           <div className="mc-card">
-            <div className="mc-card__header-row">
-              <h3 className="mc-card__heading">Durability Tests</h3>
-              <span className="mc-subtext">3D rigid-body drop simulation</span>
-            </div>
+            <h3 className="mc-card__heading">Model Quality</h3>
             <div className="mc-card__content">
-              <div className="mc-tests-grid">
-                {DROP_TESTS.map((test) => (
-                  <DropTestCard key={test.id} test={test} dispatch={dispatch} onClose={onClose} />
+              <div
+                className="settings-quality"
+                role="radiogroup"
+                aria-label="Model quality"
+              >
+                {QUALITY_OPTIONS.map((option) => (
+                  <button
+                    key={option.tier}
+                    type="button"
+                    role="radio"
+                    aria-checked={activeTier === option.tier}
+                    className={`settings-quality__option${
+                      activeTier === option.tier ? ' is-active' : ''
+                    }`}
+                    onClick={() =>
+                      dispatch({ type: 'SET_QUALITY_TIER', tier: option.tier })
+                    }
+                  >
+                    {option.label}
+                  </button>
                 ))}
               </div>
+              <p className="mc-subtext muted">
+                Affects rendering only (pixel ratio, shadows, anti-aliasing) —
+                never physics accuracy.
+              </p>
+            </div>
+            <div className="mc-group">
+              <label className="mc-label" htmlFor="mc-default-material">
+                Default Material
+              </label>
+              <select
+                id="mc-default-material"
+                className="settings-default-material"
+                value={state.defaultMaterialKey}
+                onChange={(e) =>
+                  dispatch({ type: 'SET_DEFAULT_MATERIAL', key: e.target.value })
+                }
+              >
+                {(state.materials && state.materials.length > 0
+                  ? state.materials.map((m) => m.key)
+                  : ['default']
+                ).map((key) => (
+                  <option key={key} value={key}>
+                    {key}
+                  </option>
+                ))}
+              </select>
+              <p className="mc-subtext muted">
+                Applied to every component without an explicit material. Never blocks a run.
+              </p>
+            </div>
+          </div>
 
+          {/* CARD 3: WORST-CASE POPULATION ANALYSIS */}
+          <div className="mc-card">
+            <h3 className="mc-card__heading">Worst-case population analysis</h3>
+            <div className="mc-card__content">
               <div className="mc-actions-row">
-                <button type="button" className="btn btn--sm" onClick={onUpload}>
-                  Upload geometry
+                <button
+                  type="button"
+                  className="btn btn--primary btn--sm"
+                  aria-label="Run worst-case population analysis"
+                  onClick={() => dispatch({ type: 'RUN_POPULATION' })}
+                  disabled={!hasGeometry || isRunning}
+                  title={
+                    isRunning
+                      ? 'Analysis in progress'
+                      : hasGeometry
+                        ? 'Run 10,000-unit worst-case analysis'
+                        : 'Upload a model first'
+                  }
+                >
+                  {isRunning ? 'RUNNING — may take a few minutes' : 'RUN 10,000-UNIT WORST-CASE'}
                 </button>
               </div>
+              <p className="mc-subtext muted">
+                Simulates 10,000 manufactured units with tolerance variation, usage from an esports
+                profile, and per-component failure analysis. Predicts field failure rates and the
+                weakest components. May take a few minutes.
+              </p>
             </div>
           </div>
         </div>
       </div>
-    </div>
-  );
-}
-
-interface DropTestCardProps {
-  test: (typeof DROP_TESTS)[number];
-  dispatch: React.Dispatch<ProjectAction>;
-  onClose: () => void;
-}
-
-function DropTestCard({ test, dispatch, onClose }: DropTestCardProps): React.ReactElement {
-  const { state } = useProjectStore();
-  const [config, setConfig] = React.useState<DropTestConfigState>(() =>
-    persistedConfigForTest(test),
-  );
-  const hasGeometry = state.project !== null || state.preview !== null;
-
-  const update = (patch: Partial<DropTestConfigState>) => {
-    const next = clampDropConfig({ ...config, ...patch });
-    setConfig(next);
-    persistConfigForTest(test, next);
-  };
-
-  const run = () => {
-    const finalConfig = clampDropConfig(config);
-    dispatch({
-      type: 'RUN_DROP_TEST',
-      test: test.test,
-      config: {
-        height_m: finalConfig.height_m,
-        surface: finalConfig.surface,
-        drop_count: finalConfig.drop_count,
-        orientation: finalConfig.orientation,
-        spin_rps: finalConfig.spin_rps,
-        mass_kg: finalConfig.mass_kg,
-      },
-    });
-    // Close the panel so the 3D drop animation is visible immediately.
-    onClose();
-  };
-
-  return (
-    <div className="mc-test-item">
-      <div className="mc-test-item__header">
-        <span className="mc-test-item__title">{test.title}</span>
-        <span className="mc-test-item__badge">{test.test.toUpperCase()}</span>
-      </div>
-      <p className="mc-test-item__description">{test.description}</p>
-      <div className="mc-test-item__controls">
-        <label className="mc-field">
-          <span>Drop height (m)</span>
-          <input
-            type="number"
-            min={0.02}
-            max={3}
-            step={0.05}
-            value={config.height_m}
-            aria-label={`${test.title} height`}
-            onChange={(e) => update({ height_m: Number(e.target.value) })}
-          />
-        </label>
-        <label className="mc-field">
-          <span>Drops</span>
-          <input
-            type="number"
-            min={1}
-            max={20}
-            step={1}
-            value={config.drop_count}
-            aria-label={`${test.title} drop count`}
-            onChange={(e) => update({ drop_count: Number(e.target.value) })}
-          />
-        </label>
-        <label className="mc-field">
-          <span>Surface</span>
-          <select
-            value={config.surface}
-            aria-label={`${test.title} surface`}
-            onChange={(e) => update({ surface: e.target.value as DropSurface })}
-          >
-            {DROP_SURFACES.map((surface) => (
-              <option key={surface.value} value={surface.value}>
-                {surface.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label className="mc-field">
-          <span>Orientation</span>
-          <select
-            value={config.orientation}
-            aria-label={`${test.title} orientation`}
-            onChange={(e) => update({ orientation: e.target.value as DropOrientation })}
-          >
-            {DROP_ORIENTATIONS.map((orientation) => (
-              <option key={orientation.value} value={orientation.value}>
-                {orientation.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        {test.test === 'tumble' ? (
-          <label className="mc-field">
-            <span>Spin (rev/s)</span>
-            <input
-              type="number"
-              min={0}
-              max={20}
-              step={0.5}
-              value={config.spin_rps}
-              aria-label={`${test.title} spin`}
-              onChange={(e) => update({ spin_rps: Number(e.target.value) })}
-            />
-          </label>
-        ) : null}
-        <label className="mc-field">
-          <span>Mass (kg, optional)</span>
-          <input
-            type="number"
-            min={0.01}
-            max={10}
-            step={0.01}
-            placeholder="auto"
-            value={config.mass_kg ?? ''}
-            aria-label={`${test.title} mass`}
-            onChange={(e) =>
-              update({ mass_kg: e.target.value === '' ? null : Number(e.target.value) })
-            }
-          />
-        </label>
-      </div>
-      <button
-        type="button"
-        className="btn btn--primary btn--sm"
-        onClick={run}
-        disabled={!hasGeometry}
-        title={hasGeometry ? `Run ${test.title}` : 'Upload a model first'}
-      >
-        Run {test.title}
-      </button>
     </div>
   );
 }

@@ -37,11 +37,11 @@ Every artifact is a pure function of the inputs: no timestamps, no random state 
 - Impact-specific hazards: battery crush, PCB/component shock, fracture, delamination, screw pull-out.
 - Shell: buckling, yield localization, crack propagation, snap-through, vibration fatigue. Beam: buckling, fatigue crack, joint failure, torsion buckling.
 
-**Accuracy claims require physical calibration.** No accuracy percentage is claimed for uncalibrated screening output — a "95–98% physical accuracy" statement is only possible after instrumented physical calibration of the model against measured data. Calibration is enforced structurally through correlation records: qualification runs may require correlation, and the `CORRELATION_ERROR` integrity gate fails when any recorded error fraction exceeds the configured `maximum_error_fraction` policy. Until such calibration exists, results are screening estimates labeled `exploration_only` or, at most, `qualification_pending_review`.
+**Accuracy claims require physical calibration.** No accuracy percentage is claimed for uncalibrated screening output — a "95–98% physical accuracy" statement is only possible after instrumented physical calibration of the model against measured data. Correlation is enforced in two ways: (1) `correlation_records` are administrative evidence (approved records with self-reported error fractions) — they are reviewed but are NOT verified against simulated output; (2) a `correlation.measured_drops` campaign compares the simulator's predicted peak chassis acceleration and settle time against user-supplied instrumented drop measurements (ASTM D3332-style), and the `CORRELATION_MEASURED` integrity gate fails when the per-condition error exceeds 25%, R² < 0.8, or the signed bias exceeds 10%. Until measured-drop correlation exists, results are screening estimates labeled `exploration_only` or, at most, `qualification_pending_review`.
 
 ### Qualification integrity gates
 
-In addition to the 12 readiness gates (approved method, geometry, materials, pinned load case, reviewed fixtures, tolerance profile, solver capability, convergence, force balance, correlation, active requirement, no blocking issues), qualification runs evaluate five **integrity gates** that hard-block on invalid or unsubstantiated analysis:
+In addition to the 12 readiness gates (approved method, geometry, materials, pinned load case, reviewed fixtures, tolerance profile, solver capability, convergence, force balance, correlation, active requirement, no blocking issues), qualification runs evaluate six **integrity gates** that hard-block on invalid or unsubstantiated analysis:
 
 | Gate | Meaning |
 |---|---|

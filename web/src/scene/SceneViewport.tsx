@@ -57,6 +57,44 @@ export function useDetectedQuality(): QualityTier {
   return tier;
 }
 
+/**
+ * Memoized playback buttons.  The status text next to them re-renders every
+ * 100 ms while playback runs; keeping the buttons on their own memoized
+ * subtree (stable props: the play state and stable callbacks) prevents the
+ * 100 Hz re-render churn from making the buttons unreliable to interact
+ * with under load.
+ */
+const DropPlaybackButtons = React.memo(function DropPlaybackButtons({
+  playing,
+  onTogglePlay,
+  onRestart,
+}: {
+  playing: boolean;
+  onTogglePlay: () => void;
+  onRestart: () => void;
+}) {
+  return (
+    <>
+      <button
+        type="button"
+        className="btn btn--sm"
+        aria-label={playing ? 'Pause drop simulation' : 'Play drop simulation'}
+        onClick={onTogglePlay}
+      >
+        {playing ? 'PAUSE' : 'PLAY'}
+      </button>
+      <button
+        type="button"
+        className="btn btn--sm"
+        aria-label="Restart drop simulation"
+        onClick={onRestart}
+      >
+        RESTART
+      </button>
+    </>
+  );
+});
+
 function releaseWebGLProbe(gl: WebGLRenderingContext | WebGL2RenderingContext): void {
   try {
     gl.getExtension('WEBGL_lose_context')?.loseContext();
@@ -175,6 +213,20 @@ export const SceneViewport = React.forwardRef<
     ? resolveActiveDrop(dropSimulation.drops, dropTime)
     : null;
 
+  const handleTogglePlay = React.useCallback(() => {
+    const next = !dropPlaying;
+    setDropPlaying(next);
+    runtimeRef.current?.setDropPlayback(next);
+  }, [dropPlaying]);
+
+  const handleRestart = React.useCallback(() => {
+    // The runtime restarts and resumes playing; keep the React play state in
+    // sync so the control bar shows PAUSE after a restart.
+    setDropPlaying(true);
+    setDropTime(0);
+    runtimeRef.current?.restartDropPlayback();
+  }, []);
+
   React.useEffect(() => {
     runtimeRef.current?.setSelection(props.selectedId);
   }, [props.selectedId]);
@@ -220,29 +272,11 @@ export const SceneViewport = React.forwardRef<
       <canvas ref={canvasRef} aria-hidden="true" />
       {dropSimulation ? (
         <div className="drop-sim-controls" role="group" aria-label="Drop simulation playback">
-          <button
-            type="button"
-            className="btn btn--sm"
-            aria-label={dropPlaying ? 'Pause drop simulation' : 'Play drop simulation'}
-            onClick={() => {
-              const next = !dropPlaying;
-              setDropPlaying(next);
-              runtimeRef.current?.setDropPlayback(next);
-            }}
-          >
-            {dropPlaying ? 'PAUSE' : 'PLAY'}
-          </button>
-          <button
-            type="button"
-            className="btn btn--sm"
-            aria-label="Restart drop simulation"
-            onClick={() => {
-              setDropTime(0);
-              runtimeRef.current?.restartDropPlayback();
-            }}
-          >
-            RESTART
-          </button>
+          <DropPlaybackButtons
+            playing={dropPlaying}
+            onTogglePlay={handleTogglePlay}
+            onRestart={handleRestart}
+          />
           <span className="drop-sim-controls__status">
             {activeDrop ? `Drop ${activeDrop.index + 1}/${dropSimulation.drops.length}` : 'Simulation'}
             {' · '}

@@ -104,6 +104,47 @@ export function ModelTree(): React.ReactElement {
     });
   }, [entries, deferredSearch, filterSeverity, severities]);
 
+  const defaultCount = React.useMemo(() => {
+    const assignments = state.lastResult?.material_assignments;
+    if (Array.isArray(assignments)) {
+      return assignments.filter((a) => a.source === 'default').length;
+    }
+    return filteredEntries.filter(
+      (entry) =>
+        !state.objectMaterials[entry.id] ||
+        state.objectMaterials[entry.id] === state.defaultMaterialKey,
+    ).length;
+  }, [
+    filteredEntries,
+    state.lastResult?.material_assignments,
+    state.objectMaterials,
+    state.defaultMaterialKey,
+  ]);
+
+  const listRef = React.useRef<HTMLDivElement | null>(null);
+  const rowRefs = React.useRef(new Map<string, HTMLDivElement | null>());
+
+  // Selecting a component from outside the tree is an explicit request to
+  // show it: clear any filters that would hide the row, then scroll it into
+  // view once it renders.
+  React.useEffect(() => {
+    const selectedId = state.selectedId;
+    if (!selectedId) return;
+    if (!filteredEntries.some((entry) => entry.id === selectedId)) {
+      setSearch('');
+      setFilterSeverity(null);
+    }
+  }, [state.selectedId, filteredEntries]);
+
+  React.useEffect(() => {
+    const selectedId = state.selectedId;
+    if (!selectedId) return;
+    const row = rowRefs.current.get(selectedId);
+    if (row && listRef.current?.contains(row)) {
+      row.scrollIntoView({ block: 'nearest' });
+    }
+  }, [state.selectedId, filteredEntries]);
+
   // Roving tabindex state
   const [focusedIndex, setFocusedIndex] = React.useState(0);
 
@@ -189,10 +230,17 @@ export function ModelTree(): React.ReactElement {
         </div>
       ) : null}
 
+      {defaultCount > 0 ? (
+        <div className="model-tree__default-banner" role="status" aria-live="polite">
+          <strong>{defaultCount} component(s) using Default Material</strong>
+          <span>Assign a specific material via each row's dropdown.</span>
+        </div>
+      ) : null}
+
       {filteredEntries.length === 0 ? (
         <p className="model-tree__empty muted">No matching objects found.</p>
       ) : (
-        <div className="model-tree__list" role="tree" aria-label="Model Hierarchy">
+        <div className="model-tree__list" role="tree" aria-label="Model Hierarchy" ref={listRef}>
           {state.preview?.display_asset?.parts &&
           state.preview.display_asset.parts.length > 0 &&
           state.partGeometry ? (
@@ -234,10 +282,16 @@ export function ModelTree(): React.ReactElement {
               entry.className && entry.className.toLowerCase() !== displayName.toLowerCase()
                 ? entry.className
                 : entry.geometry.type;
+            const usesDefault =
+              !state.objectMaterials[entry.id] ||
+              state.objectMaterials[entry.id] === state.defaultMaterialKey;
 
             return (
               <div
                 key={entry.id}
+                ref={(el) => {
+                  rowRefs.current.set(entry.id, el);
+                }}
                 role="treeitem"
                 tabIndex={index === focusedIndex ? 0 : -1}
                 aria-selected={isSelected}
@@ -265,6 +319,14 @@ export function ModelTree(): React.ReactElement {
                 <div className="model-row__center">
                   <div className="model-row__title-line">
                     <span className="model-row__name">{displayName}</span>
+                    {usesDefault ? (
+                      <span
+                        className="model-row__default-chip"
+                        title="Uses Default Material — assign a specific material via the dropdown"
+                      >
+                        DEFAULT
+                      </span>
+                    ) : null}
                     {state.materials && state.materials.length > 0 ? (
                       <select
                         className="model-row__material"

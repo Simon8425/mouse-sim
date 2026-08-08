@@ -27,10 +27,10 @@ from mouse_sim.materials import (
 class MaterialCatalogTests(unittest.TestCase):
     def test_builtin_catalog_contains_mouse_materials_in_si(self):
         catalog = builtin_materials()
-        self.assertEqual(len(catalog), 11)
+        self.assertEqual(len(catalog), 12)
         self.assertEqual(
             set(catalog),
-            {"ABS", "PC", "PC/ABS", "POM", "nylon", "TPU", "FR4", "LiPo", "steel", "PTFE", "magnesium/aluminum"},
+            {"ABS", "PC", "PC/ABS", "POM", "nylon", "TPU", "FR4", "LiPo", "steel", "PTFE", "magnesium/aluminum", "default"},
         )
         self.assertIn("ABS", catalog)
         self.assertIn("pc/abs", catalog)
@@ -120,6 +120,124 @@ class MaterialCatalogTests(unittest.TestCase):
         )
         with self.assertRaises(ValidationError):
             validate_material(invalid)
+
+    def test_builtin_fatigue_and_use_range_fields(self):
+        catalog = builtin_materials()
+        cases = {
+            "ABS": (14e6, 6, 233.15, 363.15),
+            "PC": (25e6, 6, 233.15, 398.15),
+            "PC/ABS": (20e6, 6, 233.15, 373.15),
+            "POM": (30e6, 6, 233.15, 363.15),
+            "nylon": (20e6, 6, 233.15, 373.15),
+            "FR4": (65e6, 10, 233.15, 403.15),
+            "default": (14e6, 6, 233.15, 363.15),
+            "steel": (220e6, 5, 233.15, 473.15),
+        }
+        for key, (fatigue, k, use_min, use_max) in cases.items():
+            properties = catalog[key].properties
+            self.assertIsNotNone(properties.fatigue_strength_at_1e6_pa, key)
+            self.assertEqual(properties.fatigue_strength_at_1e6_pa.value_si, fatigue, key)
+            self.assertEqual(properties.fatigue_exponent_k, k, key)
+            self.assertEqual(properties.continuous_use_temperature_min_k, use_min, key)
+            self.assertEqual(properties.continuous_use_temperature_max_k, use_max, key)
+            # Legacy temperature fields stay 293.15 data-validity placeholders.
+            self.assertEqual(properties.temperature_min_k, 293.15, key)
+            self.assertEqual(properties.temperature_max_k, 293.15, key)
+        for key in ("TPU", "LiPo", "PTFE", "magnesium/aluminum"):
+            properties = catalog[key].properties
+            self.assertIsNone(properties.fatigue_strength_at_1e6_pa, key)
+            self.assertIsNone(properties.fatigue_exponent_k, key)
+            self.assertIsNotNone(properties.continuous_use_temperature_min_k, key)
+
+    def test_builtin_fr4_carries_anisotropy_quartet(self):
+        definition = builtin_materials()["FR4"]
+        self.assertTrue(definition.anisotropy_supported)
+        properties = definition.properties
+        self.assertEqual(properties.young_modulus_transverse_pa.value_si, 22e9)
+        self.assertEqual(properties.young_modulus_thickness_pa.value_si, 9e9)
+        self.assertEqual(properties.shear_modulus_xy_pa.value_si, 7e9)
+        self.assertEqual(properties.shear_modulus_thickness_pa.value_si, 3.5e9)
+        self.assertEqual(properties.poissons_ratio_xy, 0.14)
+        self.assertEqual(properties.poissons_ratio_xz, 0.34)
+        validate_material(definition)
+
+    def test_anisotropy_supported_requires_quartet(self):
+        material = builtin_materials()["ABS"]
+        flagged = replace(material, anisotropy_supported=True)
+        with self.assertRaises(ValidationError) as context:
+            validate_material(flagged)
+        self.assertIn("anisotropy_supported requires", " ".join(context.exception.errors))
+        missing_e2 = replace(
+            material,
+            anisotropy_supported=True,
+            properties=replace(
+                material.properties,
+                young_modulus_transverse_pa=Quantity.from_value(22e9, "Pa"),
+                young_modulus_thickness_pa=Quantity.from_value(9e9, "Pa"),
+                poissons_ratio_xy=0.14,
+            ),
+        )
+        with self.assertRaises(ValidationError) as context:
+            validate_material(missing_e2)
+        self.assertIn("shear_modulus_xy_pa", " ".join(context.exception.errors))
+
+    def test_fatigue_pair_must_be_set_together(self):
+        material = builtin_materials()["ABS"]
+        strength_only = replace(
+            material,
+            properties=replace(
+                material.properties,
+                fatigue_strength_at_1e6_pa=Quantity.from_value(14e6, "Pa"),
+                fatigue_exponent_k=None,
+            ),
+        )
+        with self.assertRaises(ValidationError) as context:
+            validate_material(strength_only)
+        self.assertIn("must be set together", " ".join(context.exception.errors))
+        exponent_only = replace(
+            material,
+            properties=replace(
+                material.properties,
+                fatigue_strength_at_1e6_pa=None,
+                fatigue_exponent_k=6.0,
+            ),
+        )
+        with self.assertRaises(ValidationError) as context:
+            validate_material(exponent_only)
+        self.assertIn("must be set together", " ".join(context.exception.errors))
+
+    def test_weld_line_factor_range_enforced(self):
+        material = builtin_materials()["ABS"]
+        for value in (0.3, 0.9, -0.5, 1.5):
+            invalid = replace(material, properties=replace(material.properties, weld_line_factor=value))
+            with self.assertRaises(ValidationError):
+                validate_material(invalid)
+        valid = replace(material, properties=replace(material.properties, weld_line_factor=0.6))
+        validate_material(valid)
+
+    def test_new_fields_serialize_in_to_dict(self):
+        properties = builtin_materials()["FR4"].properties
+        data = properties.to_dict()
+        for field_name in (
+            "fatigue_strength_at_1e6_pa",
+            "fatigue_exponent_k",
+            "young_modulus_transverse_pa",
+            "young_modulus_thickness_pa",
+            "shear_modulus_xy_pa",
+            "shear_modulus_thickness_pa",
+            "poissons_ratio_xy",
+            "poissons_ratio_xz",
+            "weld_line_factor",
+            "continuous_use_temperature_min_k",
+            "continuous_use_temperature_max_k",
+        ):
+            self.assertIn(field_name, data)
+        self.assertEqual(data["fatigue_exponent_k"], 10)
+        self.assertEqual(data["poissons_ratio_xy"], 0.14)
+        self.assertEqual(data["young_modulus_transverse_pa"]["value_si"], 22e9)
+        definition = builtin_materials()["ABS"].to_dict()
+        self.assertIn("anisotropy_supported", definition)
+        self.assertFalse(definition["anisotropy_supported"])
 
 
 class MaterialAssignmentTests(unittest.TestCase):

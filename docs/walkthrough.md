@@ -156,7 +156,7 @@ python3 -S -m unittest discover -s tests -p 'test_*.py'
 - **Impact energy method blocked for qualification**: impact results carry
   `qualification_blocked=True`; `impact_qualification_status` requires an approved method plus
   validated evidence.
-- **Integrity gates hard-block invalid evidence**: the five integrity gates
+- **Integrity gates hard-block invalid evidence**: the six integrity gates
   (`ANALYSIS_VALIDITY`, `IMPACT_VALIDITY`, `CORRELATION_ERROR`, `REQUIREMENT_EVALUATION`,
   `CONVERGENCE_EVIDENCE`) block qualification on invalid/unsupported analysis, correlation error
   fractions beyond `maximum_error_fraction`, failing or unmeasurable structured requirement

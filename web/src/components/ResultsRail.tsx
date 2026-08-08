@@ -1,42 +1,38 @@
 /**
- * Results rail — the side panel that renders the latest pipeline result,
- * organized into tabs (overview, mass, structural, impact, qualification,
- * issues) with guarded access to each optional result section.
+ * Results rail — compact side panel for the latest pipeline result.
+ * Layout: header (run id + stale banner) → slim metric strip (Run / Validity
+ * / Evidence) → tabs (Overview, Impact, Structural, Qualification, Issues) →
+ * panel. Optional result sections render as slim 2-column key-value lists
+ * (results-rail__kv); the Mass tab is folded into Overview.
  */
-import { useState, useRef, useEffect, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import * as React from 'react';
-import type { PipelineResult, QualificationGate } from '../api/contracts';
+import type {
+  PipelineResult,
+  QualificationGate,
+  ComponentAssessment,
+  ComponentResult,
+  ComponentScreeningResult,
+  PopulationResult,
+  SensitivityEntry,
+  SensitivityLevel,
+  ShellResult,
+} from '../api/contracts';
+import { isRecord } from '../api/contracts';
 import { useProjectStore } from '../state/projectStore';
+import { selectAssumptions, selectHasStaleResult, selectUnsupportedModes } from '../state/selectors';
 import {
-  selectUnsupportedModes,
-  selectAssumptions,
-  selectHasStaleResult,
-} from '../state/selectors';
-import {
-  lifecycleLabel,
-  validityLabel,
-  dispositionLabel,
-  dispositionTone,
-  modeLabel,
-  gateStatusLabel,
-  severityTone,
-  severityLabel,
-  validityConfidenceLabel,
+  dispositionLabel, dispositionTone, gateStatusLabel, lifecycleLabel, modeLabel, severityLabel,
+  severityTone, validityConfidenceLabel, validityLabel,
 } from '../lib/status';
 import {
-  formatMass,
-  formatLength,
-  formatForce,
-  formatPressure,
-  formatEnergy,
-  formatAcceleration,
-  formatDuration,
+  formatAcceleration, formatDuration, formatEnergy, formatForce, formatLength, formatMass, formatPressure,
 } from '../lib/units';
-import { formatVector3, formatNumber } from '../lib/format';
+import { formatNumber, formatSigned, formatVector3 } from '../lib/format';
 import { StatusBadge } from './StatusBadge';
 
 /** Identifiers for the tabs rendered by the results rail. */
-type TabId = 'overview' | 'mass' | 'structural' | 'impact' | 'qualification' | 'issues';
+type TabId = 'overview' | 'impact' | 'structural' | 'qualification' | 'issues' | 'components' | 'population';
 
 /** Badge tone values supported by StatusBadge. */
 type Tone = 'ok' | 'error' | 'warn' | 'neutral';
@@ -50,19 +46,39 @@ interface IssueRow {
   affectedIds: string[];
 }
 
-const TABS: readonly TabId[] = ['overview', 'mass', 'structural', 'impact', 'qualification', 'issues'];
+/** One key-value row in a results-rail__kv list. */
+interface KvRow {
+  label: string;
+  value: ReactNode;
+}
+
+const TABS: readonly TabId[] = [
+  'overview',
+  'impact',
+  'structural',
+  'qualification',
+  'issues',
+  'components',
+  'population',
+];
 
 const TAB_LABELS: Record<TabId, string> = {
   overview: 'Overview',
-  mass: 'Mass',
-  structural: 'Structural',
   impact: 'Impact',
+  structural: 'Structural',
   qualification: 'Qualification',
   issues: 'Issues',
+  components: 'Components',
+  population: 'Population',
 };
 
-/** Shape of the project store state, derived from the store hook itself. */
+const MIN_RAIL_WIDTH = 260;
+const MAX_RAIL_WIDTH = 720;
+const DEFAULT_RAIL_WIDTH = 420;
+
+/** Shape of the project store state and dispatch, derived from the hook. */
 type ProjectState = ReturnType<typeof useProjectStore>['state'];
+type ProjectDispatch = ReturnType<typeof useProjectStore>['dispatch'];
 
 /** A titled results-rail section with an h4 heading. */
 function RailSection({ title, children }: { title: string; children: ReactNode }): JSX.Element {
@@ -79,18 +95,22 @@ function Empty({ children }: { children: ReactNode }): JSX.Element {
   return <p className="results-rail__empty muted">{children}</p>;
 }
 
-/** One compact metric in the analysis deck. Values are always result-backed. */
-function MetricCard({
-  label,
-  value,
-  detail,
-  tone = 'neutral',
-}: {
-  label: string;
-  value: ReactNode;
-  detail: string;
-  tone?: 'brand' | 'telemetry' | 'neutral';
-}): JSX.Element {
+/** Slim 2-column key-value list used across all tabs. */
+function KvList({ rows }: { rows: KvRow[] }): JSX.Element {
+  return (
+    <table className="results-rail__kv">
+      <tbody>
+        {rows.map((row) => (
+          <tr key={row.label}>
+            <th scope="row">{row.label}</th>
+            <td>{row.value}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}/** One compact metric in the analysis strip. */
+function MetricCard({ label, value, detail, tone = 'neutral' }: { label: string; value: ReactNode; detail: string; tone?: 'brand' | 'telemetry' | 'neutral' }): JSX.Element {
   return (
     <div className={`metric-card metric-card--${tone}`}>
       <span className="metric-card__label">{label}</span>
@@ -103,33 +123,9 @@ function MetricCard({
 /** Horizontal summary of run state and returned engineering evidence. */
 function MetricStrip({ result }: { result: PipelineResult }): JSX.Element {
   const disposition = result.qualification?.evidence_disposition ?? 'exploration_only';
-  const massValue =
-    result.mass === null
-      ? 'Not requested'
-      : result.mass.mass_kg === null
-        ? 'No value'
-        : formatMass(result.mass.mass_kg);
-  const structuralValue =
-    result.structural === null
-      ? 'Not requested'
-      : result.structural.response.max_stress_pa === null
-        ? 'No value'
-        : formatPressure(result.structural.response.max_stress_pa);
-  const impactValue =
-    result.impact === null
-      ? 'Not requested'
-      : result.impact.result === null
-        ? 'No estimate'
-        : formatForce(result.impact.result.peak_force_n);
-
   return (
     <div className="results-rail__metric-strip" aria-label="Analysis metrics">
-      <MetricCard
-        label="Run"
-        value={lifecycleLabel(result.lifecycle_state)}
-        detail={result.mode}
-        tone="brand"
-      />
+      <MetricCard label="Run" value={modeLabel(result.mode)} detail={lifecycleLabel(result.lifecycle_state)} tone="brand" />
       <MetricCard
         label="Validity"
         value={<StatusBadge tone={validityTone(result.validity.state)}>{validityLabel(result.validity.state)}</StatusBadge>}
@@ -141,9 +137,6 @@ function MetricStrip({ result }: { result: PipelineResult }): JSX.Element {
         value={<StatusBadge tone={dispositionTone(disposition)}>{dispositionLabel(disposition)}</StatusBadge>}
         detail={result.qualification ? 'qualification gate' : 'no qualification result'}
       />
-      <MetricCard label="Mass" value={massValue} detail="aggregate result" />
-      <MetricCard label="Structural" value={structuralValue} detail="max stress" />
-      <MetricCard label="Impact" value={impactValue} detail="peak force" />
     </div>
   );
 }
@@ -152,8 +145,7 @@ function canonicalSeverity(severity: string): string {
   return severity.toLowerCase() === 'warn' ? 'warning' : severity.toLowerCase();
 }
 
-/** Shared severity filter for the issue deck and its affected-object signals. */
-function SeverityFilter({
+/** Shared severity filter for the issues tab. */function SeverityFilter({
   result,
   value,
   onChange,
@@ -197,11 +189,11 @@ function SeverityFilter({
 
 function formatHumanLabel(text: string): string {
   if (!text) return text;
-  let cleaned = text.replace(/^UNSUPPORTED_/i, '');
-  cleaned = cleaned.replace(/_/g, ' ').toLowerCase();
+  const cleaned = text.replace(/^UNSUPPORTED_/i, '').replace(/_/g, ' ').toLowerCase();
   return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
 }
 
+/** Collapsible disclosure bar (▶ / ▼ chevron) for secondary solver data. */
 function DisclosureCard({
   title,
   count,
@@ -226,123 +218,66 @@ function DisclosureCard({
   );
 }
 
-function UnifiedUnsupportedTable({ items }: { items: string[] }): JSX.Element {
-  if (items.length === 0) {
-    return <p className="muted">None</p>;
-  }
+/** Assumption / formula lines, split on the ': ' separator. */
+function AssumptionsList({ items }: { items: string[] }): JSX.Element {
+  if (items.length === 0) return <p className="muted">None</p>;
   return (
-    <table className="dense-table">
-      <thead>
-        <tr>
-          <th style={{ width: '40%' }}>Failure Mode</th>
-          <th style={{ width: '60%' }}>Status</th>
-        </tr>
-      </thead>
-      <tbody>
-        {items.map((item) => (
-          <tr key={item}>
-            <td>
-              <code>{formatHumanLabel(item)}</code>
-            </td>
-            <td>
-              <StatusBadge tone="neutral">Disclosed (Not Simulated)</StatusBadge>
-            </td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    <ul className="disclosure-card__list">
+      {items.map((item, index) => {
+        const parts = item.split(': ');
+        const title = parts.length > 1 ? parts[0] : `Assumption ${index + 1}`;
+        const detail = parts.length > 1 ? parts.slice(1).join(': ') : item;
+        return (
+          <li key={index}>
+            <strong>{title}</strong>
+            {detail ? `: ${detail}` : ''}
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 
-function UnifiedAssumptionsTable({ items }: { items: string[] }): JSX.Element {
-  if (items.length === 0) {
-    return <p className="muted">None</p>;
-  }
+/** Badged mono list for disclosed items (unsupported modes / solver flags). */
+function DisclosedList({
+  items,
+  label = (item: string) => item,
+  badge,
+}: {
+  items: string[];
+  label?: (item: string) => string;
+  badge: ReactNode;
+}): JSX.Element {
+  if (items.length === 0) return <p className="muted">None</p>;
   return (
-    <table className="dense-table">
-      <thead>
-        <tr>
-          <th style={{ width: '35%' }}>Item</th>
-          <th style={{ width: '65%' }}>Assumption / Formula</th>
-        </tr>
-      </thead>
-      <tbody>
-        {items.map((item, index) => {
-          const parts = item.split(': ');
-          const title = parts.length > 1 ? parts[0] : `Assumption ${index + 1}`;
-          const detail = parts.length > 1 ? parts.slice(1).join(': ') : item;
-          return (
-            <tr key={index}>
-              <th scope="row">{title}</th>
-              <td>{detail}</td>
-            </tr>
-          );
-        })}
-      </tbody>
-    </table>
+    <ul className="disclosure-card__list">
+      {items.map((item) => (
+        <li key={item}>
+          <code>{label(item)}</code> {badge}
+        </li>
+      ))}
+    </ul>
   );
 }
 
-function UnifiedReactionsTable({ reactions }: { reactions: Record<string, number> }): JSX.Element {
+/** Fixture → force reaction lines. */
+function ReactionsList({ reactions }: { reactions: Record<string, number> }): JSX.Element {
   const entries = Object.entries(reactions);
-  if (entries.length === 0) {
-    return <p className="muted">None</p>;
-  }
+  if (entries.length === 0) return <p className="muted">None</p>;
   return (
-    <table className="dense-table">
-      <thead>
-        <tr>
-          <th style={{ width: '40%' }}>Fixture / Reaction</th>
-          <th style={{ width: '60%' }}>Force</th>
-        </tr>
-      </thead>
-      <tbody>
-        {entries.map(([fixture, force]) => (
-          <tr key={fixture}>
-            <td>
-              <code>{fixture}</code>
-            </td>
-            <td className="num">{formatForce(force)}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
-  );
-}
-
-function UnifiedFlagsTable({ flags }: { flags: string[] }): JSX.Element {
-  if (flags.length === 0) {
-    return <p className="muted">None</p>;
-  }
-  return (
-    <table className="dense-table">
-      <thead>
-        <tr>
-          <th style={{ width: '40%' }}>Flag Key</th>
-          <th style={{ width: '60%' }}>Status</th>
-        </tr>
-      </thead>
-      <tbody>
-        {flags.map((flag) => (
-          <tr key={flag}>
-            <td>
-              <code>{flag}</code>
-            </td>
-            <td>
-              <StatusBadge tone="warn">Active Assumption</StatusBadge>
-            </td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    <ul className="disclosure-card__list">
+      {entries.map(([fixture, force]) => (
+        <li key={fixture}>
+          <code>{fixture}</code> — {formatForce(force)}
+        </li>
+      ))}
+    </ul>
   );
 }
 
 /** Mono chip list, or a muted dash when the list is empty. */
 function Chips({ items }: { items: string[] }): JSX.Element {
-  if (items.length === 0) {
-    return <span className="muted">—</span>;
-  }
+  if (items.length === 0) return <span className="muted">—</span>;
   return (
     <span className="chips">
       {items.map((item) => (
@@ -354,36 +289,32 @@ function Chips({ items }: { items: string[] }): JSX.Element {
   );
 }
 
-/**
- * Tone for a lifecycle state: completed reads as ok, everything else as error.
- * @param lifecycleState - Raw lifecycle state from the pipeline result.
- * @returns The badge tone for that state.
- */
 function lifecycleTone(lifecycleState: string): Tone {
   return lifecycleState === 'completed' ? 'ok' : 'error';
 }
 
-/**
- * Tone for a validity state: valid → ok, invalid → error, otherwise warn.
- * @param validityState - Raw validity state string.
- * @returns The badge tone for that state.
- */
 function validityTone(validityState: string): Tone {
   if (validityState === 'valid') return 'ok';
   if (validityState === 'invalid') return 'error';
   return 'warn';
 }
 
-/**
- * Tone for a qualification gate: blockers are errors, unevaluable gates are
- * neutral, passed gates are ok, and any other gate is warn.
- * @param gate - The evaluated fields of a qualification gate.
- * @returns The badge tone for that gate.
- */
 function gateTone(gate: { passed: boolean; evaluable: boolean; blocker: boolean }): Tone {
   if (gate.blocker) return 'error';
   if (!gate.evaluable) return 'neutral';
   return gate.passed ? 'ok' : 'warn';
+}
+
+/** Rail header: eyebrow + run title. */
+function RailHeader({ runId }: { runId: string | null }): JSX.Element {
+  return (
+    <div className="results-rail__deck-header">
+      <div className="results-rail__deck-title">
+        <span className="panel-eyebrow">Results</span>
+        <strong>{runId === null ? 'Awaiting result' : `RUN ${runId.slice(0, 12)}`}</strong>
+      </div>
+    </div>
+  );
 }
 
 /**
@@ -407,10 +338,15 @@ export function ResultsRail({
     ? (state.resultsTab as TabId)
     : 'overview';
 
-  const [railWidth, setRailWidth] = useState<number>(420);
+  const [railWidth, setRailWidth] = useState<number>(DEFAULT_RAIL_WIDTH);
   const [isDragging, setIsDragging] = useState<boolean>(false);
+  const railRef = useRef<HTMLElement | null>(null);
   const dragStartXRef = useRef<number>(0);
-  const startWidthRef = useRef<number>(420);
+  const startWidthRef = useRef<number>(DEFAULT_RAIL_WIDTH);
+
+  useEffect(() => {
+    if (railRef.current) railRef.current.style.width = `${railWidth}px`;
+  }, [railWidth]);
 
   const handleMouseDown = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -423,12 +359,10 @@ export function ResultsRail({
     if (!isDragging) return;
     const handleMouseMove = (e: MouseEvent) => {
       const deltaX = dragStartXRef.current - e.clientX;
-      const newWidth = Math.min(Math.max(startWidthRef.current + deltaX, 260), 720);
+      const newWidth = Math.min(Math.max(startWidthRef.current + deltaX, MIN_RAIL_WIDTH), MAX_RAIL_WIDTH);
       setRailWidth(newWidth);
     };
-    const handleMouseUp = () => {
-      setIsDragging(false);
-    };
+    const handleMouseUp = () => setIsDragging(false);
     window.addEventListener('mousemove', handleMouseMove);
     window.addEventListener('mouseup', handleMouseUp);
     return () => {
@@ -438,7 +372,7 @@ export function ResultsRail({
   }, [isDragging]);
 
   const handleToggleExpand = () => {
-    setRailWidth((prev) => (prev > 300 ? 260 : 420));
+    setRailWidth((prev) => (prev > 300 ? MIN_RAIL_WIDTH : DEFAULT_RAIL_WIDTH));
   };
 
   const toggle = (
@@ -458,7 +392,7 @@ export function ResultsRail({
   }
 
   return (
-    <aside className="results-rail" style={{ width: `${railWidth}px` }}>
+    <aside ref={railRef} className="results-rail">
       {toggle}
       <div className="results-rail__body">
         <div
@@ -471,40 +405,16 @@ export function ResultsRail({
         </div>
         {result === null ? (
           <>
-            <div className="results-rail__deck-header">
-              <div className="results-rail__deck-title">
-                <span className="panel-eyebrow">Analysis deck</span>
-                <strong>Awaiting result</strong>
-              </div>
-              <span className="results-rail__deck-id">NO RUN</span>
-            </div>
-            <div className="results-rail__empty-container">
-              <p className="results-rail__empty muted">
-                No result yet — run an analysis to populate the deck.
-              </p>
-            </div>
+            <RailHeader runId={null} />
+            <p className="results-rail__empty muted">No result yet — run an analysis to populate the rail.</p>
           </>
         ) : (
           <>
-            <div className="results-rail__deck-header">
-              <div className="results-rail__deck-title">
-                <span className="panel-eyebrow">Analysis deck</span>
-                <strong>{state.mode === 'qualification' ? 'Qualification review' : 'Exploration study'}</strong>
-              </div>
-              <span className="results-rail__deck-id">RUN {result.run_id.slice(0, 12)}</span>
-            </div>
-            <MetricStrip result={result} />
-            {selectHasStaleResult(state) && (
+            <RailHeader runId={result.run_id} />
+            {selectHasStaleResult(state) ? (
               <div className="stale-banner">Result is stale — rerun to refresh.</div>
-            )}
-            {selectUnsupportedModes(state).length > 0 ? (
-              <details className="results-rail__disclosure">
-                <summary>Unsupported modes disclosed ({selectUnsupportedModes(state).length})</summary>
-                <ul>
-                  {selectUnsupportedModes(state).map((mode) => <li key={mode}>{mode}</li>)}
-                </ul>
-              </details>
             ) : null}
+            <MetricStrip result={result} />
             <div className="results-rail__tabs" role="tablist" aria-label="Results">
               {TABS.map((tab) => (
                 <button
@@ -519,13 +429,8 @@ export function ResultsRail({
                 </button>
               ))}
             </div>
-            <SeverityFilter
-              result={result}
-              value={state.severityFilter}
-              onChange={(severity) => dispatch({ type: 'SET_SEVERITY_FILTER', severity })}
-            />
             <div className="results-rail__panel" role="tabpanel">
-              {renderTab(activeTab, result, state)}
+              {renderTab(activeTab, result, state, dispatch)}
             </div>
           </>
         )}
@@ -539,42 +444,170 @@ export function ResultsRail({
  * @param tab - Active tab identifier.
  * @param result - Latest pipeline result (non-null here).
  * @param state - Project store state, needed by state-based selectors.
+ * @param dispatch - Project store dispatch, needed by the issues filter.
  * @returns The rendered panel content.
  */
-function renderTab(tab: TabId, result: PipelineResult, state: ProjectState): JSX.Element {
+function renderTab(
+  tab: TabId,
+  result: PipelineResult,
+  state: ProjectState,
+  dispatch: ProjectDispatch,
+): JSX.Element {
   switch (tab) {
     case 'overview':
       return renderOverview(result, state);
-    case 'mass':
-      return renderMass(result);
-    case 'structural':
-      return renderStructural(result);
     case 'impact':
       return renderImpact(result);
+    case 'structural':
+      return renderStructural(result);
     case 'qualification':
       return renderQualification(result);
     case 'issues':
-      return renderIssues(result, state);
+      return renderIssues(result, state, dispatch);
+    case 'components':
+      return renderComponents(result);
+    case 'population':
+      return renderPopulation(result);
   }
 }
 
+function shellTone(status: string): Tone {
+  switch (status.toLowerCase()) {
+    case 'pass':
+      return 'ok';
+    case 'warn':
+      return 'warn';
+    case 'fail':
+      return 'error';
+    default:
+      return 'neutral';
+  }
+}
+
+function classificationTone(classification: string): Tone {
+  switch (classification.toLowerCase()) {
+    case 'safe':
+      return 'ok';
+    case 'marginal':
+    case 'unsupported':
+      return 'warn';
+    case 'failed':
+    case 'invalid_input':
+      return 'error';
+    case 'insufficient_evidence':
+    default:
+      return 'neutral';
+  }
+}
+
+/** Capitalize the first letter of a raw backend label, keeping the rest as-is. */
+function capitalizeLabel(label: string): string {
+  if (!label) return label;
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
+/** Critical-region coordinates rounded to mm-scale precision, or '—'. */
+function formatCriticalRegion(region: number[] | null | undefined): string {
+  if (!Array.isArray(region) || region.length < 3) return '—';
+  if (!region.every((coord) => typeof coord === 'number' && Number.isFinite(coord))) return '—';
+  return `(${region.map((coord) => formatNumber(coord)).join(', ')})`;
+}
+
 /**
- * Tone for mass completeness status.
- * @param status - Mass status string.
- * @returns Badge tone matching status.
+ * Shell Validation — the authoritative engineering result. Rendered first in
+ * the Overview tab whenever the backend returned a shell block.
+ * @param shell - The shell FEA result.
+ * @param sampleCount - Population sample count, used when the shell verdict
+ *   came from a Monte Carlo sample rather than a single deterministic run.
+ * @returns The shell validation panel content.
  */
-function massStatusTone(status: string): Tone {
-  if (status === 'complete' || status === 'valid') {
-    return 'ok';
+function renderShellValidation(shell: ShellResult, sampleCount?: number): JSX.Element {
+  const classification = shell.classification;
+  const statKind = shell.statistical_confidence?.kind;
+  const statValue =
+    statKind === 'single_run'
+      ? 'Single deterministic run'
+      : statKind
+        ? `Sampling (${sampleCount !== undefined ? sampleCount.toLocaleString('en-US') : '—'}, 95% Wilson CI)`
+        : '—';
+  const stability = shell.critical_region_stability;
+  const rows: KvRow[] = [
+    {
+      label: 'Peak stress',
+      value: shell.peak_stress_pa !== null && shell.peak_stress_pa !== undefined ? formatPressure(shell.peak_stress_pa) : '—',
+    },
+    {
+      label: 'Max deformation',
+      value:
+        shell.max_displacement_m !== null && shell.max_displacement_m !== undefined
+          ? formatLength(shell.max_displacement_m)
+          : '—',
+    },
+    {
+      label: 'Minimum safety factor',
+      value:
+        shell.min_safety_factor !== null && shell.min_safety_factor !== undefined
+          ? formatNumber(shell.min_safety_factor)
+          : '—',
+    },
+    { label: 'Critical region', value: formatCriticalRegion(shell.critical_region) },
+    { label: 'Failure mode', value: shell.failure_mode || '—' },
+    {
+      label: 'Physical-model confidence',
+      value: shell.physical_model_confidence ? capitalizeLabel(shell.physical_model_confidence) : '—',
+    },
+    { label: 'Statistical confidence', value: statValue },
+  ];
+  if (shell.loading) {
+    const loading = shell.loading;
+    if (loading.drop_peak_speed_m_s !== null && loading.drop_peak_speed_m_s !== undefined) {
+      rows.push({
+        label: 'Drop peak speed',
+        value: `${formatNumber(loading.drop_peak_speed_m_s)} m/s`,
+      });
+    }
+    if (loading.drop_peak_energy_j !== null && loading.drop_peak_energy_j !== undefined) {
+      rows.push({ label: 'Drop peak energy', value: formatEnergy(loading.drop_peak_energy_j) });
+    }
+    if (loading.drop_peak_force_n !== null && loading.drop_peak_force_n !== undefined) {
+      rows.push({ label: 'Drop peak force', value: formatForce(loading.drop_peak_force_n) });
+    }
   }
-  if (status === 'partial' || status === 'mixed') {
-    return 'warn';
-  }
-  return 'neutral';
+  const assumptions = shell.assumptions ?? [];
+  const limitations = shell.limitations ?? [];
+  return (
+    <RailSection title="Shell Validation">
+      <div className="results-rail__shell-status">
+        <StatusBadge tone={shellTone(shell.status ?? 'not_evaluated')}>
+          {shell.status ?? 'not_evaluated'}
+        </StatusBadge>
+        {classification ? (
+          <StatusBadge tone={classificationTone(classification)}>{formatHumanLabel(classification)}</StatusBadge>
+        ) : null}
+      </div>
+      {stability && stability.stable === false && stability.statement ? (
+        <p className="results-rail__stability-warning">{stability.statement}</p>
+      ) : null}
+      <KvList rows={rows} />
+      <DisclosureCard title="Screening assumptions" count={assumptions.length + limitations.length}>
+        {assumptions.length > 0 ? <AssumptionsList items={assumptions} /> : null}
+        {limitations.length > 0 ? (
+          <div className="disclosure-card__limitations">
+            <span className="results-rail__subhead">Limitations</span>
+            <AssumptionsList items={limitations} />
+          </div>
+        ) : null}
+        {assumptions.length === 0 && limitations.length === 0 ? <p className="muted">None</p> : null}
+      </DisclosureCard>
+    </RailSection>
+  );
 }
 
 /**
- * Overview tab: executive summary, mode, validity, unsupported modes, assumptions, errors, and issues.
+ * Overview tab: shell validation (authoritative) first, then the run summary
+ * kv, mass mini-section, and disclosures for assumptions, unsupported modes,
+ * and errors. When no shell block was returned the overview falls back to the
+ * existing run summary — the Structural tab keeps its own section.
  * @param result - Latest pipeline result.
  * @param state - Global project state.
  * @returns The overview panel content.
@@ -583,84 +616,49 @@ function renderOverview(result: PipelineResult, state: ProjectState): JSX.Elemen
   const disposition = result.qualification?.evidence_disposition ?? 'exploration_only';
   const runId =
     result.run_id.length > 18 ? `${result.run_id.slice(0, 12)}…${result.run_id.slice(-6)}` : result.run_id;
-  const unsupported = selectUnsupportedModes(state);
   const assumptions = selectAssumptions(state);
+  const unsupported = selectUnsupportedModes(state);
   const errors = result.errors;
-  const issues = result.issues;
 
   return (
     <>
+      {result.shell ? renderShellValidation(result.shell, result.population?.sample_count) : null}
       <RailSection title="Summary">
-        <table className="dense-table">
-          <thead>
-            <tr>
-              <th style={{ width: '30%' }}>Metric</th>
-              <th style={{ width: '30%' }}>Value / Status</th>
-              <th style={{ width: '40%' }}>Description</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <th scope="row">Mode</th>
-              <td className="num-mid">{modeLabel(result.mode)}</td>
-              <td className="muted">Pipeline evaluation mode</td>
-            </tr>
-            <tr>
-              <th scope="row">Lifecycle</th>
-              <td>
-                <StatusBadge tone={lifecycleTone(result.lifecycle_state)}>
-                  {lifecycleLabel(result.lifecycle_state)}
-                </StatusBadge>
-              </td>
-              <td className="muted">Run execution state</td>
-            </tr>
-            <tr>
-              <th scope="row">Run ID</th>
-              <td className="num-mid">
-                <code>{runId}</code>
-              </td>
-              <td className="muted">Execution run identifier</td>
-            </tr>
-            <tr>
-              <th scope="row">Validity</th>
-              <td>
-                <StatusBadge tone={validityTone(result.validity.state)}>
-                  {validityLabel(result.validity.state)}
-                </StatusBadge>
-              </td>
-              <td className="muted">Overall physics validity</td>
-            </tr>
-            <tr>
-              <th scope="row">Confidence</th>
-              <td className="num-mid">{validityConfidenceLabel(result.validity.confidence)}</td>
-              <td className="muted">Confidence metric</td>
-            </tr>
-            <tr>
-              <th scope="row">Evidence disposition</th>
-              <td>
-                <StatusBadge tone={dispositionTone(disposition)}>{dispositionLabel(disposition)}</StatusBadge>
-              </td>
-              <td className="muted">Evidence fidelity level</td>
-            </tr>
-            <tr>
-              <th scope="row">Engine version</th>
-              <td className="num-mid">{result.engine_version}</td>
-              <td className="muted">Pipeline solver engine</td>
-            </tr>
-          </tbody>
-        </table>
+        <KvList
+          rows={[
+            { label: 'Mode', value: modeLabel(result.mode) },
+            { label: 'Lifecycle', value: <StatusBadge tone={lifecycleTone(result.lifecycle_state)}>{lifecycleLabel(result.lifecycle_state)}</StatusBadge> },
+            { label: 'Run ID', value: <code>{runId}</code> },
+            { label: 'Validity', value: <StatusBadge tone={validityTone(result.validity.state)}>{validityLabel(result.validity.state)}</StatusBadge> },
+            { label: 'Confidence', value: validityConfidenceLabel(result.validity.confidence) },
+            { label: 'Evidence disposition', value: <StatusBadge tone={dispositionTone(disposition)}>{dispositionLabel(disposition)}</StatusBadge> },
+            { label: 'Engine version', value: result.engine_version },
+          ]}
+        />
       </RailSection>
-
-      <DisclosureCard title="Unsupported failure modes" count={unsupported.length}>
-        <UnifiedUnsupportedTable items={unsupported} />
-      </DisclosureCard>
-
-      <DisclosureCard title="Solver assumptions" count={assumptions.length}>
-        <UnifiedAssumptionsTable items={assumptions} />
-      </DisclosureCard>
-
-      {errors.length > 0 && (
-        <DisclosureCard title="Errors" count={errors.length} defaultOpen={true}>
+      {result.mass ? (
+        <RailSection title="Mass">
+          <KvList
+            rows={[
+              { label: 'Mass', value: result.mass.mass_kg !== null ? formatMass(result.mass.mass_kg) : '—' },
+              { label: 'Center of mass', value: formatVector3(result.mass.center_of_mass_m) },
+              { label: 'Completeness', value: `${Math.round(result.mass.completeness * 100)}%` },
+            ]}
+          />
+        </RailSection>
+      ) : null}
+      {assumptions.length > 0 ? (
+        <DisclosureCard title="Solver assumptions" count={assumptions.length}>
+          <AssumptionsList items={assumptions} />
+        </DisclosureCard>
+      ) : null}
+      {unsupported.length > 0 ? (
+        <DisclosureCard title="Unsupported failure modes" count={unsupported.length}>
+          <DisclosedList items={unsupported} label={formatHumanLabel} badge={<StatusBadge tone="neutral">Disclosed (Not Simulated)</StatusBadge>} />
+        </DisclosureCard>
+      ) : null}
+      {errors.length > 0 ? (
+        <DisclosureCard title="Errors" count={errors.length} defaultOpen>
           <ul>
             {errors.map((error, index) => (
               <li key={`${error.code}-${index}`}>
@@ -669,239 +667,14 @@ function renderOverview(result: PipelineResult, state: ProjectState): JSX.Elemen
             ))}
           </ul>
         </DisclosureCard>
-      )}
-
-      {issues.length > 0 && (
-        <DisclosureCard title="Issues" count={issues.length} defaultOpen={false}>
-          <ul>
-            {issues.map((issue, index) => (
-              <li key={`${issue.code}-${index}`}>
-                <StatusBadge tone={severityTone(issue.severity)}>{severityLabel(issue.severity)}</StatusBadge>{' '}
-                <code>{issue.category}</code> — {issue.message}
-              </li>
-            ))}
-          </ul>
-        </DisclosureCard>
-      )}
+      ) : null}
     </>
   );
 }
 
 /**
- * Mass tab: aggregate mass summary and the per-object breakdown table.
- * @param result - Latest pipeline result.
- * @returns The mass panel content.
- */
-function renderMass(result: PipelineResult): JSX.Element {
-  if (result.mass === null) {
-    return <Empty>No mass analysis was requested.</Empty>;
-  }
-  const mass = result.mass;
-  return (
-    <>
-      <RailSection title="Mass Summary">
-        <table className="dense-table">
-          <thead>
-            <tr>
-              <th style={{ width: '30%' }}>Metric</th>
-              <th style={{ width: '30%' }}>Value</th>
-              <th style={{ width: '40%' }}>Description</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <th scope="row">Mass</th>
-              <td className="num-mid">{mass.mass_kg !== null ? formatMass(mass.mass_kg) : '—'}</td>
-              <td className="muted">Total mouse assembly weight</td>
-            </tr>
-            <tr>
-              <th scope="row">Status</th>
-              <td className="num-mid">
-                <StatusBadge tone={massStatusTone(mass.mass_status)}>{mass.mass_status}</StatusBadge>
-              </td>
-              <td className="muted">Mass computation fidelity</td>
-            </tr>
-            <tr>
-              <th scope="row">Center of mass</th>
-              <td className="num-mid">{formatVector3(mass.center_of_mass_m)}</td>
-              <td className="muted">Center of gravity coordinates</td>
-            </tr>
-            <tr>
-              <th scope="row">Uncertainty</th>
-              <td className="num-mid">{mass.uncertainty_kg !== null ? formatMass(mass.uncertainty_kg) : '—'}</td>
-              <td className="muted">Estimated mass tolerance</td>
-            </tr>
-            <tr>
-              <th scope="row">Completeness</th>
-              <td className="num-mid">{`${Math.round(mass.completeness * 100)}%`}</td>
-              <td className="muted">Geometry completeness ratio</td>
-            </tr>
-          </tbody>
-        </table>
-      </RailSection>
-
-      <RailSection title="Objects">
-        <table className="dense-table">
-          <thead>
-            <tr>
-              <th style={{ width: '22%' }}>Object</th>
-              <th style={{ width: '18%' }} className="num-mid">Mass</th>
-              <th style={{ width: '18%' }} className="num-mid">Volume</th>
-              <th style={{ width: '14%' }}>Status</th>
-              <th style={{ width: '14%' }}>Source</th>
-              <th style={{ width: '14%' }}>Review</th>
-            </tr>
-          </thead>
-          <tbody>
-            {mass.objects.map((obj) => (
-              <tr key={obj.object_id}>
-                <td>
-                  <code>{obj.object_id}</code>
-                </td>
-                <td className="num-mid">{obj.mass_kg !== null ? formatMass(obj.mass_kg) : '—'}</td>
-                <td className="num-mid">{obj.volume_m3 !== null ? `${formatNumber(obj.volume_m3)} m³` : '—'}</td>
-                <td>{obj.mass_status}</td>
-                <td>{obj.source_status}</td>
-                <td>{obj.review_status}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </RailSection>
-    </>
-  );
-}
-
-/**
- * Structural tab: solver response, displacements, stresses, reactions, flags, assumptions, unsupported modes, and preflight checks.
- * @param result - Latest pipeline result.
- * @returns The structural panel content.
- */
-function renderStructural(result: PipelineResult): JSX.Element {
-  if (result.structural === null) {
-    return <Empty>No structural evaluation was requested.</Empty>;
-  }
-  const response = result.structural.response;
-  if (response === null) {
-    return <Empty>No structural response was produced.</Empty>;
-  }
-  const preflight = result.structural.preflight ?? [];
-
-  return (
-    <>
-      <RailSection title="Structural Response">
-        <table className="dense-table">
-          <thead>
-            <tr>
-              <th style={{ width: '30%' }}>Metric</th>
-              <th style={{ width: '30%' }}>Value</th>
-              <th style={{ width: '40%' }}>Description</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <th scope="row">Method</th>
-              <td className="num-mid"><code>{response.method_id}</code></td>
-              <td className="muted">Structural FEA method</td>
-            </tr>
-            <tr>
-              <th scope="row">Validity</th>
-              <td>
-                <StatusBadge tone={validityTone(response.validity)}>{validityLabel(response.validity)}</StatusBadge>
-              </td>
-              <td className="muted">FEA convergence status</td>
-            </tr>
-            <tr>
-              <th scope="row">Max displacement</th>
-              <td className="num-mid">{response.max_displacement_m !== null ? formatLength(response.max_displacement_m) : '—'}</td>
-              <td className="muted">Shell deflection under hand load</td>
-            </tr>
-            <tr>
-              <th scope="row">Displacement location</th>
-              <td className="num-mid">{formatVector3(response.max_displacement_location)}</td>
-              <td className="muted">Peak displacement location</td>
-            </tr>
-            <tr>
-              <th scope="row">Max stress</th>
-              <td className="num-mid">{response.max_stress_pa !== null ? formatPressure(response.max_stress_pa) : '—'}</td>
-              <td className="muted">Peak von Mises stress</td>
-            </tr>
-            <tr>
-              <th scope="row">Filtered stress</th>
-              <td className="num-mid">{response.max_stress_filtered_pa !== null ? formatPressure(response.max_stress_filtered_pa) : '—'}</td>
-              <td className="muted">Singularity-filtered stress</td>
-            </tr>
-            <tr>
-              <th scope="row">Filtered location</th>
-              <td className="num-mid">{formatVector3(response.filtered_location)}</td>
-              <td className="muted">Filtered peak stress location</td>
-            </tr>
-            <tr>
-              <th scope="row">Safety factor</th>
-              <td className="num-mid">
-                {response.safety_factor !== null ? formatNumber(response.safety_factor) : (response.safety_factor_status ?? '—')}
-              </td>
-              <td className="muted">Structural safety factor</td>
-            </tr>
-            <tr>
-              <th scope="row">Force residual</th>
-              <td className="num-mid">{response.force_residual_n !== null ? formatForce(response.force_residual_n) : '—'}</td>
-              <td className="muted">Equilibrium force residual</td>
-            </tr>
-            <tr>
-              <th scope="row">Moment residual</th>
-              <td className="num-mid">
-                {response.moment_residual_n_m !== null ? `${formatNumber(response.moment_residual_n_m)} N·m` : '—'}
-              </td>
-              <td className="muted">Equilibrium moment residual</td>
-            </tr>
-          </tbody>
-        </table>
-      </RailSection>
-      <DisclosureCard title="Reactions" count={Object.keys(response.reactions).length}>
-        <UnifiedReactionsTable reactions={response.reactions} />
-      </DisclosureCard>
-      <DisclosureCard title="Flags" count={response.flags.length}>
-        <UnifiedFlagsTable flags={response.flags} />
-      </DisclosureCard>
-      <DisclosureCard title="Solver assumptions" count={response.assumptions.length}>
-        <UnifiedAssumptionsTable items={response.assumptions} />
-      </DisclosureCard>
-      <DisclosureCard title="Unsupported failure modes" count={response.unsupported_failure_modes.length}>
-        <UnifiedUnsupportedTable items={response.unsupported_failure_modes} />
-      </DisclosureCard>
-      {preflight.length > 0 && (
-        <DisclosureCard title="Preflight checks" count={preflight.length}>
-          <table className="dense-table">
-            <thead>
-              <tr>
-                <th style={{ width: '30%' }}>Code</th>
-                <th style={{ width: '30%' }}>Severity</th>
-                <th style={{ width: '40%' }}>Message</th>
-              </tr>
-            </thead>
-            <tbody>
-              {preflight.map((item, index) => (
-                <tr key={`${item.code}-${index}`}>
-                  <td>
-                    <code>{item.code}</code>
-                  </td>
-                  <td>
-                    <StatusBadge tone={severityTone(item.severity)}>{severityLabel(item.severity)}</StatusBadge>
-                  </td>
-                  <td className="muted">{item.message}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </DisclosureCard>
-      )}
-    </>
-  );
-}
-
-/**
- * Impact tab: contact estimate summary, assumptions, and unsupported modes.
+ * Impact tab: drop simulation table when present, plus the quasi-static
+ * impact estimate kv and its assumptions disclosure.
  * @param result - Latest pipeline result.
  * @returns The impact panel content.
  */
@@ -915,13 +688,10 @@ function renderImpact(result: PipelineResult): JSX.Element {
     <>
       {simulation ? (
         <RailSection title="Drop Simulation">
-          <p className="muted" style={{ fontSize: '11px' }}>
+          <p className="results-rail__config-line">
             3D rigid-body simulation · {simulation.config.test} test ·{' '}
             {simulation.config.height_m.toFixed(2)} m · {simulation.config.surface} ·{' '}
             {simulation.config.drop_count} drop(s) · {simulation.config.orientation} orientation
-            {simulation.model.support_model === 'mesh_extreme_points'
-              ? ` · ${simulation.model.support_point_count} support points`
-              : ''}
           </p>
           <table className="dense-table">
             <thead>
@@ -946,9 +716,8 @@ function renderImpact(result: PipelineResult): JSX.Element {
             </tbody>
           </table>
           {simulation.peak ? (
-            <p className="muted" style={{ fontSize: '11px' }}>
-              Worst impact: {simulation.peak.impact_speed_m_s.toFixed(2)} m/s at{' '}
-              {simulation.peak.t_s.toFixed(2)} s
+            <p className="results-rail__worst-impact">
+              Worst impact: {simulation.peak.impact_speed_m_s.toFixed(2)} m/s at {simulation.peak.t_s.toFixed(2)} s
               {simulation.peak_force_estimate_n
                 ? ` · estimated peak force ${formatForce(simulation.peak_force_estimate_n)}`
                 : ''}
@@ -958,124 +727,118 @@ function renderImpact(result: PipelineResult): JSX.Element {
       ) : null}
       {estimate ? (
         <RailSection title="Impact Estimate">
-          <table className="dense-table">
-            <thead>
-              <tr>
-                <th style={{ width: '30%' }}>Metric</th>
-                <th style={{ width: '30%' }}>Value</th>
-                <th style={{ width: '40%' }}>Description</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <th scope="row">Closing velocity</th>
-                <td className="num-mid">{formatNumber(estimate.closing_velocity_m_s)} m/s</td>
-                <td className="muted">Free fall impact velocity</td>
-              </tr>
-              <tr>
-                <th scope="row">Impact energy</th>
-                <td className="num-mid">{formatEnergy(estimate.impact_energy_j)}</td>
-                <td className="muted">Quasi-static impact kinetic energy</td>
-              </tr>
-              <tr>
-                <th scope="row">Effective mass</th>
-                <td className="num-mid">{formatMass(estimate.effective_mass_kg)}</td>
-                <td className="muted">Effective falling assembly mass</td>
-              </tr>
-              <tr>
-                <th scope="row">Impulse</th>
-                <td className="num-mid">{formatNumber(estimate.impulse_n_s)} N·s</td>
-                <td className="muted">Total impact momentum change</td>
-              </tr>
-              <tr>
-                <th scope="row">Peak force</th>
-                <td className="num-mid">{formatForce(estimate.peak_force_n)}</td>
-                <td className="muted">Peak contact force</td>
-              </tr>
-              <tr>
-                <th scope="row">Peak acceleration</th>
-                <td className="num-mid">{formatNumber(estimate.peak_acceleration_m_s2)} m/s²</td>
-                <td className="muted">Peak deceleration at impact</td>
-              </tr>
-              <tr>
-                <th scope="row">Contact duration</th>
-                <td className="num-mid">{formatNumber(estimate.contact_duration_s)} s</td>
-                <td className="muted">Impulse contact duration</td>
-              </tr>
-              <tr>
-                <th scope="row">Contact compression</th>
-                <td className="num-mid">{formatLength(estimate.contact_compression_m)}</td>
-                <td className="muted">Peak bumper deformation</td>
-              </tr>
-              <tr>
-                <th scope="row">Validity</th>
-                <td>
-                  <StatusBadge tone={validityTone(estimate.validity)}>{validityLabel(estimate.validity)}</StatusBadge>
-                </td>
-                <td className="muted">Impact solver validity state</td>
-              </tr>
-              <tr>
-                <th scope="row">Qualification blocked</th>
-                <td className="num-mid">{estimate.qualification_blocked ? 'yes' : 'no'}</td>
-                <td className="muted">Impact qualification gate blocker</td>
-              </tr>
-              <tr>
-                <th scope="row">Safety factor</th>
-                <td className="num-mid">
-                  {typeof estimate.safety_factor === 'number' ? formatNumber(estimate.safety_factor) : estimate.safety_factor}
-                </td>
-                <td className="muted">Impact safety factor limit</td>
-              </tr>
-            </tbody>
-          </table>
+          <KvList
+            rows={[
+              { label: 'Closing velocity', value: `${formatNumber(estimate.closing_velocity_m_s)} m/s` },
+              { label: 'Impact energy', value: formatEnergy(estimate.impact_energy_j) },
+              { label: 'Effective mass', value: formatMass(estimate.effective_mass_kg) },
+              { label: 'Impulse', value: `${formatNumber(estimate.impulse_n_s)} N·s` },
+              { label: 'Peak force', value: formatForce(estimate.peak_force_n) },
+              { label: 'Peak acceleration', value: `${formatNumber(estimate.peak_acceleration_m_s2)} m/s²` },
+              { label: 'Contact duration', value: `${formatNumber(estimate.contact_duration_s)} s` },
+              { label: 'Contact compression', value: formatLength(estimate.contact_compression_m) },
+              { label: 'Validity', value: <StatusBadge tone={validityTone(estimate.validity)}>{validityLabel(estimate.validity)}</StatusBadge> },
+              { label: 'Safety factor', value: typeof estimate.safety_factor === 'number' ? formatNumber(estimate.safety_factor) : estimate.safety_factor },
+            ]}
+          />
         </RailSection>
       ) : null}
-      {estimate && estimate.flags.includes('CONTACT_PATCH_ASSUMPTION') ? (
-        <p className="results-rail__note muted">Energy-based quasi-static estimate; local contact stress not resolved.</p>
-      ) : null}
-      {estimate ? (
+      {estimate && estimate.assumptions.length > 0 ? (
         <DisclosureCard title="Solver assumptions" count={estimate.assumptions.length}>
-          <UnifiedAssumptionsTable items={estimate.assumptions} />
-        </DisclosureCard>
-      ) : null}
-      {estimate ? (
-        <DisclosureCard title="Unsupported failure modes" count={estimate.unsupported_failure_modes.length}>
-          <UnifiedUnsupportedTable items={estimate.unsupported_failure_modes} />
+          <AssumptionsList items={estimate.assumptions} />
         </DisclosureCard>
       ) : null}
     </>
   );
 }
 
+/**
+ * Structural tab: solver response kv, plus disclosures for reactions, flags,
+ * and assumptions.
+ * @param result - Latest pipeline result.
+ * @returns The structural panel content.
+ */
+function renderStructural(result: PipelineResult): JSX.Element {
+  if (result.structural === null) {
+    return <Empty>No structural evaluation was requested.</Empty>;
+  }
+  const response = result.structural.response;
+  if (response === null) {
+    return <Empty>No structural response was produced.</Empty>;
+  }
+  const maxDisplacement =
+    response.max_displacement_m !== null
+      ? response.max_displacement_location !== null
+        ? `${formatLength(response.max_displacement_m)} at ${formatVector3(response.max_displacement_location)}`
+        : formatLength(response.max_displacement_m)
+      : '—';
+  const residuals =
+    response.force_residual_n !== null || response.moment_residual_n_m !== null
+      ? `${response.force_residual_n !== null ? formatForce(response.force_residual_n) : '—'} / ${
+          response.moment_residual_n_m !== null ? `${formatNumber(response.moment_residual_n_m)} N·m` : '—'
+        }`
+      : '—';
+
+  return (
+    <>
+      <RailSection title="Structural Response">
+        <KvList
+          rows={[
+            { label: 'Method', value: <code>{response.method_id}</code> },
+            { label: 'Validity', value: <StatusBadge tone={validityTone(response.validity)}>{validityLabel(response.validity)}</StatusBadge> },
+            { label: 'Max displacement', value: maxDisplacement },
+            { label: 'Max stress', value: response.max_stress_pa !== null ? formatPressure(response.max_stress_pa) : '—' },
+            { label: 'Filtered stress', value: response.max_stress_filtered_pa !== null ? formatPressure(response.max_stress_filtered_pa) : '—' },
+            { label: 'Safety factor', value: response.safety_factor !== null ? formatNumber(response.safety_factor) : response.safety_factor_status ?? '—' },
+            { label: 'Residuals', value: residuals },
+          ]}
+        />
+      </RailSection>
+      {Object.keys(response.reactions).length > 0 ? (
+        <DisclosureCard title="Reactions" count={Object.keys(response.reactions).length}>
+          <ReactionsList reactions={response.reactions} />
+        </DisclosureCard>
+      ) : null}
+      {response.flags.length > 0 ? (
+        <DisclosureCard title="Flags" count={response.flags.length}>
+          <DisclosedList items={response.flags} badge={<StatusBadge tone="warn">Active Assumption</StatusBadge>} />
+        </DisclosureCard>
+      ) : null}
+      {response.assumptions.length > 0 ? (
+        <DisclosureCard title="Solver assumptions" count={response.assumptions.length}>
+          <AssumptionsList items={response.assumptions} />
+        </DisclosureCard>
+      ) : null}
+    </>
+  );
+}
+
+/** Qualification gate checks table: Key | Status | Gate & Explanation. */
 function renderGateTable(gates: QualificationGate[]): JSX.Element {
   if (gates.length === 0) {
-    return <p className="muted" style={{ padding: '4px 0' }}>No gate checks assigned to this study.</p>;
+    return <p className="muted">No gate checks assigned to this study.</p>;
   }
   return (
     <table className="dense-table">
       <thead>
         <tr>
-          <th style={{ width: '22%' }}>Key</th>
-          <th style={{ width: '20%', textAlign: 'center' }}>Status</th>
-          <th style={{ width: '58%' }}>Gate & Explanation</th>
+          <th className="results-rail__gate-key">Key</th>
+          <th className="results-rail__gate-status">Status</th>
+          <th>Gate &amp; Explanation</th>
         </tr>
       </thead>
       <tbody>
         {gates.map((gate) => (
           <tr key={gate.key}>
-            <td>
-              <code>{gate.key}</code>
-            </td>
-            <td style={{ textAlign: 'center' }}>
+            <td><code>{gate.key}</code></td>
+            <td className="results-rail__gate-status-cell">
               <StatusBadge tone={gateTone(gate)}>
                 {gateStatusLabel({ passed: gate.passed, evaluable: gate.evaluable, blocker: gate.blocker })}
               </StatusBadge>
             </td>
             <td>
-              <strong style={{ color: 'var(--text-primary)' }}>{gate.label}</strong>
-              {gate.explanation ? (
-                <span className="muted" style={{ marginLeft: '6px' }}>— {gate.explanation}</span>
-              ) : null}
+              <strong className="gate-label">{gate.label}</strong>
+              {gate.explanation ? <span className="gate-explanation muted">— {gate.explanation}</span> : null}
             </td>
           </tr>
         ))}
@@ -1084,9 +847,39 @@ function renderGateTable(gates: QualificationGate[]): JSX.Element {
   );
 }
 
+/** One qualification study card: preview metric kv + gate checks. */
+function StudyCard({
+  badge,
+  title,
+  metrics,
+  gates,
+}: {
+  badge: string;
+  title: string;
+  metrics: KvRow[];
+  gates: QualificationGate[];
+}): JSX.Element {
+  return (
+    <div className="qualification-study-card">
+      <div className="qualification-study-card__header">
+        <div className="qualification-study-card__title">
+          <span className="qualification-study-card__badge">{badge}</span>
+          <span>{title}</span>
+        </div>
+      </div>
+      <div className="qualification-study-card__subhead">Preview Metrics</div>
+      <KvList rows={metrics} />
+      <div className="qualification-study-card__subhead">Gate Checks</div>
+      {renderGateTable(gates)}
+    </div>
+  );
+}
+
 /**
- * Qualification tab: divided into 3 study sections (Slam Impact, Downforce, Drop Suite)
- * with values aligned in the middle column and explanations on the right side.
+ * Qualification tab: overall status kv, then the three study cards
+ * (Slam Impact, Downforce, Drop Suite) with their gate tables.
+ * @param result - Latest pipeline result.
+ * @returns The qualification panel content.
  */
 function renderQualification(result: PipelineResult): JSX.Element {
   if (result.qualification === null) {
@@ -1108,183 +901,75 @@ function renderQualification(result: PipelineResult): JSX.Element {
   return (
     <>
       <RailSection title="Qualification Overview">
-        <table className="dense-table">
-          <thead>
-            <tr>
-              <th style={{ width: '25%' }}>Metric</th>
-              <th style={{ width: '25%' }}>Status / Value</th>
-              <th style={{ width: '50%' }}>Description</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <th scope="row">Overall Status</th>
-              <td>
+        <KvList
+          rows={[
+            {
+              label: 'Overall Status',
+              value: (
                 <StatusBadge tone={qualification.qualified ? 'ok' : 'error'}>
                   {qualification.qualified ? 'qualified' : 'not qualified'}
                 </StatusBadge>
-              </td>
-              <td className="muted">Overall gate pass criteria</td>
-            </tr>
-            <tr>
-              <th scope="row">Evidence Disposition</th>
-              <td>
+              ),
+            },
+            {
+              label: 'Evidence disposition',
+              value: (
                 <StatusBadge tone={dispositionTone(qualification.evidence_disposition)}>
                   {dispositionLabel(qualification.evidence_disposition)}
                 </StatusBadge>
-              </td>
-              <td className="muted">Fidelity evidence level</td>
-            </tr>
-            <tr>
-              <th scope="row">Blocking Keys</th>
-              <td>
-                <Chips items={qualification.blocking_keys} />
-              </td>
-              <td className="muted">Critical gate blockers</td>
-            </tr>
-          </tbody>
-        </table>
+              ),
+            },
+            { label: 'Blocking keys', value: <Chips items={qualification.blocking_keys} /> },
+          ]}
+        />
       </RailSection>
-
-      {/* STUDY 1: SLAM IMPACT */}
-      <div className="qualification-study-card">
-        <div className="qualification-study-card__header">
-          <div className="qualification-study-card__title">
-            <span className="qualification-study-card__badge">STUDY 01</span>
-            <span>Slam Impact (Drop Contact)</span>
-          </div>
-        </div>
-        <div className="qualification-study-card__subhead">Preview Metrics</div>
-        <table className="dense-table" style={{ marginBottom: '12px' }}>
-          <thead>
-            <tr>
-              <th style={{ width: '25%' }}>Metric</th>
-              <th style={{ width: '25%' }}>Value</th>
-              <th style={{ width: '50%' }}>Description</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <th scope="row">Peak Acceleration</th>
-              <td className="num-mid">{impact ? formatAcceleration(impact.peak_acceleration_m_s2) : '—'}</td>
-              <td className="muted">Drop deceleration peak</td>
-            </tr>
-            <tr>
-              <th scope="row">Peak Force</th>
-              <td className="num-mid">{impact ? formatForce(impact.peak_force_n) : '—'}</td>
-              <td className="muted">Contact impact load</td>
-            </tr>
-            <tr>
-              <th scope="row">Impact Energy</th>
-              <td className="num-mid">{impact ? formatEnergy(impact.impact_energy_j) : '—'}</td>
-              <td className="muted">Impact kinetic energy</td>
-            </tr>
-            <tr>
-              <th scope="row">Contact Duration</th>
-              <td className="num-mid">{impact ? formatDuration(impact.contact_duration_s) : '—'}</td>
-              <td className="muted">Impact duration window</td>
-            </tr>
-          </tbody>
-        </table>
-        <div className="qualification-study-card__subhead">Gate Checks</div>
-        {renderGateTable(slamGates)}
-      </div>
-
-      {/* STUDY 2: DOWNFORCE */}
-      <div className="qualification-study-card">
-        <div className="qualification-study-card__header">
-          <div className="qualification-study-card__title">
-            <span className="qualification-study-card__badge">STUDY 02</span>
-            <span>Downforce (Hand Load Flex)</span>
-          </div>
-        </div>
-        <div className="qualification-study-card__subhead">Preview Metrics</div>
-        <table className="dense-table" style={{ marginBottom: '12px' }}>
-          <thead>
-            <tr>
-              <th style={{ width: '25%' }}>Metric</th>
-              <th style={{ width: '25%' }}>Value</th>
-              <th style={{ width: '50%' }}>Description</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <th scope="row">Max Displacement</th>
-              <td className="num-mid">{structural ? formatLength(structural.max_displacement_m) : '—'}</td>
-              <td className="muted">Shell deflection under hand load</td>
-            </tr>
-            <tr>
-              <th scope="row">Max Stress</th>
-              <td className="num-mid">{structural ? formatPressure(structural.max_stress_pa) : '—'}</td>
-              <td className="muted">Peak von Mises stress</td>
-            </tr>
-            <tr>
-              <th scope="row">Safety Factor</th>
-              <td className="num-mid">
-                {structural?.safety_factor !== null && structural?.safety_factor !== undefined
-                  ? formatNumber(structural.safety_factor)
-                  : '—'}
-              </td>
-              <td className="muted">Structural safety margin</td>
-            </tr>
-            <tr>
-              <th scope="row">Response Validity</th>
-              <td className="num-mid">{structural ? structural.validity : '—'}</td>
-              <td className="muted">FEA solver convergence state</td>
-            </tr>
-          </tbody>
-        </table>
-        <div className="qualification-study-card__subhead">Gate Checks</div>
-        {renderGateTable(downforceGates)}
-      </div>
-
-      {/* STUDY 3: DROP SUITE */}
-      <div className="qualification-study-card">
-        <div className="qualification-study-card__header">
-          <div className="qualification-study-card__title">
-            <span className="qualification-study-card__badge">STUDY 03</span>
-            <span>Drop Suite (Multi-Axis & Budget Sweep)</span>
-          </div>
-        </div>
-        <div className="qualification-study-card__subhead">Preview Metrics</div>
-        <table className="dense-table" style={{ marginBottom: '12px' }}>
-          <thead>
-            <tr>
-              <th style={{ width: '25%' }}>Metric</th>
-              <th style={{ width: '25%' }}>Value</th>
-              <th style={{ width: '50%' }}>Description</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <th scope="row">Total Mass</th>
-              <td className="num-mid">{result.mass ? formatMass(result.mass.mass_kg) : '—'}</td>
-              <td className="muted">Total mouse assembly weight</td>
-            </tr>
-            <tr>
-              <th scope="row">Center of Mass</th>
-              <td className="num-mid">{result.mass ? formatVector3(result.mass.center_of_mass_m) : '—'}</td>
-              <td className="muted">Center of gravity coordinates</td>
-            </tr>
-            <tr>
-              <th scope="row">Completeness</th>
-              <td className="num-mid">{result.mass ? `${Math.round(result.mass.completeness * 100)}%` : '—'}</td>
-              <td className="muted">Geometry mass completeness</td>
-            </tr>
-          </tbody>
-        </table>
-        <div className="qualification-study-card__subhead">Gate Checks</div>
-        {renderGateTable(remainingGates)}
-      </div>
+      <StudyCard
+        badge="STUDY 01"
+        title="Slam Impact (Drop Contact)"
+        metrics={[
+          { label: 'Peak Acceleration', value: impact ? formatAcceleration(impact.peak_acceleration_m_s2) : '—' },
+          { label: 'Peak Force', value: impact ? formatForce(impact.peak_force_n) : '—' },
+          { label: 'Impact Energy', value: impact ? formatEnergy(impact.impact_energy_j) : '—' },
+          { label: 'Contact Duration', value: impact ? formatDuration(impact.contact_duration_s) : '—' },
+        ]}
+        gates={slamGates}
+      />
+      <StudyCard
+        badge="STUDY 02"
+        title="Downforce (Hand Load Flex)"
+        metrics={[
+          { label: 'Max Displacement', value: structural ? formatLength(structural.max_displacement_m) : '—' },
+          { label: 'Max Stress', value: structural ? formatPressure(structural.max_stress_pa) : '—' },
+          {
+            label: 'Safety Factor',
+            value:
+              structural?.safety_factor !== null && structural?.safety_factor !== undefined
+                ? formatNumber(structural.safety_factor)
+                : '—',
+          },
+          { label: 'Response Validity', value: structural ? structural.validity : '—' },
+        ]}
+        gates={downforceGates}
+      />
+      <StudyCard
+        badge="STUDY 03"
+        title="Drop Suite (Multi-Axis & Budget Sweep)"
+        metrics={[
+          { label: 'Total Mass', value: result.mass ? formatMass(result.mass.mass_kg) : '—' },
+          { label: 'Center of Mass', value: result.mass ? formatVector3(result.mass.center_of_mass_m) : '—' },
+          { label: 'Completeness', value: result.mass ? `${Math.round(result.mass.completeness * 100)}%` : '—' },
+        ]}
+        gates={remainingGates}
+      />
     </>
   );
 }
 
 /**
  * Issues tab: combined table of validation findings, pipeline issues, and
- * pipeline errors.
- * @param result - Latest pipeline result.
- * @returns The issues panel content.
+ * pipeline errors. Rows expand on click only.
+ * @param rows - Combined issue rows.
+ * @returns The issues table element.
  */
 function IssuesTable({ rows }: { rows: IssueRow[] }): JSX.Element {
   const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
@@ -1294,15 +979,15 @@ function IssuesTable({ rows }: { rows: IssueRow[] }): JSX.Element {
   }
 
   return (
-    <table className="dense-table dense-table--interactive">
+    <table className="dense-table dense-table--interactive dense-table--issues">
       <thead>
         <tr>
-          <th style={{ width: '24px' }}></th>
-          <th style={{ width: '90px' }}>Severity</th>
-          <th style={{ width: '210px' }}>Code</th>
-          <th style={{ width: '100px' }}>Phase</th>
+          <th />
+          <th>Severity</th>
+          <th>Code</th>
+          <th>Phase</th>
           <th>Message</th>
-          <th style={{ width: '140px' }}>Affected</th>
+          <th>Affected</th>
         </tr>
       </thead>
       <tbody>
@@ -1313,36 +998,26 @@ function IssuesTable({ rows }: { rows: IssueRow[] }): JSX.Element {
               <tr
                 className={`table-row--expandable${isExpanded ? ' is-expanded' : ''}`}
                 onClick={() => setExpandedIndex(isExpanded ? null : index)}
-                onMouseEnter={() => setExpandedIndex(index)}
                 tabIndex={0}
                 role="button"
                 aria-expanded={isExpanded}
-                title="Move cursor over or click line to expand details"
+                title="Click to expand details"
               >
                 <td className="expand-chevron">{isExpanded ? '▼' : '▶'}</td>
-                <td>
-                  <StatusBadge tone={severityTone(row.severity)}>
-                    {severityLabel(row.severity)}
-                  </StatusBadge>
-                </td>
-                <td>
-                  <code>{row.code}</code>
-                </td>
+                <td><StatusBadge tone={severityTone(row.severity)}>{severityLabel(row.severity)}</StatusBadge></td>
+                <td><code>{row.code}</code></td>
                 <td>{row.phase}</td>
                 <td title={row.message}>{row.message}</td>
-                <td>
-                  <Chips items={row.affectedIds} />
-                </td>
+                <td><Chips items={row.affectedIds} /></td>
               </tr>
               {isExpanded ? (
                 <tr className="table-row--details">
                   <td colSpan={6}>
                     <div className="issue-detail-card">
-                      <h5>Diagnostic Details: {row.code}</h5>
                       <p><strong>Message:</strong> {row.message}</p>
-                      <p><strong>Phase:</strong> {row.phase} &bull; <strong>Severity:</strong> {row.severity}</p>
+                      <p><strong>Phase:</strong> {row.phase}</p>
                       {row.affectedIds.length > 0 ? (
-                        <p><strong>Affected Components:</strong> {row.affectedIds.join(', ')}</p>
+                        <p><strong>Affected components:</strong> {row.affectedIds.join(', ')}</p>
                       ) : null}
                     </div>
                   </td>
@@ -1386,7 +1061,14 @@ function buildIssueRows(result: PipelineResult): IssueRow[] {
   ];
 }
 
-function renderIssues(result: PipelineResult, state: ProjectState): JSX.Element {
+/**
+ * Issues tab: severity filter bar + the combined issues table.
+ * @param result - Latest pipeline result.
+ * @param state - Global project state.
+ * @param dispatch - Project store dispatch.
+ * @returns The issues panel content.
+ */
+function renderIssues(result: PipelineResult, state: ProjectState, dispatch: ProjectDispatch): JSX.Element {
   const allRows = buildIssueRows(result);
   const rows = state.severityFilter
     ? allRows.filter((row) => canonicalSeverity(row.severity) === state.severityFilter)
@@ -1394,12 +1076,510 @@ function renderIssues(result: PipelineResult, state: ProjectState): JSX.Element 
 
   return (
     <RailSection title="Issues">
-      {state.severityFilter && allRows.length > 0 ? (
-        <p className="results-rail__note muted">
-          Showing {rows.length} of {allRows.length} findings at {state.severityFilter} severity.
-        </p>
-      ) : null}
+      <SeverityFilter
+        result={result}
+        value={state.severityFilter}
+        onChange={(severity) => dispatch({ type: 'SET_SEVERITY_FILTER', severity })}
+      />
       <IssuesTable rows={rows} />
     </RailSection>
+  );
+}
+
+/** Key metrics highlighted per component type, in display order. */
+const COMPONENT_METRICS: Record<string, string[]> = {
+  pcb: ['max_deflection_m', 'flex_stress_pa', 'thermal_damage'],
+  battery: ['transmitted_force_n', 'shock_g', 'crush_margin'],
+  switch: ['usage_damage', 'stalk_damage'],
+  encoder: ['usage_damage'],
+  screw: ['margin', 'preload_fraction'],
+  clip: ['derated_retention_force_n', 'creep_modulus_factor'],
+  mount: ['compression_stress_pa', 'buckling_margin'],
+  adhesive: ['utilization'],
+};
+
+function componentTone(status: string): Tone {
+  switch (status.toLowerCase()) {
+    case 'pass':
+      return 'ok';
+    case 'warn':
+      return 'warn';
+    case 'fail':
+      return 'error';
+    default:
+      return 'neutral';
+  }
+}
+
+function formatMetricValue(key: string, value: number | string | null | undefined): string {
+  if (value === null || value === undefined) return '—';
+  if (typeof value === 'string') return value;
+  if (!Number.isFinite(value)) return '—';
+  if (key.endsWith('_pa') || key.includes('stress')) return formatPressure(value);
+  if (key.endsWith('_m')) return formatLength(value);
+  if (key.endsWith('_n') || key.includes('force')) return formatForce(value);
+  if (key === 'thermal_damage' || key === 'preload_fraction' || key === 'utilization') {
+    return `${(value * 100).toFixed(1)}%`;
+  }
+  return formatNumber(value);
+}
+
+/** Read a component metric, honoring the battery crush_margin key rename. */
+function readComponentMetric(
+  metrics: Record<string, number | string | null>,
+  key: string,
+): number | string | null | undefined {
+  if (key === 'crush_margin') return metrics.crush_margin ?? metrics.margin_crush;
+  return metrics[key];
+}
+
+/** One component row: status badge, id + type, and the type's key metrics. */
+function ComponentRow({ component }: { component: ComponentAssessment }): JSX.Element {
+  const id = component.component_id ?? 'unknown';
+  const type = component.type ?? 'unknown';
+  const metrics = component.metrics ?? {};
+  const keys = COMPONENT_METRICS[type] ?? Object.keys(metrics).slice(0, 3);
+  const findings = component.findings ?? [];
+  const usageRatio = component.usage_ratio;
+  return (
+    <div className="results-rail__component">
+      <div className="results-rail__component-head">
+        <StatusBadge tone={componentTone(component.status ?? 'not_evaluated')}>
+          {component.status ?? 'not_evaluated'}
+        </StatusBadge>
+        <code>{id}</code>
+        <span className="muted">{type}</span>
+        {component.validity ? (
+          <span className="results-rail__screening-label muted">{component.validity}</span>
+        ) : null}
+        {usageRatio !== null && usageRatio !== undefined && Number.isFinite(usageRatio) ? (
+          <code className="chip results-rail__usage-chip">{formatRate(usageRatio)}</code>
+        ) : null}
+      </div>
+      {keys.length > 0 ? (
+        <div className="results-rail__component-metrics">
+          {keys.map((key) => (
+            <span key={key}>
+              <span className="muted">{key}:</span> {formatMetricValue(key, readComponentMetric(metrics, key))}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {findings.length > 0 ? (
+        <div className="results-rail__component-findings">
+          {findings.map((finding, index) => (
+            <code
+              key={`${finding.code}-${index}`}
+              className="results-rail__finding"
+              title={finding.message}
+            >
+              {finding.code}
+            </code>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+const SCREENING_NOTE_DEFAULT =
+  'simplified models, low-medium confidence; component verdicts do not affect the shell result';
+
+/** Components tab: secondary screening banner plus a compact per-component list. */
+function renderComponents(result: PipelineResult): JSX.Element {
+  const screening: ComponentScreeningResult | null | undefined = result.component_screening;
+  const components: ComponentResult | null | undefined = screening ?? result.components;
+  if (components === null || components === undefined) {
+    return <Empty>No component analysis was requested.</Empty>;
+  }
+  const rows = components.components ?? [];
+  const summary = components.summary;
+  const failCount =
+    summary?.fail_count ??
+    rows.filter((row) => (row.status ?? '').toLowerCase() === 'fail').length;
+  const warnCount =
+    summary?.warn_count ??
+    rows.filter((row) => (row.status ?? '').toLowerCase() === 'warn').length;
+  const weakest =
+    summary?.weakest ??
+    rows.find((row) => (row.status ?? '').toLowerCase() === 'fail') ??
+    null;
+  const note = screening?.note ?? SCREENING_NOTE_DEFAULT;
+  const confidence = screening?.confidence ?? 'low-medium';
+  const bannerText = screening
+    ? `SECONDARY COMPONENT SCREENING — ${note} (${confidence} confidence)`
+    : `SECONDARY COMPONENT SCREENING — ${SCREENING_NOTE_DEFAULT}`;
+  return (
+    <>
+      <p className="results-rail__screening-note">{bannerText}</p>
+      <RailSection title="Component Assessment">
+        <p className="results-rail__config-line">
+          {rows.length} component(s), {failCount} failed, {warnCount} warnings — weakest:{' '}
+          {weakest
+            ? `${weakest.component_id ?? 'unknown'} (${weakest.status ?? 'not_evaluated'})`
+            : 'none'}
+        </p>
+        {rows.length === 0 ? (
+          <p className="muted">No components were reported.</p>
+        ) : (
+          rows.map((component, index) => (
+            <ComponentRow key={`${component.component_id ?? 'component'}-${index}`} component={component} />
+          ))
+        )}
+      </RailSection>
+    </>
+  );
+}
+
+/**
+ * Rate formatter: 1 decimal for rates >= 0.1%, 2 decimals (significant)
+ * for smaller rates, e.g. 1/10000 → 0.01%.
+ */
+function formatRate(rate: number | null | undefined): string {
+  if (rate === null || rate === undefined || !Number.isFinite(rate)) return '—';
+  const percent = rate * 100;
+  return `${percent.toFixed(percent >= 0.1 ? 1 : 2)}%`;
+}
+
+/** Failure-rate bar list, fill width scaled against the worst rate. */
+function FailureRateList({ rates }: { rates: NonNullable<PopulationResult['component_failure_rates']> }): JSX.Element {
+  const maxRate = Math.max(...rates.map((r) => r.rate ?? 0), 0);
+  return (
+    <div className="results-rail__failrates">
+      {rates.map((rate, index) => {
+        const width = maxRate > 0 ? Math.max(2, ((rate.rate ?? 0) / maxRate) * 100) : 0;
+        return (
+          <div className="results-rail__failrate" key={`${rate.component_id ?? 'rate'}-${index}`}>
+            <span className="results-rail__failrate-label">
+              <code>{rate.component_id ?? 'unknown'}</code> <span className="muted">{rate.type ?? ''}</span>
+            </span>
+            <span className="results-rail__failrate-track">
+              <span className="results-rail__failrate-fill" style={{ width: `${width}%` }} />
+            </span>
+            <span className="results-rail__failrate-value">{formatRate(rate.rate)}</span>
+            <span className="results-rail__failrate-rank">#{rate.rank ?? '—'}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Population survival curve rendered as a small SVG polyline. */
+function SurvivalCurve({ survival }: { survival: NonNullable<PopulationResult['survival']> }): JSX.Element | null {
+  const points = survival
+    .filter(
+      (point) =>
+        Number.isFinite(point.usage_fraction) &&
+        Number.isFinite(point.survival_rate),
+    )
+    .map((point) => `${(point.usage_fraction as number) * 100},${40 - (point.survival_rate as number) * 40}`)
+    .join(' ');
+  if (points === '') return null;
+  return (
+    <svg
+      className="results-rail__survival"
+      viewBox="0 0 100 40"
+      preserveAspectRatio="none"
+      role="img"
+      aria-label="Survival curve across usage"
+    >
+      <polyline points={points} />
+    </svg>
+  );
+}
+
+/** Guarded reads for the loose-typed population shell block. */
+function readPopulationShell(shell: NonNullable<PopulationResult['shell']>): {
+  failures: number | null;
+  failure_rate: number | null;
+  wilson_ci: { low: number | null; high: number | null } | null;
+  sensitivity: SensitivityEntry[];
+  assumptions: string[];
+} {
+  const toFinite = (value: unknown): number | null =>
+    typeof value === 'number' && Number.isFinite(value) ? value : null;
+  const ci = isRecord(shell.wilson_ci) ? shell.wilson_ci : null;
+  return {
+    failures: toFinite(shell.failures),
+    failure_rate: toFinite(shell.failure_rate),
+    wilson_ci:
+      ci === null
+        ? null
+        : { low: toFinite(ci.low), high: toFinite(ci.high) },
+    sensitivity: Array.isArray(shell.sensitivity)
+      ? shell.sensitivity.filter(
+          (entry): entry is SensitivityEntry => isRecord(entry) && typeof entry.parameter === 'string',
+        )
+      : [],
+    assumptions: Array.isArray(shell.assumptions)
+      ? shell.assumptions.filter((item): item is string => typeof item === 'string')
+      : [],
+  };
+}
+
+/** Guarded reads for a deterministic worst-case shell block. */
+function readWorstCaseShell(shell: unknown): {
+  safety_factor: number | null;
+  peak_stress_pa: number | null;
+  max_displacement_m: number | null;
+  verdict: string | null;
+} {
+  const toFinite = (value: unknown): number | null =>
+    typeof value === 'number' && Number.isFinite(value) ? value : null;
+  const rec = isRecord(shell) ? shell : null;
+  return {
+    safety_factor: toFinite(rec?.safety_factor),
+    peak_stress_pa: toFinite(rec?.peak_stress_pa),
+    max_displacement_m: toFinite(rec?.max_displacement_m),
+    verdict: rec && typeof rec.verdict === 'string' ? rec.verdict : null,
+  };
+}
+
+/** Guarded reads for the deterministic worst-case drop block. */
+function readWorstCaseDrop(drop: unknown): {
+  drop_height_m: number | null;
+  surface: string | null;
+  orientation: string | null;
+  peak_impact_speed_m_s: number | null;
+  impact_energy_j: number | null;
+  peak_acceleration_g: number | null;
+} {
+  const toFinite = (value: unknown): number | null =>
+    typeof value === 'number' && Number.isFinite(value) ? value : null;
+  const rec = isRecord(drop) ? drop : null;
+  return {
+    drop_height_m: toFinite(rec?.drop_height_m),
+    surface: rec && typeof rec.surface === 'string' ? rec.surface : null,
+    orientation: rec && typeof rec.orientation === 'string' ? rec.orientation : null,
+    peak_impact_speed_m_s: toFinite(rec?.peak_impact_speed_m_s),
+    impact_energy_j: toFinite(rec?.impact_energy_j),
+    peak_acceleration_g: toFinite(rec?.peak_acceleration_g),
+  };
+}
+
+/** Guarded reads for worst-case component rows. */
+function readWorstCaseComponents(components: unknown): ComponentAssessment[] {
+  if (!Array.isArray(components)) return [];
+  return components.filter(
+    (entry): entry is ComponentAssessment =>
+      isRecord(entry) && (typeof entry.component_id === 'string' || typeof entry.status === 'string'),
+  );
+}
+
+function worstCaseVerdictTone(verdict: string): Tone {
+  switch (verdict.toLowerCase()) {
+    case 'pass':
+      return 'ok';
+    case 'warn':
+      return 'warn';
+    case 'fail':
+      return 'error';
+    default:
+      return 'neutral';
+  }
+}
+
+/** Sensitivity strength chip (HIGH / MEDIUM / LOW / NOT_OBSERVED). */
+function SensitivityLevelChip({ level }: { level?: SensitivityLevel | string }): JSX.Element | null {
+  if (!level) return null;
+  const normalized = level.toUpperCase();
+  const tone: Tone =
+    normalized === 'HIGH' || normalized === 'MEDIUM'
+      ? normalized === 'HIGH'
+        ? 'error'
+        : 'warn'
+      : 'neutral';
+  return (
+    <code className={`chip results-rail__sensitivity-level results-rail__sensitivity-level--${tone}`}>
+      {normalized}
+    </code>
+  );
+}
+
+/** Deterministic worst-case population block (single corner run, no Monte Carlo tail). */
+function renderWorstCasePopulation(population: PopulationResult): JSX.Element {
+  const verdict = population.verdict ?? 'not_evaluated';
+  const shell = readWorstCaseShell(population.shell);
+  const drop = readWorstCaseDrop(population.drop);
+  const components = readWorstCaseComponents(population.components);
+  const assumptions = population.assumptions ?? [];
+  return (
+    <>
+      <p className="results-rail__screening-note results-rail__worst-case-note">
+        DETERMINISTIC WORST CASE — worst-case corner, not a Monte Carlo tail
+      </p>
+      <RailSection title="Deterministic Worst Case">
+        <div className="results-rail__shell-status">
+          <StatusBadge tone={worstCaseVerdictTone(verdict)}>{verdict}</StatusBadge>
+        </div>
+        <KvList
+          rows={[
+            {
+              label: 'Safety factor',
+              value: shell.safety_factor !== null ? formatNumber(shell.safety_factor) : '—',
+            },
+            {
+              label: 'Peak stress',
+              value: shell.peak_stress_pa !== null ? formatPressure(shell.peak_stress_pa) : '—',
+            },
+            {
+              label: 'Max deformation',
+              value: shell.max_displacement_m !== null ? formatLength(shell.max_displacement_m) : '—',
+            },
+            { label: 'Drop height', value: drop.drop_height_m !== null ? formatLength(drop.drop_height_m) : '—' },
+            { label: 'Surface', value: drop.surface ?? '—' },
+            { label: 'Orientation', value: drop.orientation ?? '—' },
+            {
+              label: 'Peak acceleration',
+              value: drop.peak_acceleration_g !== null ? `${formatNumber(drop.peak_acceleration_g)} g` : '—',
+            },
+          ]}
+        />
+      </RailSection>
+      {components.length > 0 ? (
+        <RailSection title="Worst-case components">
+          <ul className="results-rail__worst-case-components">
+            {components.map((component, index) => {
+              const usageRatio = component.usage_ratio;
+              return (
+                <li key={`${component.component_id ?? 'component'}-${index}`}>
+                  <StatusBadge tone={componentTone(component.status ?? 'not_evaluated')}>
+                    {component.status ?? 'not_evaluated'}
+                  </StatusBadge>{' '}
+                  <code>{component.component_id ?? 'unknown'}</code>{' '}
+                  <span className="muted">{component.type ?? ''}</span>
+                  {usageRatio !== null && usageRatio !== undefined && Number.isFinite(usageRatio) ? (
+                    <code className="chip results-rail__usage-chip">{formatRate(usageRatio)}</code>
+                  ) : null}
+                </li>
+              );
+            })}
+          </ul>
+        </RailSection>
+      ) : null}
+      {assumptions.length > 0 ? (
+        <DisclosureCard title="Worst-case assumptions" count={assumptions.length}>
+          <AssumptionsList items={assumptions} />
+        </DisclosureCard>
+      ) : null}
+    </>
+  );
+}
+
+/** Population tab: shell robustness first, then the secondary component screening. */
+function renderPopulation(result: PipelineResult): JSX.Element {
+  const population: PopulationResult | null | undefined = result.population;
+  if (population === null || population === undefined) {
+    return (
+      <>
+        <p className="results-rail__screening-note">
+          SECONDARY COMPONENT SCREENING — {SCREENING_NOTE_DEFAULT}
+        </p>
+        <Empty>No population analysis was requested — run the worst-case analysis from Settings.</Empty>
+      </>
+    );
+  }
+  if (population.mode === 'deterministic_worst_case') {
+    return renderWorstCasePopulation(population);
+  }
+  const sampleCount = population.sample_count ?? 0;
+  const failed = population.units_failed ?? 0;
+  const ci = population.wilson_ci;
+  const header = [
+    `${sampleCount.toLocaleString('en-US')} virtual units`,
+    population.profile,
+    `${population.lifespan_days ?? '—'} days`,
+  ].join(' · ');
+  const outcome = `${failed.toLocaleString('en-US')} failed (${formatRate(population.failure_rate)}${ci ? `, 95% Wilson CI ${formatRate(ci.low)}–${formatRate(ci.high)}` : ''})`;
+  const weakest = population.weakest_components ?? [];
+  const sensitivity = population.sensitivity ?? [];
+  const survival = population.survival ?? [];
+  const shell = population.shell !== null && population.shell !== undefined ? readPopulationShell(population.shell) : null;
+  const shellSensitivity = (shell?.sensitivity ?? []).slice().sort(
+    (a, b) => Math.abs(b.correlation ?? 0) - Math.abs(a.correlation ?? 0),
+  );
+
+  return (
+    <>
+      {shell ? (
+        <RailSection title="Shell robustness across manufacturing variation">
+          <p className="results-rail__config-line">
+            {shell.failures !== null ? shell.failures.toLocaleString('en-US') : '—'} /{' '}
+            {sampleCount.toLocaleString('en-US')} units below safety factor 1 (
+            {formatRate(shell.failure_rate)}
+            {shell.wilson_ci
+              ? `, 95% Wilson CI ${formatRate(shell.wilson_ci.low)}–${formatRate(shell.wilson_ci.high)}`
+              : ''}
+            )
+          </p>
+          {shellSensitivity.length > 0 ? (
+            <div className="results-rail__sensitivity">
+              <div className="results-rail__subhead">
+                Sensitivity (correlation with shell failure — correlation, not causation)
+              </div>
+              <ul>
+                {shellSensitivity.slice(0, 5).map((entry, index) => (
+                  <li key={`${entry.parameter ?? 'shell-sensitivity'}-${index}`}>
+                    <code>{entry.parameter ?? 'parameter'}</code>:{' '}
+                    <span className="results-rail__sensitivity-value">
+                      {formatSigned(entry.correlation ?? null)}
+                    </span>{' '}
+                    <SensitivityLevelChip level={entry.level} />
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </RailSection>
+      ) : null}
+      <RailSection title="Population Analysis">
+        <p className="results-rail__config-line">
+          {header} — {outcome}
+        </p>
+        {population.component_failure_rates && population.component_failure_rates.length > 0 ? (
+          <>
+            <div className="results-rail__subhead">Secondary component screening</div>
+            <FailureRateList rates={population.component_failure_rates} />
+          </>
+        ) : null}
+        {weakest.length > 0 ? (
+          <div className="results-rail__weakest">
+            <div className="results-rail__subhead">Weakest components</div>
+            <ul>
+              {weakest.map((component, index) => (
+                <li key={`${component.component_id ?? 'weakest'}-${index}`}>
+                  <code>{component.component_id ?? 'unknown'}</code>{' '}
+                  <span className="muted">{component.type ?? ''}</span> — {formatRate(component.rate)} · rank{' '}
+                  {component.rank ?? '—'}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+        {survival.length > 0 ? (
+          <div className="results-rail__survival-block">
+            <div className="results-rail__subhead">Survival vs usage</div>
+            <SurvivalCurve survival={survival} />
+          </div>
+        ) : null}
+        {sensitivity.length > 0 ? (
+          <div className="results-rail__sensitivity">
+            <div className="results-rail__subhead">Sensitivity (top 5)</div>
+            <ul>
+              {sensitivity.slice(0, 5).map((entry, index) => (
+                <li key={`${entry.parameter ?? 'sensitivity'}-${index}`}>
+                  <code>{entry.parameter ?? 'parameter'}</code>:{' '}
+                  <span className="results-rail__sensitivity-value">
+                    {formatSigned(entry.correlation ?? null)}
+                  </span>{' '}
+                  <SensitivityLevelChip level={entry.level} />
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+      </RailSection>
+    </>
   );
 }

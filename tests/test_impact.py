@@ -10,6 +10,10 @@ from mouse_sim.impact import (
     CONTACT_PATCH_ASSUMPTION,
     DESK_EDGE_CONTACT_APPROXIMATION,
     FATIGUE_ESTIMATE_EXCEEDED,
+    FATIGUE_GENERIC_FALLBACK,
+    HERTZ_CONTACT_DURATION_FACTOR,
+    IMPACT_ACCELERATION_IMPLAUSIBLE,
+    IMPACT_STRESS_IMPLAUSIBLE,
     INVALID_CONTACT_OFFSET,
     INVALID_INERTIA_TENSOR,
     INVALID_KINEMATICS,
@@ -99,6 +103,67 @@ class ForceTests(unittest.TestCase):
     def test_half_sine_duration_fallback(self):
         result = estimate_impact(mass_kg=0.1, velocity_m_s=4.0, contact_duration_s=0.01)
         self.assertAlmostEqual(result.peak_force_n, math.pi * 0.1 * 4.0 / (2.0 * 0.01), places=9)
+
+
+class PeakAccelerationTests(unittest.TestCase):
+    def test_peak_acceleration_is_falling_body_deceleration(self):
+        result = estimate_impact(mass_kg=0.1, velocity_m_s=4.0, contact_stiffness_n_per_m=1e5)
+        self.assertAlmostEqual(result.peak_acceleration_m_s2, result.peak_force_n / 0.1, places=9)
+
+    def test_peak_acceleration_uses_body_mass_not_reduced_mass(self):
+        # Equal masses: the two-body relative acceleration (F/m_eff) would
+        # overstate the falling body's deceleration by 2x.
+        result = estimate_impact(
+            mass_kg=0.1, velocity_m_s=4.0, contact_stiffness_n_per_m=1e5, target_mass_kg=0.1
+        )
+        self.assertAlmostEqual(result.effective_mass_kg, 0.05, places=9)
+        self.assertAlmostEqual(result.peak_acceleration_m_s2, result.peak_force_n / 0.1, places=9)
+        relative = result.peak_force_n / result.effective_mass_kg
+        self.assertAlmostEqual(result.peak_acceleration_m_s2, relative / 2.0, places=9)
+
+
+class ContactDurationAssumptionTests(unittest.TestCase):
+    def test_compression_phase_duration_note_on_linear_branch(self):
+        result = estimate_impact(mass_kg=0.1, velocity_m_s=4.0, contact_stiffness_n_per_m=1e5)
+        self.assertTrue(
+            any("compression phase" in item and "full contact" in item for item in result.assumptions)
+        )
+
+    def test_compression_phase_duration_note_on_half_sine_branch(self):
+        result = estimate_impact(mass_kg=0.1, velocity_m_s=4.0, contact_duration_s=0.01)
+        self.assertTrue(
+            any("compression phase" in item and "full contact" in item for item in result.assumptions)
+        )
+
+
+class PlausibilityFlagTests(unittest.TestCase):
+    def test_absurd_stiffness_flags_implausible_acceleration(self):
+        # Tiny body on an absurdly stiff contact: deceleration >> 1e6 m/s^2.
+        result = estimate_impact(mass_kg=1e-6, velocity_m_s=4.0, contact_stiffness_n_per_m=1e8)
+        self.assertGreater(result.peak_acceleration_m_s2, 1e6)
+        self.assertIn(IMPACT_ACCELERATION_IMPLAUSIBLE, result.flags)
+        self.assertEqual(result.validity, "inconclusive")
+        self.assertTrue(
+            any(IMPACT_ACCELERATION_IMPLAUSIBLE in item for item in result.assumptions)
+        )
+
+    def test_absurd_stress_flags_implausible_stress(self):
+        result = estimate_impact(
+            mass_kg=0.1,
+            velocity_m_s=4.0,
+            contact_stiffness_n_per_m=1e8,
+            load_path_area_m2=1e-10,
+        )
+        self.assertGreater(result.load_path_stress_pa, 1e11)
+        self.assertIn(IMPACT_STRESS_IMPLAUSIBLE, result.flags)
+        self.assertEqual(result.validity, "inconclusive")
+        self.assertTrue(any(IMPACT_STRESS_IMPLAUSIBLE in item for item in result.assumptions))
+
+    def test_plausible_impacts_carry_no_implausibility_flags(self):
+        result = estimate_impact(mass_kg=0.1, velocity_m_s=4.0, contact_stiffness_n_per_m=1e5)
+        self.assertNotIn(IMPACT_ACCELERATION_IMPLAUSIBLE, result.flags)
+        self.assertNotIn(IMPACT_STRESS_IMPLAUSIBLE, result.flags)
+        self.assertEqual(result.validity, "valid")
 
 
 class ValidationTests(unittest.TestCase):
@@ -194,6 +259,104 @@ class FatigueTests(unittest.TestCase):
         self.assertAlmostEqual(summary["damage_sum"], 2.0)
         self.assertTrue(summary["miner_exceeded"])
 
+    def test_generic_fallback_law_matches_hand_computed_life(self):
+        # Generic polymer law N = 1e6*(14e6/sigma)^6 (ABS-like compilation,
+        # R ~ 0.1): at sigma = 14e6 the life is exactly 1e6; at 28e6 it is
+        # 1e6/2^6 = 15625.
+        at_ref = repeat_impact_cycles(cycles_n=1, stress_amplitude_pa=14e6)
+        self.assertEqual(at_ref["levels"][0]["cycles_to_failure"], 1e6)
+        doubled = repeat_impact_cycles(cycles_n=1, stress_amplitude_pa=28e6)
+        self.assertEqual(doubled["levels"][0]["cycles_to_failure"], 15625.0)
+        self.assertAlmostEqual(doubled["damage_sum"], 1.0 / 15625.0)
+
+    def test_generic_fallback_flag_and_assumption(self):
+        summary = repeat_impact_cycles(cycles_n=1000, stress_amplitude_pa=1e8)
+        self.assertIn(FATIGUE_GENERIC_FALLBACK, summary["flags"])
+        self.assertTrue(
+            any("14 MPa @ 10^6" in item and "slope 6" in item for item in summary["assumptions"])
+        )
+        self.assertTrue(
+            any("material-specific S-N data unavailable" in item for item in summary["assumptions"])
+        )
+        with_material = repeat_impact_cycles(
+            cycles_n=1000,
+            stress_amplitude_pa=1e8,
+            fatigue_strength_at_1e6_pa=20e6,
+            fatigue_exponent_k=7,
+        )
+        self.assertNotIn(FATIGUE_GENERIC_FALLBACK, with_material["flags"])
+        self.assertEqual(with_material["assumptions"], [])
+
+    def test_material_basquin_laws_exact_lives(self):
+        # Per-material S-N data (polymer fatigue compilations, R ~ 0.1):
+        # ABS 14 MPa @ 1e6, slope 6; PC 20 MPa @ 1e6, slope 7;
+        # POM 30 MPa @ 1e6, slope 9; FR-4 100 MPa @ 1e6, slope 8.
+        # N = 1e6*(sigma_ref/sigma)^k, hand-computed below.
+        materials = (
+            ("ABS", 14e6, 6, 1e6 / 64.0),      # at 2*sigma_ref: 15625.0
+            ("PC", 20e6, 7, 1e6 / 128.0),      # 7812.5
+            ("POM", 30e6, 9, 1e6 / 512.0),     # 1953.125
+            ("FR-4", 100e6, 8, 1e6 / 256.0),   # 3906.25
+        )
+        for name, sigma_ref, exponent, expected_at_doubled in materials:
+            at_ref = repeat_impact_cycles(
+                cycles_n=1,
+                stress_amplitude_pa=sigma_ref,
+                fatigue_strength_at_1e6_pa=sigma_ref,
+                fatigue_exponent_k=exponent,
+            )
+            self.assertEqual(
+                at_ref["levels"][0]["cycles_to_failure"], 1e6, name
+            )
+            self.assertAlmostEqual(at_ref["damage_sum"], 1e-6, places=12, msg=name)
+            doubled = repeat_impact_cycles(
+                cycles_n=1,
+                stress_amplitude_pa=2.0 * sigma_ref,
+                fatigue_strength_at_1e6_pa=sigma_ref,
+                fatigue_exponent_k=exponent,
+            )
+            self.assertEqual(doubled["levels"][0]["cycles_to_failure"], expected_at_doubled, name)
+            self.assertFalse(doubled["miner_exceeded"], name)
+            self.assertNotIn(FATIGUE_GENERIC_FALLBACK, doubled["flags"], name)
+
+    def test_partial_material_data_falls_back_to_generic(self):
+        only_ref = repeat_impact_cycles(
+            cycles_n=1, stress_amplitude_pa=14e6, fatigue_strength_at_1e6_pa=20e6
+        )
+        self.assertIn(FATIGUE_GENERIC_FALLBACK, only_ref["flags"])
+        only_k = repeat_impact_cycles(
+            cycles_n=1, stress_amplitude_pa=14e6, fatigue_exponent_k=7
+        )
+        self.assertIn(FATIGUE_GENERIC_FALLBACK, only_k["flags"])
+
+    def test_epsilon_exactly_one_lifetime_triggers_exhaustion(self):
+        # At the stress where the Basquin law gives N = 1000 cycles, running
+        # exactly 1000 cycles gives damage_sum == 1.0; float rounding may
+        # land a hair below 1.0, so the 1e-9 epsilon must still flag it.
+        sigma_ref = 14e6
+        exponent = 6
+        stress = sigma_ref * (1e6 / 1000.0) ** (1.0 / exponent)
+        summary = repeat_impact_cycles(
+            cycles_n=1000,
+            stress_amplitude_pa=stress,
+            fatigue_strength_at_1e6_pa=sigma_ref,
+            fatigue_exponent_k=exponent,
+        )
+        self.assertAlmostEqual(summary["levels"][0]["cycles_to_failure"], 1000.0, places=6)
+        self.assertAlmostEqual(summary["damage_sum"], 1.0, places=9)
+        self.assertTrue(summary["miner_exceeded"])
+        self.assertIn(FATIGUE_ESTIMATE_EXCEEDED, summary["flags"])
+
+    def test_damage_below_one_lifetime_not_exceeded(self):
+        summary = repeat_impact_cycles(
+            cycles_n=999,
+            stress_amplitude_pa=14e6 * (1e6 / 1000.0) ** (1.0 / 6),
+            fatigue_strength_at_1e6_pa=14e6,
+            fatigue_exponent_k=6,
+        )
+        self.assertFalse(summary["miner_exceeded"])
+        self.assertEqual(summary["flags"], [])
+
 
 class QualificationTests(unittest.TestCase):
     def test_qualification_blocked_by_default(self):
@@ -276,7 +439,21 @@ class HertzContactTests(unittest.TestCase):
         self.assertEqual(result.contact_model, CONTACT_MODEL_HERTZ_NONLINEAR)
         self.assertAlmostEqual(result.peak_force_n, expected_peak, places=6)
         self.assertAlmostEqual(result.contact_compression_m, delta_max, places=6)
-        self.assertAlmostEqual(result.contact_duration_s, 2.94 * delta_max / velocity, places=6)
+        # Default plastic impact (e=0): contact ends at max compression, so
+        # the reported duration is half the full elastic contact duration.
+        self.assertAlmostEqual(
+            result.contact_duration_s, 2.94 * (1.0 + 0.0) / 2.0 * delta_max / velocity, places=6
+        )
+        elastic = estimate_impact(
+            mass_kg=mass,
+            velocity_m_s=velocity,
+            effective_modulus_pa=modulus,
+            contact_radius_m=radius,
+            restitution=1.0,
+        )
+        self.assertAlmostEqual(
+            elastic.contact_duration_s, 2.94 * (1.0 + 1.0) / 2.0 * delta_max / velocity, places=6
+        )
         self.assertAlmostEqual(result.impact_energy_j, 0.5 * mass * velocity * velocity, places=9)
         self.assertAlmostEqual(result.impact_energy_j, (2.0 / 5.0) * k_h * delta_max ** 2.5, places=6)
 
@@ -404,12 +581,31 @@ class EnergyPartitionTests(unittest.TestCase):
         t_trans = impulse * impulse / (2.0 * mass)
         t_rot = 0.5 * impulse * impulse * offset * offset / inertia
         total = t_trans + t_rot
+        scale = result.impact_energy_j / total
         partition = result.energy_partition
-        self.assertAlmostEqual(partition["translational_energy_j"], t_trans, places=9)
-        self.assertAlmostEqual(partition["rotational_energy_j"], t_rot, places=9)
+        self.assertAlmostEqual(partition["translational_energy_j"], t_trans * scale, places=9)
+        self.assertAlmostEqual(partition["rotational_energy_j"], t_rot * scale, places=9)
         self.assertAlmostEqual(partition["rotational_fraction"], t_rot / total, places=9)
         self.assertAlmostEqual(partition["translational_fraction"], t_trans / total, places=9)
         self.assertEqual(partition["contact_offset_m"], [offset, 0.0, 0.0])
+
+    def test_partition_conserves_reported_impact_energy(self):
+        result = estimate_impact(
+            mass_kg=0.1,
+            velocity_m_s=4.0,
+            contact_stiffness_n_per_m=1e5,
+            total_mass_kg=0.1,
+            inertia_tensor_kg_m2=[[1e-6, 0.0, 0.0], [0.0, 1e-6, 0.0], [0.0, 0.0, 1e-6]],
+            contact_location_m=(0.01, 0.0, 0.0),
+            center_of_mass_m=(0.0, 0.0, 0.0),
+        )
+        partition = result.energy_partition
+        total = partition["translational_energy_j"] + partition["rotational_energy_j"]
+        self.assertAlmostEqual(total, result.impact_energy_j, places=9)
+        self.assertAlmostEqual(
+            (total - result.impact_energy_j) / result.impact_energy_j, 0.0, places=9
+        )
+        self.assertTrue(any("energy conservation" in item for item in partition["notes"]))
 
     def test_partition_omitted_without_inertia_tensor(self):
         result = estimate_impact(mass_kg=0.1, velocity_m_s=4.0, contact_stiffness_n_per_m=1e5)

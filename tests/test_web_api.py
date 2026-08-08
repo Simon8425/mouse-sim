@@ -13,7 +13,7 @@ from mouse_sim.canonical import canonical_json
 from mouse_sim.geometry import TriangleMesh
 from mouse_sim.importers import GeometryLoadResult, ImportDiagnostic
 from mouse_sim.pipeline import run_pipeline
-from mouse_sim.web_api import WebConfig, build_server, register_step_asset
+from mouse_sim.web_api import WebConfig, build_server, register_step_asset, slim_result_for_web
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BASELINE_PATH = REPO_ROOT / "examples" / "mouse_baseline.json"
@@ -159,7 +159,14 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(payload["engine_version"], "0.1.0")
         direct = run_pipeline(dict(document, options={"strict": False}))
         self.assertEqual(payload["run_id"], direct["run_id"])
-        self.assertEqual(canonical_json(payload["result"]), canonical_json(direct))
+        self.assertEqual(
+            canonical_json(payload["result"]),
+            canonical_json(slim_result_for_web(direct)),
+        )
+        self.assertEqual(
+            payload["result"]["manifest"]["manifest_hash"],
+            direct["manifest"]["manifest_hash"],
+        )
         self.assertEqual(payload["result"]["lifecycle_state"], direct["lifecycle_state"])
         self.assertEqual(payload["result"]["mass"]["mass_kg"], direct["mass"]["mass_kg"])
         self.assertIsNotNone(payload["result"]["mass"]["mass_kg"])
@@ -180,6 +187,32 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(payload["result"]["errors"], [])
         self.assertTrue(payload["materials"])
         self.assertEqual(payload["materials"][0]["approval_state"], "draft")
+
+    def test_analyze_manifest_objects_slimmed(self):
+        """The web response replaces geometry-heavy manifest inputs with their
+        canonical hashes so per-object meshes are not echoed back."""
+        document = self.load_baseline()
+        envelope = {
+            "schema_id": "gms.web-analysis-request/1",
+            "request": dict(document),
+            "options": {"strict": False, "use_cache": True},
+        }
+        server, base_url = self.start_server()
+        response, data = self.post_json(base_url, "/api/analyze", envelope)
+        self.assertEqual(response.status, 200, data.decode("utf-8"))
+        payload = json.loads(data)
+        manifest = payload["result"]["manifest"]
+        self.assertIsInstance(manifest, dict)
+        inputs = manifest["inputs"]
+        self.assertIsInstance(inputs, dict)
+        objects = inputs["objects"]
+        self.assertIsInstance(objects, dict)
+        self.assertEqual(objects["count"], len(document["objects"]))
+        digest = objects["sha256"]
+        self.assertIsInstance(digest, str)
+        self.assertEqual(len(digest), 64)
+        # The mesh payload itself must not be echoed back to the client.
+        self.assertNotIn("geometry", json.dumps(objects))
 
     def test_analyze_cache_reuse(self):
         document = self.load_baseline()
@@ -320,7 +353,10 @@ class WebApiTests(unittest.TestCase):
             dict(request_doc, options={"min_thickness_m": 0.0005, "max_thickness_m": 0.05, "debug": True, "strict": False})
         )
         self.assertEqual(payload["run_id"], direct["run_id"])
-        self.assertEqual(canonical_json(payload["result"]), canonical_json(direct))
+        self.assertEqual(
+            canonical_json(payload["result"]),
+            canonical_json(slim_result_for_web(direct)),
+        )
 
     def test_analyze_pipeline_validation_fail_returns_422(self):
         document = self.load_baseline()
@@ -375,6 +411,7 @@ class WebApiTests(unittest.TestCase):
                 "ANALYSIS_VALIDITY",
                 "IMPACT_VALIDITY",
                 "CORRELATION_ERROR",
+                "CORRELATION_MEASURED",
                 "REQUIREMENT_EVALUATION",
                 "CONVERGENCE_EVIDENCE",
             },

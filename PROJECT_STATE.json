@@ -1,0 +1,82 @@
+{
+  "project": "gaming-mouse shell engineering validation platform",
+  "engine": {
+    "version": "0.1.0",
+    "hash": "e8a010a408f4e17c",
+    "engine_hash_modules": [
+      "pipeline", "physics", "drop_sim", "impact", "geometry", "mass",
+      "materials", "validation", "qualification", "units", "collision",
+      "classification", "lifecycle", "components_elec", "components_mech",
+      "profiles", "population"
+    ],
+    "schema": {
+      "web_analysis_request": "gms.web-analysis-request/1",
+      "web_analysis_response": "gms.web-analysis-response/1",
+      "pipeline_result": "gms.pipeline-result/1",
+      "run_manifest": "gms.run-manifest/1"
+    },
+    "assset_format_version": "parts-v7"
+  },
+  "git": {
+    "branch": "main",
+    "commit_before_session": "ff57855",
+    "commit_after_session": "pending commit of 60 changed paths"
+  },
+  "working_tree": {
+    "modified_files": 44,
+    "untracked_files": 16,
+    "deleted_files": 0,
+    "notes": "all changes intended; see HANDOFF.md section 3"
+  },
+  "tests": {
+    "backend_total": 713,
+    "backend_passed": 711,
+    "backend_skipped": 2,
+    "backend_skipped_reason": "FreeCAD-gated STEP integration (MOUSE_SIM_RUN_SLOW_STEP_INTEGRATION=1)",
+    "frontend_total": 112,
+    "frontend_files": 17,
+    "typecheck": "clean",
+    "lint": "clean",
+    "build": "clean",
+    "e2e": {"passed": 72, "failed": 0, "projects": 4},
+    "step_integration": "OK"
+  },
+  "server": {
+    "command": "python3 -S -m mouse_sim serve --project-root . --web-dist web/dist --port 8898",
+    "port": 8898,
+    "url": "http://127.0.0.1:8898/",
+    "status": "running"
+  },
+  "environment": {
+    "python": "3.9.6",
+    "node": "v22.20.0",
+    "npm": "10.9.3",
+    "stdlib_only": true
+  },
+  "capabilities": {
+    "drop_simulation": true,
+    "impact_screening": true,
+    "shell_structural": true,
+    "anisotropy": "orthotropic plate, approximate",
+    "fatigue_lifecycle": true,
+    "manufacturing_variation": true,
+    "monte_carlo_population": "10,000 units default",
+    "deterministic_worst_case": true,
+    "component_screening": ["pcb", "battery", "switch", "encoder", "screw", "clip", "mount", "adhesive"],
+    "usage_profiles": ["esports_fps", "esports_moba", "productivity", "general"],
+    "confidence_system": "physical-model vs statistical, split",
+    "classification": ["safe", "marginal", "failed", "unsupported", "invalid_input", "insufficient_evidence"],
+    "measured_drop_correlation": true,
+    "step_import": "FreeCAD worker; stdlib parser for small faceted fixtures only"
+  },
+  "known_limitations": [
+    "contact stiffness k=1e5 N/m screening convention (uncalibrated; measured 2e5-1e6)",
+    "self-intersection unverified above 5000 triangles (disclosed)",
+    "float NaN in any request field aborts the run (PIPELINE_INTERNAL)",
+    "first-impact speed under-reported by ~g*dt/2 (semi-implicit Euler, conservative)",
+    "corner-orientation settle non-monotonic in restitution (chaotic, energetically clean)",
+    "battery crush loads cell by own inertia with 0.5 transmission (disclosed)",
+    "multi-point contact manifolds not implemented",
+    "crack propagation / detailed solder / battery chemistry not implemented"
+  ]
+}

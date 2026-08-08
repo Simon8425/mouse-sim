@@ -3,7 +3,12 @@ import unittest
 
 from mouse_sim import canonical_json
 from mouse_sim.cache import ArtifactCache
-from mouse_sim.pipeline import ENGINE_VERSION, run_pipeline
+from mouse_sim.pipeline import (
+    ENGINE_VERSION,
+    _ENGINE_BEHAVIOR_MODULES,
+    pipeline_module,
+    run_pipeline,
+)
 
 SHELL = {"type": "box", "size": [100, 60, 40]}
 PCB = {"type": "box", "size": [60, 40, 1.6]}
@@ -70,6 +75,7 @@ def qualification_request(**overrides):
                     "required": True,
                     "required_record_types": ("static_correlation",),
                     "require_reviewed_records": True,
+                    "maximum_error_fraction": 0.25,
                 },
             },
             "geometry": {"closed": True, "reviewed": True, "repairs_reviewed": True},
@@ -151,16 +157,24 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(qualification["qualified"])
         self.assertEqual(result["errors"], [])
 
-    def test_missing_material_issue_and_unknown_mass(self):
+    def test_missing_material_issue_and_default_fallback(self):
         request = mouse_project_request(
             objects=[{"id": "shell", "geometry": SHELL, "material": "Titanium-7"}]
         )
         result = run_pipeline(request)
         codes = [item["code"] for item in result["issues"]]
         self.assertIn("MATERIAL_NOT_FOUND", codes)
-        self.assertIn(result["mass"]["mass_status"], ("unknown", "partial"))
-        self.assertIsNone(result["mass"]["mass_kg"])
+        self.assertIn("DEFAULT_MATERIAL_ASSIGNED", codes)
+        # The Default material provides full physical properties, so the
+        # simulation never runs on undefined material data: mass is computed.
+        self.assertEqual(result["mass"]["mass_status"], "calculated")
+        self.assertIsNotNone(result["mass"]["mass_kg"])
         self.assertEqual(result["lifecycle_state"], "completed")
+        assignments = result["material_assignments"]
+        self.assertEqual(
+            assignments,
+            [{"object_id": "shell", "material": "default", "source": "default"}],
+        )
 
     def test_impact_requested_includes_unsupported_failure_modes(self):
         request = mouse_project_request(
@@ -176,15 +190,14 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(result["validity"]["unsupported_failure_modes"])
 
     def test_validity_aggregates_nested_unsupported_and_missing_impact_result(self):
-        no_mass = run_pipeline(mouse_project_request(
-            objects=[{"id": "shell", "geometry": SHELL, "material": "Titanium-7"}],
-            impact={"fall_height_m": 0.5},
+        failed_impact = run_pipeline(mouse_project_request(
+            impact={"fall_height_m": -1.0},
         ))
-        validity = no_mass["validity"]
+        validity = failed_impact["validity"]
         self.assertEqual(validity["state"], "failed")
         self.assertEqual(validity["confidence"], "low")
-        self.assertEqual(no_mass["impact"]["result"], None)
-        self.assertTrue(any("mass" in reason for reason in validity["reasons"]))
+        self.assertEqual(failed_impact["impact"]["result"]["validity"], "failed")
+        self.assertIn("INVALID_KINEMATICS", failed_impact["impact"]["result"]["flags"])
         self.assertTrue(validity["unsupported_failure_modes"])
 
         unsupported_run = run_pipeline(mouse_project_request(
@@ -215,6 +228,51 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(
                 first["manifest"]["manifest_hash"], second["manifest"]["manifest_hash"]
             )
+
+    def test_cache_hit_skips_execution(self):
+        # The cached payload stores input hashes under manifest; a hit must
+        # actually short-circuit execution (a write-only cache is a bug).
+        with tempfile.TemporaryDirectory() as directory:
+            cache = ArtifactCache(directory)
+            request = mouse_project_request()
+            first = run_pipeline(request, cache=cache)
+            executed = []
+
+            original = pipeline_module._execute
+
+            def spy(request, mode, options, result):
+                executed.append(True)
+                return original(request, mode, options, result)
+
+            pipeline_module._execute = spy
+            try:
+                second = run_pipeline(request, cache=cache)
+            finally:
+                pipeline_module._execute = original
+            self.assertEqual(first["run_id"], second["run_id"])
+            self.assertEqual(executed, [])
+
+    def test_engine_hash_detects_module_changes(self):
+        # The run id must change when an engine module's source changes so
+        # stale cached physics are never served.
+        import hashlib
+        import os
+        import tempfile
+
+        from mouse_sim.pipeline import _engine_hash
+
+        with tempfile.TemporaryDirectory() as directory:
+            for name in _ENGINE_BEHAVIOR_MODULES:
+                with open(os.path.join(directory, name + ".py"), "w", encoding="utf-8") as stream:
+                    stream.write("# baseline\n")
+            baseline = _engine_hash(root=directory)
+            with open(os.path.join(directory, "drop_sim.py"), "a", encoding="utf-8") as stream:
+                stream.write("# changed\n")
+            changed = _engine_hash(root=directory)
+            self.assertNotEqual(baseline, changed)
+            self.assertEqual(len(baseline), 64)
+        # The installed engine hash is not the empty-input constant.
+        self.assertNotEqual(_engine_hash(), hashlib.sha256(b"").hexdigest())
 
     def test_invalid_geometry_fails_cleanly_with_issue(self):
         request = mouse_project_request(
@@ -319,15 +377,17 @@ class PipelineTests(unittest.TestCase):
         )
         result = run_pipeline(request)
         materials = result["materials"]
-        self.assertEqual(materials["assignments"], {"shell": "Titanium-7"})
-        self.assertEqual(materials["definitions"], {})
+        # The unresolvable key is replaced by the Default material so the
+        # component is always fully simulatable.
+        self.assertEqual(materials["assignments"], {"shell": "default"})
+        self.assertEqual(sorted(materials["definitions"]), ["default"])
+        self.assertIn("DEFAULT_MATERIAL_ASSIGNED", [item["code"] for item in result["issues"]])
 
 
 class QualificationIntegrityPipelineTests(unittest.TestCase):
     def test_qualification_mode_clean_inputs_reach_pending_review(self):
         result = run_pipeline(
             qualification_request(
-                structure=None,
                 convergence_evidence=False,
                 force_balance=False,
                 method={
@@ -341,7 +401,7 @@ class QualificationIntegrityPipelineTests(unittest.TestCase):
         self.assertEqual(qualification["evidence_disposition"], "qualification_pending_review")
         self.assertTrue(qualification["qualified"])
         self.assertEqual(qualification["blocking_keys"], [])
-        self.assertEqual(len(qualification["integrity_gates"]), 5)
+        self.assertEqual(len(qualification["integrity_gates"]), 6)
 
     def test_qualification_mode_invalid_structural_response_blocks(self):
         result = run_pipeline(qualification_request(
@@ -359,15 +419,245 @@ class QualificationIntegrityPipelineTests(unittest.TestCase):
         self.assertIn("CONVERGENCE_EVIDENCE", qualification["blocking_keys"])
         self.assertEqual(qualification["structural_validity"], "inconclusive")
 
-    def test_qualification_mode_structural_unsupported_modes_block(self):
+    def test_qualification_mode_structural_unsupported_modes_disclosed_not_blocking(self):
+        # Unsupported failure modes describe the closed-form model's scope
+        # (buckling, fatigue, ...), not a failed analysis: they are disclosed
+        # on the gate but must not hard-block an otherwise valid response.
         result = run_pipeline(qualification_request())
+        self.assertEqual(result["errors"], [])
+        qualification = result["qualification"]
+        self.assertEqual(qualification["evidence_disposition"], "qualification_pending_review")
+        self.assertNotIn("ANALYSIS_VALIDITY", qualification["blocking_keys"])
+        gate = {
+            item["key"]: item for item in qualification["integrity_gates"]
+        }["ANALYSIS_VALIDITY"]
+        self.assertIn("unsupported failure modes", gate["explanation"])
+        self.assertTrue(result["structural"]["response"]["unsupported_failure_modes"])
+
+    def test_impact_allowable_derived_from_material(self):
+        # The impact safety factor must reach a real value from the assembly
+        # material's allowable when the load-path stress is computable
+        # (previously always not_available).
+        request = mouse_project_request(impact={
+            "fall_height_m": 0.5,
+            "contact_stiffness_n_per_m": 1e5,
+            "load_path_area_m2": 1e-4,
+        })
+        result = run_pipeline(request)
+        self.assertEqual(result["errors"], [])
+        impact_result = result["impact"]["result"]
+        self.assertEqual(impact_result["validity"], "valid")
+        self.assertNotEqual(impact_result["safety_factor"], "not_available")
+        self.assertGreater(float(impact_result["safety_factor"]), 0.0)
+        # The safety factor is the material allowable over the load-path
+        # stress (ABS tensile allowable 20 MPa in the fixture catalog).
+        self.assertAlmostEqual(
+            float(impact_result["safety_factor"]),
+            20e6 / float(impact_result["load_path_stress_pa"]),
+            places=6,
+        )
+
+    def test_environment_temperature_derates_structural_response(self):
+        base = run_pipeline(mouse_project_request(
+            load_case={"kind": "pressure", "magnitude": {"value": 1, "unit": "kPa"}},
+            structure={"type": "shell_panel", "a_m": 0.06, "b_m": 0.04, "t_m": 0.002, "material": "ABS"},
+        ))
+        hot = run_pipeline(mouse_project_request(
+            load_case={"kind": "pressure", "magnitude": {"value": 1, "unit": "kPa"}},
+            structure={"type": "shell_panel", "a_m": 0.06, "b_m": 0.04, "t_m": 0.002, "material": "ABS"},
+            environment_temperature_k=353.15,
+        ))
+        self.assertEqual(base["errors"], [])
+        self.assertEqual(hot["errors"], [])
+        base_response = base["structural"]["response"]
+        hot_response = hot["structural"]["response"]
+        self.assertGreater(hot_response["max_displacement_m"], base_response["max_displacement_m"])
+        self.assertLess(float(hot_response["safety_factor"]), float(base_response["safety_factor"]))
+        self.assertEqual(hot_response["validity"], "approximate")
+        self.assertTrue(
+            any("temperature" in reason for reason in hot["validity"]["reasons"])
+        )
+
+    def test_environment_temperature_out_of_range_warns(self):
+        request = mouse_project_request(environment_temperature_k=500.0)
+        result = run_pipeline(request)
+        self.assertEqual(result["errors"], [])
+        self.assertIn(
+            "ENVIRONMENT_TEMPERATURE_OUT_OF_RANGE", [item["code"] for item in result["issues"]]
+        )
+
+    def test_correlation_measured_drops_verdict(self):
+        def run_correlation(measured_values):
+            drops = []
+            for index, measured in enumerate(measured_values):
+                drops.append(
+                    {
+                        "drop_id": "D{}".format(index + 1),
+                        "height_m": 0.5,
+                        "surface": "concrete",
+                        "orientation": "flat",
+                        "measured_peak_accel_g": measured,
+                    }
+                )
+            request = mouse_project_request(
+                drop_simulation={"height_m": 0.5, "drop_count": 1},
+                correlation={"acceptance": {}, "measured_drops": drops},
+            )
+            return run_pipeline(request)
+
+        # Measured values close to the prediction pass the acceptance band
+        # (the fixture predicts ~187 g at 0.5 m on concrete).
+        plausible = run_correlation([190.0, 200.0, 180.0])
+        self.assertEqual(plausible["errors"], [])
+        correlation = plausible["correlation"]
+        self.assertIsNotNone(correlation)
+        self.assertEqual(correlation["verdict"], "pass")
+        self.assertEqual(len(correlation["conditions"]), 3)
+        # Wildly different measured values fail the correlation honestly.
+        implausible = run_correlation([20.0, 30.0, 25.0])
+        self.assertEqual(implausible["correlation"]["verdict"], "fail")
+        self.assertGreaterEqual(len(implausible["correlation"]["explanation"]), 1)
+
+    def test_correlation_invalid_section_fails_gracefully(self):
+        request = mouse_project_request(
+            drop_simulation={"height_m": 0.5},
+            correlation={"measured_drops": "not-a-list"},
+        )
+        result = run_pipeline(request)
+        # The drop simulation still completes; the correlation section reports
+        # its own failure instead of killing the run.
+        self.assertEqual(result["errors"], [])
+        self.assertIsNotNone(result["drop_simulation"])
+        self.assertIn(
+            "CORRELATION_EVALUATION_FAILED", [item["code"] for item in result["issues"]]
+        )
+
+    def test_shell_result_primary_summary(self):
+        # The shell is the authoritative engineering result: a consolidated
+        # summary (status, stress, deflection, safety factor, critical
+        # region, confidence) separate from the secondary component layer.
+        request = mouse_project_request(
+            load_case={"kind": "pressure", "magnitude": {"value": 1, "unit": "kPa"}},
+            structure={"type": "shell_panel", "a_m": 0.06, "b_m": 0.04, "t_m": 0.002, "material": "ABS"},
+        )
+        result = run_pipeline(request)
+        self.assertEqual(result["errors"], [])
+        shell = result["shell"]
+        self.assertIsNotNone(shell)
+        self.assertEqual(shell["classification"], "safe")
+        self.assertGreater(shell["min_safety_factor"], 1.0)
+        self.assertIsNotNone(shell["peak_stress_pa"])
+        self.assertIsNotNone(shell["max_displacement_m"])
+        self.assertEqual(shell["physical_model_confidence"], "medium")
+        self.assertEqual(shell["statistical_confidence"]["kind"], "single_run")
+        self.assertEqual(shell["critical_region_stability"]["stable"], True)
+        self.assertTrue(shell["assumptions"])
+
+    def test_shell_result_confidence_drops_with_assumed_mass(self):
+        # Assumed mass (open tessellation) must downgrade the shell
+        # confidence, not silently bake a fabricated mass into a high-
+        # confidence verdict.
+        request = {
+            "schema_id": "gms.project/1",
+            "mode": "exploration",
+            "units": "m",
+            "objects": [
+                {
+                    "id": "shell",
+                    "geometry": {
+                        "type": "mesh",
+                        "vertices": [[0, 0, 0], [0.1, 0, 0], [0, 0.06, 0]],
+                        "triangles": [[0, 1, 2]],
+                        "units": "m",
+                    },
+                },
+            ],
+            "load_case": {"kind": "pressure", "magnitude": {"value": 1, "unit": "kPa"}},
+            "structure": {"type": "shell_panel", "a_m": 0.06, "b_m": 0.04, "t_m": 0.002, "material": "ABS"},
+            "drop_simulation": {"height_m": 0.5},
+        }
+        result = run_pipeline(request)
+        codes = [item["code"] for item in result["issues"]]
+        self.assertIn("DROP_SIMULATION_MASS_ASSUMED", codes)
+        shell = result["shell"]
+        self.assertIsNotNone(shell)
+        self.assertEqual(shell["physical_model_confidence"], "medium")
+        self.assertTrue(
+            any("mass assumed" in limitation for limitation in shell["limitations"])
+        )
+
+    def test_components_never_contaminate_shell_result(self):
+        # Architectural invariant: the secondary component models must not
+        # feed back into the shell physics.  Running with and without a
+        # deliberately failing component spec must produce IDENTICAL shell,
+        # structural, mass, and drop results.
+        base = mouse_project_request(
+            load_case={"kind": "pressure", "magnitude": {"value": 1, "unit": "kPa"}},
+            structure={"type": "shell_panel", "a_m": 0.06, "b_m": 0.04, "t_m": 0.002, "material": "ABS"},
+            drop_simulation={"height_m": 0.75, "drop_count": 1},
+        )
+        with_components = dict(base)
+        with_components["components"] = [
+            {"component_id": "battery_pack", "type": "battery", "mass_kg": 0.1},
+        ]
+        with_components["lifecycle"] = {"actuation_cycles": 50_000_000}
+        plain = run_pipeline(base)
+        contaminated = run_pipeline(with_components)
+        self.assertEqual(plain["shell"], contaminated["shell"])
+        self.assertEqual(plain["structural"], contaminated["structural"])
+        self.assertEqual(plain["mass"], contaminated["mass"])
+        self.assertEqual(
+            plain["drop_simulation"]["trajectory"], contaminated["drop_simulation"]["trajectory"]
+        )
+        self.assertIsNone(plain["component_screening"])
+        self.assertIsNotNone(contaminated["component_screening"])
+        self.assertEqual(contaminated["component_screening"]["confidence"], "low-medium")
+
+    def test_population_shell_robustness_block(self):
+        # The population's PRIMARY answer is the shell failure probability
+        # across manufacturing variation (wall thickness, modulus, strength,
+        # density); the component screening stays secondary.
+        request = mouse_project_request(
+            load_case={"kind": "pressure", "magnitude": {"value": 50, "unit": "kPa"}},
+            structure={"type": "shell_panel", "a_m": 0.06, "b_m": 0.04, "t_m": 0.0008, "material": "ABS"},
+            population={"sample_count": 200, "profile": "general", "lifespan_days": 730, "workers": 1},
+        )
+        result = run_pipeline(request)
+        self.assertEqual(result["errors"], [])
+        population = result["population"]
+        shell = population["shell"]
+        self.assertIsNotNone(shell)
+        self.assertIn("nominal", shell)
+        self.assertGreaterEqual(shell["failures"], 0)
+        self.assertIn("wilson_ci", shell)
+        self.assertTrue(shell["assumptions"])
+        # The shell sensitivity includes the shell-specific tolerances.
+        shell_params = {item["parameter"] for item in shell["sensitivity"]}
+        self.assertIn("wall_thickness_scale", shell_params)
+        self.assertIn("shell_strength_scale", shell_params)
+
+    def test_population_without_structure_has_no_shell_block(self):
+        request = mouse_project_request(
+            population={"sample_count": 100, "profile": "general", "lifespan_days": 730, "workers": 1},
+        )
+        result = run_pipeline(request)
+        self.assertEqual(result["errors"], [])
+        self.assertIsNone(result["population"]["shell"])
+
+    def test_qualification_mode_pinned_load_case_without_analysis_blocks(self):
+        # A load case pinned for the run with no structural analysis
+        # performed must block: "all gates passed with zero physics" is a
+        # false green light.
+        result = run_pipeline(qualification_request(structure=None))
+        self.assertEqual(result["errors"], [])
+        self.assertIsNone(result["structural"])
         qualification = result["qualification"]
         self.assertEqual(qualification["evidence_disposition"], "qualification_blocked")
         self.assertIn("ANALYSIS_VALIDITY", qualification["blocking_keys"])
         gate = {
             item["key"]: item for item in qualification["integrity_gates"]
         }["ANALYSIS_VALIDITY"]
-        self.assertIn("unsupported failure modes", gate["explanation"])
+        self.assertIn("load case pinned", gate["explanation"])
 
     def test_qualification_mode_impact_requested_blocks(self):
         result = run_pipeline(qualification_request(
@@ -397,7 +687,6 @@ class QualificationIntegrityPipelineTests(unittest.TestCase):
     def test_qualification_requirement_target_pass_reaches_pending_review(self):
         result = run_pipeline(qualification_request(
             requirement={"status": "active", "target": {"metric": "mass_kg", "max": 10.0}},
-            structure=None,
             convergence_evidence=False,
             force_balance=False,
             method={

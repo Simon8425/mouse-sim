@@ -1,8 +1,10 @@
 import json
 import math
+from dataclasses import replace
 import unittest
 
 from mouse_sim.errors import UnitError
+from mouse_sim.materials import builtin_materials
 from mouse_sim.physics import (
     INVALID_LOAD_UNITS,
     INVALID_LOAD_LOCATION,
@@ -12,8 +14,11 @@ from mouse_sim.physics import (
     NUMERIC_OVERFLOW,
     POINT_LOAD_SINGULARITY,
     SCREENING_SURROGATE_MODEL_ID,
+    SERIES_NOT_CONVERGED,
+    SMALL_DEFLECTION_VIOLATED,
     THIN_SHELL_OUT_OF_RANGE,
     UNDERCONSTRAINED_REACTIONS,
+    UNSUPPORTED_ANISOTROPY,
     SolverCapabilities,
     beam_response,
     preflight_structural_case,
@@ -121,6 +126,47 @@ class PhysicsTests(unittest.TestCase):
         self.assertIsNone(res.safety_factor)
         self.assertEqual(res.safety_factor_status, "not_available")
 
+    def test_safety_factor_uses_raw_stress_not_filtered(self):
+        res = shell_panel_response(0.1, 0.1, 0.002, 2e9, 0.35, 1000.0,
+                                   allowable_pa=20e6)
+        self.assertIsNotNone(res.safety_factor)
+        self.assertAlmostEqual(res.safety_factor, 20e6 / res.max_stress_pa, places=12)
+        self.assertNotAlmostEqual(res.safety_factor, 20e6 / res.max_stress_filtered_pa, places=12)
+        self.assertEqual(res.safety_factor_status, "pass")
+
+    def test_filtered_location_components_are_metres(self):
+        a, b, t = 0.1, 0.1, 0.002
+        res = shell_panel_response(a, b, t, 2e9, 0.35, 1000.0)
+        x, y, z = res.filtered_location
+        self.assertGreaterEqual(x, 0.0)
+        self.assertLessEqual(x, a)
+        self.assertGreaterEqual(y, 0.0)
+        self.assertLessEqual(y, b)
+        self.assertAlmostEqual(abs(z), t / 2.0, places=12)
+        disp = res.max_displacement_location
+        self.assertLessEqual(x, max(disp[0], disp[1], a, b))
+        self.assertLessEqual(y, max(disp[0], disp[1], a, b))
+
+    def test_square_panel_stress_series_not_converged_flag(self):
+        res = shell_panel_response(0.1, 0.1, 0.001, 2.3e9, 0.35, 5000.0, series_order=3)
+        self.assertIn(SERIES_NOT_CONVERGED, res.flags)
+        self.assertEqual(res.validity, "approximate")
+
+    def test_converged_square_panel_stress_has_no_series_flag(self):
+        # 2 mm panel at 1 kPa: deflection is ~0.16% of the span, so both the
+        # series convergence and the small-deflection validity hold.
+        res = shell_panel_response(0.1, 0.1, 0.002, 2.3e9, 0.35, 1000.0, series_order=9)
+        self.assertNotIn(SERIES_NOT_CONVERGED, res.flags)
+        self.assertEqual(res.validity, "valid")
+
+    def test_absurdly_thin_wall_downgrades_validity(self):
+        # A 1 mm panel at 5 kPa deflects ~10% of its span: linear small-
+        # deflection plate theory is violated by an order of magnitude, so
+        # the response must be downgraded instead of presented as valid.
+        res = shell_panel_response(0.1, 0.1, 0.001, 2.3e9, 0.35, 5000.0, series_order=9)
+        self.assertEqual(res.validity, "approximate")
+        self.assertIn(SMALL_DEFLECTION_VIOLATED, res.flags)
+
     def test_preflight_missing_fixture_issue(self):
         structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
         material = {"young_modulus_pa": 2e9, "poissons_ratio": 0.35,
@@ -192,6 +238,158 @@ class PhysicsTests(unittest.TestCase):
         self.assertAlmostEqual(abs(suction.max_displacement_m), positive.max_displacement_m, places=12)
         self.assertAlmostEqual(suction.max_displacement_location[0], 0.05, places=6)
         self.assertAlmostEqual(suction.max_displacement_location[1], 0.05, places=6)
+
+
+class OrthotropicShellTests(unittest.TestCase):
+    """Audit finding: the orthotropic Navier solver must reduce exactly to
+    the isotropic one for D11=D22=D, D12=nu*D, D66=D*(1-nu)/2."""
+
+    def test_orthotropic_reduces_to_isotropic(self):
+        a, b, t = 0.1, 0.1, 0.002
+        E, nu, p = 2e9, 0.35, 1000.0
+        D = E * t ** 3 / (12.0 * (1.0 - nu * nu))
+        isotropic = shell_panel_response(a, b, t, E, nu, p, allowable_pa=20e6)
+        orthotropic = shell_panel_response(
+            a, b, t, E, nu, p, allowable_pa=20e6,
+            D11=D, D12=nu * D, D22=D, D66=D * (1.0 - nu) / 2.0,
+        )
+        self.assertAlmostEqual(orthotropic.max_displacement_m, isotropic.max_displacement_m, places=12)
+        self.assertAlmostEqual(orthotropic.max_stress_pa, isotropic.max_stress_pa, places=12)
+        self.assertAlmostEqual(
+            orthotropic.max_stress_filtered_pa, isotropic.max_stress_filtered_pa, places=12
+        )
+        self.assertAlmostEqual(orthotropic.safety_factor, isotropic.safety_factor, places=12)
+
+    def test_fr4_anisotropic_panel_deflects_more_than_isotropic_run(self):
+        # FR-4 in-plane E=22 GPa with G12=7 GPa gives D66 well below the
+        # isotropic D(1-nu)/2, so the orthotropic panel is softer under
+        # twisting-dominated bending: deflection increases (documented
+        # direction of the anisotropy correction).
+        fr4 = builtin_materials()["FR4"]
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        load = {"kind": "pressure", "magnitude_pa": 1000.0}
+        orthotropic = solve_load_case(load, structure, fr4)
+        isotropic = shell_panel_response(
+            0.1, 0.1, 0.002, fr4.properties.young_modulus.value_si,
+            fr4.properties.poissons_ratio, 1000.0,
+        )
+        self.assertGreater(orthotropic.max_displacement_m, isotropic.max_displacement_m)
+        self.assertEqual(orthotropic.validity, "valid")
+        self.assertNotIn(UNSUPPORTED_ANISOTROPY, orthotropic.flags)
+
+    def test_anisotropy_supported_without_directional_data_flagged(self):
+        abs_mat = builtin_materials()["ABS"]
+        flagged = replace(abs_mat, anisotropy_supported=True)
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        res = solve_load_case({"kind": "pressure", "magnitude_pa": 1000.0}, structure, flagged)
+        self.assertIn(UNSUPPORTED_ANISOTROPY, res.flags)
+        self.assertEqual(res.validity, "approximate")
+        self.assertTrue(any("anisotropic" in item for item in res.assumptions))
+        self.assertTrue(any("under-predicts deflection" in item for item in res.assumptions))
+
+    def test_anisotropic_material_on_beam_path_flagged(self):
+        fr4 = builtin_materials()["FR4"]
+        structure = {"type": "beam", "L_m": 0.1, "I_m4": 1e-8, "A_m2": 1e-4,
+                     "section_modulus_m3": 1e-6, "support": "cantilever"}
+        res = solve_load_case({"kind": "force", "force_n": 10.0}, structure, fr4)
+        self.assertIn(UNSUPPORTED_ANISOTROPY, res.flags)
+        self.assertEqual(res.validity, "approximate")
+
+
+class TemperatureDeratingTests(unittest.TestCase):
+    """Audit finding: linear modulus/allowable derating above 293.15 K with
+    per-material coefficients; disclosed, never silent."""
+
+    def test_abs_at_80c_derates_modulus_and_allowable(self):
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002,
+                     "temperature_k": 353.15}
+        load = {"kind": "pressure", "magnitude_pa": 1000.0}
+        hot = solve_load_case(load, structure, builtin_materials()["ABS"])
+        cold = solve_load_case(
+            {"kind": "pressure", "magnitude_pa": 1000.0},
+            {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002},
+            builtin_materials()["ABS"],
+        )
+        self.assertEqual(hot.validity, "approximate")
+        self.assertIn("temperature derating applied at T=353.15 K", hot.validity_reasons)
+        self.assertTrue(any("linear temperature derating" in item and "353.15" in item
+                            for item in hot.assumptions))
+        self.assertLess(hot.safety_factor, cold.safety_factor)
+        self.assertGreater(hot.max_displacement_m, cold.max_displacement_m)
+
+    def test_no_derating_at_or_below_reference_temperature(self):
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002,
+                     "temperature_k": 293.15}
+        res = solve_load_case({"kind": "pressure", "magnitude_pa": 1000.0}, structure,
+                              builtin_materials()["ABS"])
+        self.assertEqual(res.validity, "valid")
+        self.assertFalse(any("derating" in item for item in res.assumptions))
+
+    def test_usage_temperature_outside_continuous_use_range_reported(self):
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002,
+                     "temperature_k": 453.15}
+        res = solve_load_case({"kind": "pressure", "magnitude_pa": 1000.0}, structure,
+                              builtin_materials()["ABS"])
+        self.assertEqual(res.validity, "approximate")
+        self.assertIn("usage temperature outside continuous-use range", res.validity_reasons)
+
+
+class FeatureStressConcentrationTests(unittest.TestCase):
+    """Audit finding: feature_peak_stress_pa is disclosed-only; the nominal
+    max_stress_pa and safety factor stay unchanged."""
+
+    def test_button_press_applies_kf_but_keeps_nominal_stress(self):
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        load = {"kind": "force", "force_n": 5.0, "point_load": True}
+        res = solve_load_case(load, structure, builtin_materials()["ABS"])
+        k_f = 1.0 + 0.6 * (3.0 - 1.0)
+        self.assertIsNotNone(res.feature_peak_stress_pa)
+        self.assertAlmostEqual(res.feature_peak_stress_pa, res.max_stress_pa * k_f, places=12)
+        self.assertTrue(any("stress-concentration K_f=2.2" in item for item in res.assumptions))
+        direct = solve_load_case(load, structure, builtin_materials()["ABS"])
+        self.assertEqual(res.max_stress_pa, direct.max_stress_pa)
+        self.assertEqual(res.safety_factor, direct.safety_factor)
+
+    def test_localized_pressure_applies_kf(self):
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        load = {"kind": "pressure", "magnitude_pa": 5000.0, "distribution": "localized"}
+        res = solve_load_case(load, structure, builtin_materials()["ABS"])
+        k_f = 1.0 + 0.6 * (2.0 - 1.0)
+        self.assertAlmostEqual(res.feature_peak_stress_pa, res.max_stress_pa * k_f, places=12)
+
+    def test_uniform_pressure_has_no_feature_concentration(self):
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        res = solve_load_case({"kind": "pressure", "magnitude_pa": 1000.0}, structure,
+                              builtin_materials()["ABS"])
+        self.assertIsNone(res.feature_peak_stress_pa)
+
+    def test_feature_peak_stress_serializes_in_to_dict(self):
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        res = solve_load_case({"kind": "force", "force_n": 5.0, "point_load": True},
+                              structure, builtin_materials()["ABS"])
+        data = res.to_dict()
+        self.assertIn("feature_peak_stress_pa", data)
+        self.assertIn("validity_reasons", data)
+        json.dumps(data)
+
+
+class WeldLineDisclosureTests(unittest.TestCase):
+    """Audit finding: weld-line knockdown is disclosed as a secondary
+    allowable, never silently re-verdicting the primary safety factor."""
+
+    def test_weld_line_derated_allowable_disclosed(self):
+        material = builtin_materials()["ABS"]
+        welded = replace(material, properties=replace(material.properties, weld_line_factor=0.6))
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        res = solve_load_case({"kind": "pressure", "magnitude_pa": 1000.0}, structure, welded)
+        allowable = material.properties.tensile_allowable.value_si
+        self.assertEqual(res.weld_line_derated_allowable_pa, allowable * 0.6)
+        self.assertTrue(any("weld-line strength knockdown" in item for item in res.assumptions))
+        self.assertEqual(res.validity, "valid")
+        plain = solve_load_case({"kind": "pressure", "magnitude_pa": 1000.0}, structure,
+                                builtin_materials()["ABS"])
+        self.assertEqual(res.safety_factor, plain.safety_factor)
+        self.assertEqual(res.max_stress_pa, plain.max_stress_pa)
 
 
 class LoadUnitGuardTests(unittest.TestCase):

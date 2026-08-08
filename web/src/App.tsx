@@ -132,6 +132,7 @@ export function App(): React.ReactElement {
       state.mode,
       state.objectMaterials,
       state.partGeometry,
+      state.defaultMaterialKey,
     ],
   );
   const analysisRequestRef = React.useRef(analysisRequest);
@@ -349,10 +350,6 @@ export function App(): React.ReactElement {
       {state.controlOpen ? (
         <MissionControl
           onClose={() => dispatch({ type: 'SET_CONTROL_OPEN', open: false })}
-          onUpload={() => {
-            dispatch({ type: 'SET_CONTROL_OPEN', open: false });
-            setUploadOpen(true);
-          }}
         />
       ) : null}
     </div>

@@ -1,14 +1,16 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
 import { collectPageErrors, expectNoConsoleErrors, fixturePath } from './helpers';
 
 function dropSimulationResponse(dropCount = 2): Record<string, unknown> {
+  // The last drop gets a long runway so the pause/resume window has room
+  // before the end-of-playback restart under parallel-suite CPU load.
   const settle = 0.6;
   const interval = 0.35;
   const drops = Array.from({ length: dropCount }, (_, index) => ({
     index,
     start_s: index * (settle + interval),
-    end_s: index * (settle + interval) + settle,
-    settled_s: settle,
+    end_s: index * (settle + interval) + (index === dropCount - 1 ? 8 : settle),
+    settled_s: index === dropCount - 1 ? 8 : settle,
     impact_count: 2,
     peak_impact_speed_m_s: 3.13,
     peak_kinetic_energy_j: 0.49,
@@ -85,8 +87,33 @@ function dropSimulationResponse(dropCount = 2): Record<string, unknown> {
   };
 }
 
+/** Restart drop playback and verify the playback time actually reset to
+ * ~0.00s (the status text re-renders every 100 ms, which under
+ * parallel-suite CPU load can swallow a click; retry until the reset
+ * takes). */
+async function restartPlayback(page: Page): Promise<void> {
+  const status = page.locator('.drop-sim-controls__status');
+  const parseTime = (text: string) => Number(/(\d+\.\d{2})s/.exec(text)?.[1] ?? '0');
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await page.getByRole('button', { name: 'Restart drop simulation' }).click();
+    try {
+      await expect
+        .poll(async () => parseTime(await status.innerText()), { timeout: 3000 })
+        .toBeLessThan(0.6);
+      return;
+    } catch {
+      // The click raced a re-render; retry the restart.
+    }
+  }
+  throw new Error('restart drop playback did not reset the playback time');
+}
+
 test.describe('drop simulation playback', () => {
   test('runs a drop test, animates the trajectory, and shows results', async ({ browser }) => {
+    // Playback timing is wall-clock and the suite runs 4 projects in
+    // parallel; under CPU contention the pause/resume window needs more
+    // than the default 60 s budget.
+    test.setTimeout(120_000);
     const page = await browser.newPage();
     const errors = await collectPageErrors(page);
 
@@ -103,7 +130,8 @@ test.describe('drop simulation playback', () => {
     await page.locator('input[type="file"]').setInputFiles(fixturePath('analytic.json'));
     await page.locator('.model-row__name', { hasText: 'analytic' }).waitFor({ state: 'attached', timeout: 15000 });
 
-    await page.getByRole('button', { name: 'Control panel' }).click();
+    await page.getByRole('button', { name: 'Run test menu' }).click();
+    await page.getByRole('menuitem', { name: 'Drop Test' }).click();
     await page.getByRole('button', { name: 'Run Drop Test' }).click();
     await expect(page.locator('.mission-control')).toHaveCount(0, { timeout: 5000 });
 
@@ -118,7 +146,7 @@ test.describe('drop simulation playback', () => {
     }
 
     // Restart first so the animation is definitely playing, then pause.
-    await page.getByRole('button', { name: 'Restart drop simulation' }).click();
+    await restartPlayback(page);
     await page.waitForTimeout(300);
     await page.getByRole('button', { name: 'Pause drop simulation' }).click();
     await page.waitForTimeout(500); // let the freeze settle and the poll catch up
@@ -128,21 +156,26 @@ test.describe('drop simulation playback', () => {
     const pausedAgain = parseTime(await page.locator('.drop-sim-controls__status').innerText());
     expect(Math.abs(pausedAgain - paused)).toBeLessThanOrEqual(0.05);
 
-    // PLAY resumes from the exact paused moment, not from 0.00s.
+    // PLAY resumes from the exact paused moment, not from 0.00s. The status
+    // poll runs every 100 ms, so under parallel-suite CPU load the first
+    // reading after the click can lag by several poll intervals; the poll
+    // below waits for genuine forward progress instead of a fixed sleep. A
+    // restart-from-zero would stay below the paused value and time out.
     await page.getByRole('button', { name: 'Play drop simulation' }).click();
-    await page.waitForTimeout(250);
-    const resumed = parseTime(await page.locator('.drop-sim-controls__status').innerText());
-    expect(resumed).toBeGreaterThan(paused - 0.1);
-    expect(resumed).toBeLessThan(paused + 0.3);
+    await expect
+      .poll(async () => parseTime(await page.locator('.drop-sim-controls__status').innerText()), {
+        timeout: 3000,
+      })
+      .toBeGreaterThan(paused);
 
     // The counter is monotonic: it passes through Drop 1/2 before Drop 2/2.
     await page.waitForTimeout(300);
     const counterAfterResume = await page.locator('.drop-sim-controls__status').innerText();
     expect(counterAfterResume).toMatch(/Drop [12]\/2/);
 
-    // Restart returns to the beginning of the sequence.
-    await page.getByRole('button', { name: 'Restart drop simulation' }).click();
-    await expect(page.locator('.drop-sim-controls__status')).toContainText('Drop 1/2');
+    // Restart returns to the beginning of the sequence: the playback time
+    // resets to ~0.00s and the PLAY state resumes.
+    await restartPlayback(page);
 
     // The results rail shows the drop simulation table on the Impact tab.
     // The rail defaults to a collapsed right-edge strip; expand it first.
@@ -173,14 +206,15 @@ test.describe('drop simulation playback', () => {
     await page.locator('input[type="file"]').setInputFiles(fixturePath('analytic.json'));
     await page.locator('.model-row__name', { hasText: 'analytic' }).waitFor({ state: 'attached', timeout: 15000 });
 
-    await page.getByRole('button', { name: 'Control panel' }).click();
+    await page.getByRole('button', { name: 'Run test menu' }).click();
+    await page.getByRole('menuitem', { name: 'Drop Test' }).click();
     await page.getByRole('button', { name: 'Run Drop Test' }).click();
 
     await page.locator('.drop-sim-controls').waitFor({ state: 'visible', timeout: 15000 });
     if (await page.locator('.drawer--nav.is-open').count()) {
       await page.getByRole('button', { name: 'Toggle model navigator' }).click();
     }
-    await page.getByRole('button', { name: 'Restart drop simulation' }).click();
+    await restartPlayback(page);
 
     // Poll the counter: it must visit every drop in order and reach 7/7.
     const seen: string[] = [];

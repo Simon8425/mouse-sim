@@ -30,6 +30,9 @@ test.describe('upload flow', () => {
   });
 
   test('STEP upload normalizes and updates model tree', async () => {
+    // STEP normalization runs a FreeCAD worker; under parallel-suite CPU
+    // load the round trip can exceed the default 60 s.
+    test.setTimeout(120_000);
     await modelLoaded(page);
     await page.getByRole('button', { name: 'Upload geometry' }).click();
     const fileInput = page.locator('input[type="file"]');
@@ -42,6 +45,9 @@ test.describe('upload flow', () => {
   });
 
   test('Advanced STEP upload displays structured diagnostic', async () => {
+    // STEP parsing runs the FreeCAD worker; under parallel-suite CPU load
+    // the round trip can exceed the default 60 s.
+    test.setTimeout(120_000);
     await modelLoaded(page);
     await page.getByRole('button', { name: 'Upload geometry' }).click();
     const fileInput = page.locator('input[type="file"]');

@@ -196,7 +196,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
 
   const updatePixelRatio = () => {
     const dpr = window.devicePixelRatio || 1;
-    const maxRatio = quality === 'high' ? 2 : 1.5;
+    const maxRatio = quality === 'ultra' ? 2.5 : quality === 'high' ? 2 : 1.5;
     renderer.setPixelRatio(Math.min(dpr, maxRatio));
   };
   updatePixelRatio();
@@ -216,8 +216,8 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   const keyLight = new THREE.DirectionalLight(0xffffff, 2.4);
   keyLight.position.set(0.5, -0.8, 1);
   keyLight.castShadow = quality !== 'low';
-  keyLight.shadow.mapSize.width = quality === 'high' ? 1024 : 512;
-  keyLight.shadow.mapSize.height = quality === 'high' ? 1024 : 512;
+  keyLight.shadow.mapSize.width = quality === 'ultra' ? 2048 : quality === 'high' ? 1024 : 512;
+  keyLight.shadow.mapSize.height = quality === 'ultra' ? 2048 : quality === 'high' ? 1024 : 512;
   keyLight.userData.owned = true;
 
   const fillLight = new THREE.DirectionalLight(0xffffff, 1.1);
@@ -243,6 +243,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   let groundMesh: THREE.Mesh | null = null;
   let boundsUnion = { min: [-0.05, -0.05, -0.05] as Vec3, max: [0.05, 0.05, 0.05] as Vec3 };
   let maxDimension = 0.1;
+  let floorSize = 2.5;
 
   const syncGridAndGround = () => {
     if (gridHelper) {
@@ -254,10 +255,16 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       groundMesh = null;
     }
 
-    const size = Math.max(maxDimension * 5, 0.2);
+    const size = Math.max(maxDimension * 10, 2.5);
+    floorSize = size;
     const gridColor = theme === 'dark' ? 0x2e2c25 : 0xd8d5cc;
-    gridHelper = new THREE.GridHelper(size, 20, gridColor, gridColor);
+    gridHelper = new THREE.GridHelper(size, 24, gridColor, gridColor);
     gridHelper.rotation.x = Math.PI / 2;
+    gridHelper.position.set(
+      (boundsUnion.min[0] + boundsUnion.max[0]) / 2,
+      (boundsUnion.min[1] + boundsUnion.max[1]) / 2,
+      boundsUnion.min[2] - 0.001,
+    );
     gridHelper.userData.owned = true;
     scene.add(gridHelper);
 
@@ -277,6 +284,27 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     }
   };
   syncGridAndGround();
+
+  // Model ∪ floor framing bounds: keeps the floor's outer edge (with a
+  // generous margin) and the ground level inside the camera frustum, even
+  // when a drop envelope sits entirely above the floor plane.
+  const floorFramingBounds = (): { min: Vec3; max: Vec3 } => {
+    const cx = (boundsUnion.min[0] + boundsUnion.max[0]) / 2;
+    const cy = (boundsUnion.min[1] + boundsUnion.max[1]) / 2;
+    const half = floorSize / 2 + floorSize * 0.2;
+    return {
+      min: [
+        Math.min(boundsUnion.min[0], cx - half),
+        Math.min(boundsUnion.min[1], cy - half),
+        boundsUnion.min[2],
+      ],
+      max: [
+        Math.max(boundsUnion.max[0], cx + half),
+        Math.max(boundsUnion.max[1], cy + half),
+        boundsUnion.max[2],
+      ],
+    };
+  };
 
   // Post processing
   let composer: EffectComposer | null = null;
@@ -427,7 +455,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
         // parsing fallback.
         const fallback = createObjectGroup(
           { ...entry, displayAssetUrl: null },
-          { quality, materials: palette.getAll() },
+          { quality: quality === 'ultra' ? 'high' : quality, materials: palette.getAll() },
         );
         target.add(fallback);
         target.userData.meshObjects = fallback.userData.meshObjects ?? [];
@@ -456,7 +484,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       outerGroup.matrixAutoUpdate = true;
 
       const innerGroup = createObjectGroup(entry, {
-        quality,
+        quality: quality === 'ultra' ? 'high' : quality,
         materials: palette.getAll(),
       });
       outerGroup.add(innerGroup);
@@ -492,6 +520,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
 
     syncGridAndGround();
     overlayLayer.setPlaneRadius(maxDimension / 2);
+    overlayLayer.setContactPlaneRadius(floorSize / 2);
     applyExplode();
     applySelection();
   };
@@ -651,7 +680,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
 
       if (first || idSignature !== currentIdSignature) {
         currentIdSignature = idSignature;
-        fitCameraToBounds(camera, controls, boundsUnion);
+        fitCameraToBounds(camera, controls, floorFramingBounds());
       }
     },
 
@@ -688,8 +717,8 @@ scene.background = new THREE.Color(theme === 'dark' ? 0x141310 : 0xf7f7f4);
       updatePixelRatio();
       renderer.shadowMap.enabled = quality !== 'low';
       keyLight.castShadow = quality !== 'low';
-      keyLight.shadow.mapSize.width = quality === 'high' ? 1024 : 512;
-      keyLight.shadow.mapSize.height = quality === 'high' ? 1024 : 512;
+      keyLight.shadow.mapSize.width = quality === 'ultra' ? 2048 : quality === 'high' ? 1024 : 512;
+      keyLight.shadow.mapSize.height = quality === 'ultra' ? 2048 : quality === 'high' ? 1024 : 512;
       initComposer();
       rebuildObjects();
     },
@@ -707,19 +736,21 @@ scene.background = new THREE.Color(theme === 'dark' ? 0x141310 : 0xf7f7f4);
       lastFrameTime = null;
       applyDropTransform();
       if (simulation) {
-        // Frame the whole drop envelope (trajectory AABB ∪ model bounds) so
-        // the fall is visible instead of happening off-screen.
+        // Frame the whole drop envelope (trajectory AABB ∪ model bounds ∪
+        // floor extent) so the fall, the impact, and the surrounding floor
+        // are visible instead of happening off-screen.
         const trajectory = dropTrajectoryBounds(simulation);
+        const floor = floorFramingBounds();
         const combined: { min: Vec3; max: Vec3 } = {
           min: [
-            Math.min(trajectory.min[0], boundsUnion.min[0]),
-            Math.min(trajectory.min[1], boundsUnion.min[1]),
-            Math.min(trajectory.min[2], boundsUnion.min[2]),
+            Math.min(trajectory.min[0], floor.min[0]),
+            Math.min(trajectory.min[1], floor.min[1]),
+            Math.min(trajectory.min[2], floor.min[2]),
           ],
           max: [
-            Math.max(trajectory.max[0], boundsUnion.max[0]),
-            Math.max(trajectory.max[1], boundsUnion.max[1]),
-            Math.max(trajectory.max[2], boundsUnion.max[2]),
+            Math.max(trajectory.max[0], floor.max[0]),
+            Math.max(trajectory.max[1], floor.max[1]),
+            Math.max(trajectory.max[2], floor.max[2]),
           ],
         };
         fitCameraToBounds(camera, controls, combined);
@@ -755,7 +786,7 @@ scene.background = new THREE.Color(theme === 'dark' ? 0x141310 : 0xf7f7f4);
 
     fit() {
       if (disposed) return;
-      fitCameraToBounds(camera, controls, boundsUnion);
+      fitCameraToBounds(camera, controls, floorFramingBounds());
     },
 
     preset(name: CameraPreset) {

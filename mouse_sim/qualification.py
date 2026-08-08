@@ -38,11 +38,19 @@ GATE_SPECS = (
     ("ANALYSIS_VALIDITY", "Underlying analysis validity is clean"),
     ("IMPACT_VALIDITY", "Impact state is not blocked and carries no unsupported modes"),
     ("CORRELATION_ERROR", "Correlation error fractions within policy maximum"),
+    ("CORRELATION_MEASURED", "Predicted vs measured drop response within acceptance"),
     ("REQUIREMENT_EVALUATION", "Structured requirement targets evaluate to pass"),
     ("CONVERGENCE_EVIDENCE", "Claimed convergence/force-balance evidence is substantiated"),
 )
 
 _GATE_LABELS = dict(GATE_SPECS)
+
+# Measured-drop correlation acceptance (CORRELATION_MEASURED): the pipeline
+# agent emits result["correlation"] from a measured-drop campaign.
+MIN_DROP_CONDITIONS = 3
+MAX_RELATIVE_ERROR = 0.25
+MIN_R_SQUARED = 0.80
+MAX_ABS_BIAS = 0.10
 
 
 @dataclass(frozen=True)
@@ -412,9 +420,13 @@ def _correlation_gate(method, correlation_records):
         failures.append("missing record types: {}".format(", ".join(missing_types)))
     if require_reviewed and unreviewed:
         failures.append("unreviewed records: {}".format(", ".join(unreviewed)))
-    explanation = "; ".join(failures) if failures else (
-        "required correlation records exist and are reviewed"
-    )
+    if failures:
+        explanation = "; ".join(failures)
+    else:
+        explanation = (
+            "required correlation records exist and are reviewed; "
+            "records are self-reported; not verified against simulated output"
+        )
     return _gate("CORRELATION", passed=not failures, evaluable=True, blocker=True, explanation=explanation)
 
 
@@ -498,29 +510,44 @@ def _structural_validity(structural_response):
     return state, tuple(sorted({str(item) for item in unsupported}))
 
 
-def _analysis_validity_gate(structural_response, validation_report):
-    """ANALYSIS_VALIDITY: the underlying analysis must be valid and complete."""
+def _analysis_validity_gate(structural_response, validation_report, load_case=None):
+    """ANALYSIS_VALIDITY: the underlying analysis must be valid and complete.
+
+    Blocks only on an invalid/inconclusive structural response validity or on
+    a pinned load case that produced no structural analysis.  Unsupported
+    failure modes describe model scope, not analysis failure: they are
+    disclosed in the explanation but are not a hard block.
+    """
     failures = []
+    unsupported = []
     if structural_response is not None:
         state, unsupported = _structural_validity(structural_response)
         if state is None:
             failures.append("structural response carries no validity state")
         elif state != ValidityState.VALID:
             failures.append("structural response validity is {}".format(state.value))
-        if unsupported:
-            failures.append(
-                "structural response carries unsupported failure modes: {}".format(
-                    ", ".join(unsupported)
-                )
-            )
+    elif load_case is not None:
+        failures.append("load case pinned but no structural analysis performed")
     if validation_report is not None:
         report_status = str(_get(validation_report, "status", default="") or "").casefold()
         if report_status == "fail":
             failures.append("validation report status is fail")
     if failures:
-        return _gate("ANALYSIS_VALIDITY", False, True, True, "; ".join(failures))
+        explanation = "; ".join(failures)
+        if unsupported:
+            explanation += " (unsupported failure modes disclosed: {})".format(
+                ", ".join(unsupported)
+            )
+        return _gate("ANALYSIS_VALIDITY", False, True, True, explanation)
+    if unsupported:
+        return _gate(
+            "ANALYSIS_VALIDITY", True, True, True,
+            "underlying analysis is valid; unsupported failure modes disclosed: {}".format(
+                ", ".join(unsupported)
+            ),
+        )
     explanation = (
-        "underlying analysis is valid with no unsupported failure modes"
+        "underlying analysis is valid"
         if structural_response is not None
         else "no structural analysis performed; no validity constraints apply"
     )
@@ -558,23 +585,39 @@ def _impact_gate(impact):
 
 
 def _comparison_error_fraction(comparison):
-    """Measured-to-predicted error fraction of a comparison, or None."""
+    """Measured-to-predicted error fraction of a comparison.
+
+    Returns ``(fraction, reason)``.  Fail-closed: the fraction is computed
+    from the measured/predicted pair only (no relative_error override); a
+    comparison that lacks a numeric pair, carries NaN/inf values, has a
+    zero predicted value, or a negative measured value returns ``None``
+    with an explicit reason and never counts as passing.
+    """
     if comparison is None:
-        return None
-    relative = _get(comparison, "relative_error")
-    if relative is not None:
-        value = _numeric(relative)
-        if value is not None:
-            return abs(value)
-    measured = _numeric(_get(comparison, "measured"))
-    predicted = _numeric(_get(comparison, "predicted"))
-    if measured is None or predicted is None or predicted == 0.0:
-        return None
-    return abs(measured - predicted) / abs(predicted)
+        return None, "comparison lacks measured/predicted values"
+    raw_measured = _get(comparison, "measured")
+    raw_predicted = _get(comparison, "predicted")
+    if raw_measured is None or raw_predicted is None:
+        return None, "comparison lacks measured/predicted values"
+    measured = _numeric(raw_measured)
+    predicted = _numeric(raw_predicted)
+    if measured is None or predicted is None:
+        return None, "comparison measured/predicted values are not numeric or finite"
+    if predicted == 0.0:
+        return None, "predicted value is zero; error fraction undefined"
+    if measured < 0.0:
+        return None, "measured value is negative"
+    return abs(measured - predicted) / abs(predicted), ""
 
 
 def _correlation_error_gate(method, correlation_records):
-    """CORRELATION_ERROR: error fractions must not exceed the policy maximum."""
+    """CORRELATION_ERROR: error fractions must not exceed the policy maximum.
+
+    Fail-closed: an unparsable comparison (missing/non-numeric/non-finite
+    values, zero predicted, negative measured) is a failing comparison with
+    an explicit reason, and a required correlation policy without a
+    configured maximum error fraction fails the gate.
+    """
     if method is None:
         return _gate("CORRELATION_ERROR", False, False, True, "no analysis method provided")
     policy = _get(method, "required_correlation_policy")
@@ -583,7 +626,8 @@ def _correlation_error_gate(method, correlation_records):
     maximum = _numeric(_get(policy, "maximum_error_fraction"))
     if maximum is None:
         return _gate(
-            "CORRELATION_ERROR", True, True, True, "no maximum error fraction configured"
+            "CORRELATION_ERROR", False, True, True,
+            "correlation required but no maximum error fraction configured",
         )
     records = _correlation_records(correlation_records)
     if not records:
@@ -592,15 +636,20 @@ def _correlation_error_gate(method, correlation_records):
     for record in records:
         record_type = str(_get(record, "record_type", default="") or "")
         for comparison in _get(record, "comparisons", default=()) or ():
-            fraction = _comparison_error_fraction(comparison)
-            if fraction is None or fraction <= maximum:
+            fraction, reason = _comparison_error_fraction(comparison)
+            if fraction is not None and fraction <= maximum:
                 continue
             metric = str(_get(comparison, "metric_key", default="") or "") or "metric"
-            violations.append(
-                "{}[{}]: error fraction {:.6g} exceeds maximum {:.6g}".format(
-                    record_type, metric, fraction, maximum
+            if fraction is None:
+                violations.append(
+                    "{}[{}]: {}".format(record_type, metric, reason)
                 )
-            )
+            else:
+                violations.append(
+                    "{}[{}]: error fraction {:.6g} exceeds maximum {:.6g}".format(
+                        record_type, metric, fraction, maximum
+                    )
+                )
     if violations:
         return _gate(
             "CORRELATION_ERROR", False, True, True,
@@ -722,7 +771,11 @@ def _evaluate_requirement(requirement, pipeline_result):
 
 
 def _requirement_evaluation_gate(evaluations):
-    """REQUIREMENT_EVALUATION: structured targets must measure to pass."""
+    """REQUIREMENT_EVALUATION: structured targets must measure to pass.
+
+    With no structured requirement targets the gate is not applicable: it is
+    reported as such instead of claiming an empty pass.
+    """
     failures = []
     for evaluation in evaluations:
         status = evaluation.get("status")
@@ -734,11 +787,12 @@ def _requirement_evaluation_gate(evaluations):
     if failures:
         return _gate("REQUIREMENT_EVALUATION", False, True, True, "; ".join(failures))
     evaluated = [item for item in evaluations if item.get("status") != "not_evaluated"]
-    explanation = (
-        "all evaluated requirements pass"
-        if evaluated else "no structured requirement targets to evaluate"
-    )
-    return _gate("REQUIREMENT_EVALUATION", True, True, True, explanation)
+    if not evaluated:
+        return _gate(
+            "REQUIREMENT_EVALUATION", False, False, False,
+            "not applicable: no structured requirement targets to evaluate",
+        )
+    return _gate("REQUIREMENT_EVALUATION", True, True, True, "all evaluated requirements pass")
 
 
 def _convergence_evidence_gate(convergence_evidence, force_balance, structural_response):
@@ -770,6 +824,93 @@ def _convergence_evidence_gate(convergence_evidence, force_balance, structural_r
     return _gate(
         "CONVERGENCE_EVIDENCE", True, True, True,
         "{} evidence substantiated by a valid structural response".format(label),
+    )
+
+
+def _metric_relative_error(metric):
+    """Relative error of one measured-drop metric, or None when missing.
+
+    Prefers the measured/predicted pair (fail-closed: a missing or
+    non-numeric pair yields None, never a pass); falls back to the
+    relative_error field reported by the pipeline agent.
+    """
+    raw_measured = _get(metric, "measured")
+    raw_predicted = _get(metric, "predicted")
+    if raw_measured is not None and raw_predicted is not None:
+        measured = _numeric(raw_measured)
+        predicted = _numeric(raw_predicted)
+        if measured is not None and predicted is not None and predicted != 0.0:
+            return abs(measured - predicted) / abs(predicted)
+        return None
+    return _numeric(_get(metric, "relative_error"))
+
+
+def _correlation_measured_gate(pipeline_result):
+    """CORRELATION_MEASURED: predicted vs measured drop response within
+    acceptance.
+
+    Reads ``result["correlation"]`` (emitted by the pipeline agent) with
+    shape {conditions: [{drop_id, metrics: [{metric_key, measured,
+    predicted, relative_error, pass}]}], r_squared, bias, verdict,
+    explanation}.  The gate passes when at least ``MIN_DROP_CONDITIONS``
+    conditions were evaluated, every per-metric relative error is within
+    ``MAX_RELATIVE_ERROR``, r_squared >= ``MIN_R_SQUARED`` and
+    |bias| <= ``MAX_ABS_BIAS``.  An absent correlation section is
+    tolerated: non-evaluable and non-blocking, so runs without a
+    measured-drop campaign are not penalized.
+    """
+    correlation = pipeline_result.get("correlation") if pipeline_result is not None else None
+    if correlation is None:
+        return _gate(
+            "CORRELATION_MEASURED", False, False, False,
+            "no measured-drop correlation supplied",
+        )
+    conditions = _get(correlation, "conditions", default=()) or ()
+    r_squared = _numeric(_get(correlation, "r_squared"))
+    bias = _numeric(_get(correlation, "bias"))
+    failures = []
+    if len(conditions) < MIN_DROP_CONDITIONS:
+        failures.append(
+            "only {} drop condition(s) evaluated; minimum {} required".format(
+                len(conditions), MIN_DROP_CONDITIONS
+            )
+        )
+    max_relative = 0.0
+    for condition in conditions:
+        drop_id = str(_get(condition, "drop_id", default="") or "") or "drop"
+        for metric in _get(condition, "metrics", default=()) or ():
+            metric_key = str(_get(metric, "metric_key", default="") or "") or "metric"
+            relative = _metric_relative_error(metric)
+            if relative is None:
+                failures.append(
+                    "{}[{}]: comparison lacks numeric measured/predicted values".format(
+                        drop_id, metric_key
+                    )
+                )
+                continue
+            max_relative = max(max_relative, relative)
+            if relative > MAX_RELATIVE_ERROR:
+                failures.append(
+                    "{}[{}]: relative error {:.3f} exceeds maximum {:.3f}".format(
+                        drop_id, metric_key, relative, MAX_RELATIVE_ERROR
+                    )
+                )
+    if r_squared is None:
+        failures.append("r_squared is not numeric or missing")
+    elif r_squared < MIN_R_SQUARED:
+        failures.append("r_squared {:.3f} below minimum {:.3f}".format(r_squared, MIN_R_SQUARED))
+    if bias is None:
+        failures.append("bias is not numeric or missing")
+    elif abs(bias) > MAX_ABS_BIAS:
+        failures.append("|bias| {:.3f} exceeds maximum {:.3f}".format(abs(bias), MAX_ABS_BIAS))
+    if failures:
+        return _gate("CORRELATION_MEASURED", False, True, True, "; ".join(failures))
+    return _gate(
+        "CORRELATION_MEASURED", True, True, True,
+        "predicted vs measured drop response within acceptance "
+        "(r_squared {:.3f}, max relative error {:.3f}, bias {:.3f})".format(
+            r_squared, max_relative, bias
+        ),
     )
 
 
@@ -805,7 +946,8 @@ def evaluate_qualification(
     analysis is invalid, incomplete, or unsupported: an inconclusive or
     failed structural response, unsupported failure modes, a failed
     validation report, a qualification-blocked or unsupported impact result,
-    correlation error fractions beyond the policy maximum, unmeasurable or
+    correlation error fractions beyond the policy maximum, a measured-drop
+    correlation outside the acceptance band (when supplied), unmeasurable or
     failing structured requirement targets, or claimed convergence/force
     balance evidence that a valid structural response cannot substantiate.
     """
@@ -837,9 +979,10 @@ def evaluate_qualification(
         _validation_gate(validation_report),
     ]
     integrity_gates = [
-        _analysis_validity_gate(structural_response, validation_report),
+        _analysis_validity_gate(structural_response, validation_report, load_case),
         _impact_gate(impact),
         _correlation_error_gate(method, correlation_records),
+        _correlation_measured_gate(pipeline_result),
         _requirement_evaluation_gate(requirement_evaluations),
         _convergence_evidence_gate(convergence_evidence, force_balance, structural_response),
     ]
@@ -847,7 +990,9 @@ def evaluate_qualification(
     integrity_gates = tuple(sorted(integrity_gates, key=lambda gate: gate.key))
     all_gates = gates + integrity_gates
     blocking_keys = tuple(
-        gate.key for gate in all_gates if (not gate.evaluable) or (gate.blocker and not gate.passed)
+        gate.key
+        for gate in all_gates
+        if gate.blocker and (not gate.evaluable or not gate.passed)
     )
     if mode_value == "exploration":
         qualified = False

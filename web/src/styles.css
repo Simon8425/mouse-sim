@@ -693,14 +693,6 @@ code,
   background: var(--text-muted);
 }
 
-.results-rail__empty-container {
-  display: flex;
-  min-height: 90px;
-  align-items: center;
-  justify-content: center;
-  padding: 14px;
-}
-
 .results-rail__deck-header,
 .results-rail__toolbar {
   display: flex;
@@ -723,12 +715,6 @@ code,
   font-size: 12px;
   font-weight: 500;
   letter-spacing: -0.01em;
-}
-
-.results-rail__deck-id {
-  color: var(--text-muted);
-  font-family: var(--font-mono);
-  font-size: 10px;
 }
 
 /* Flat, slim inline metric cards */
@@ -778,32 +764,6 @@ code,
   font-size: 9px;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-/* Clean, dark disclosure bar (no brown) */
-.results-rail__disclosure {
-  margin: 6px 12px 0;
-  padding: 6px 10px;
-  border: 1px solid var(--border-color);
-  border-radius: 0px;
-  background: var(--bg-surface-raised);
-  color: var(--text-secondary);
-  font-size: 11px;
-}
-
-.results-rail__disclosure summary {
-  cursor: pointer;
-  color: var(--text-primary);
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 500;
-  letter-spacing: 0.02em;
-}
-
-.results-rail__disclosure ul {
-  display: grid;
-  padding: 6px 0 0 14px;
-  gap: 3px;
 }
 
 .results-rail__tabs {
@@ -905,6 +865,418 @@ code,
 .results-rail__note {
   color: var(--text-muted);
   font-size: 11px;
+}
+
+/* Slim 2-column key-value list used across all tabs */
+.results-rail__kv {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.results-rail__kv th,
+.results-rail__kv td {
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border-color);
+  text-align: left;
+  vertical-align: top;
+}
+
+.results-rail__kv th {
+  width: 40%;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.results-rail__kv td {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  overflow-wrap: break-word;
+}
+
+.results-rail__kv td code {
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+/* Stale-result banner */
+.stale-banner {
+  margin: 6px 12px 0;
+  padding: 5px 8px;
+  border: 1px solid var(--badge-warn-bg);
+  background: var(--bg-surface-raised);
+  color: var(--badge-warn-fg);
+  font-size: 10px;
+}
+
+/* Default-material usage banner */
+.model-tree__default-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 6px 12px 0;
+  padding: 5px 8px;
+  border: 1px solid var(--badge-warn-bg);
+  background: var(--bg-surface-raised);
+  color: var(--badge-warn-fg);
+  font-size: 10px;
+}
+
+.model-tree__default-banner strong {
+  font-weight: 600;
+}
+
+.model-tree__default-banner span {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.model-row__default-chip {
+  flex: none;
+  padding: 1px 4px;
+  border: 1px solid var(--badge-warn-bg);
+  background: var(--badge-warn-bg);
+  color: var(--badge-warn-fg);
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+}
+
+/* Muted one-line config / worst-impact notes */
+.results-rail__config-line,
+.results-rail__worst-impact {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* Secondary component screening banner (components / population tabs) */
+.results-rail__screening-note {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-color);
+  border-left: 2px solid var(--color-warn);
+  background: var(--bg-inset);
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.5;
+  letter-spacing: 0.02em;
+}
+
+/* Shell Validation header badge row (overview tab) */
+.results-rail__shell-status {
+  margin-bottom: 6px;
+}
+
+.results-rail__shell-status .badge + .badge {
+  margin-left: 6px;
+}
+
+/* Warning line for unstable critical-region probes */
+.results-rail__stability-warning {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--badge-warn-bg);
+  border-left: 2px solid var(--color-warn);
+  background: var(--bg-inset);
+  color: var(--badge-warn-fg);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* Deterministic worst-case banner (population tab) */
+.results-rail__worst-case-note {
+  border-left-color: var(--color-error);
+}
+
+/* Worst-case component rows */
+.results-rail__worst-case-components {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 11px;
+}
+
+.results-rail__worst-case-components li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.results-rail__worst-case-components code {
+  color: var(--text-primary);
+  font-size: 11px;
+}
+
+/* Sensitivity strength chips (population tab) */
+.results-rail__sensitivity-level {
+  padding: 1px 5px;
+  border: 1px solid var(--border-color);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.results-rail__sensitivity-level--ok {
+  border-color: var(--badge-ok-bg);
+  background: var(--badge-ok-bg);
+  color: var(--badge-ok-fg);
+}
+
+.results-rail__sensitivity-level--warn {
+  border-color: var(--badge-warn-bg);
+  background: var(--badge-warn-bg);
+  color: var(--badge-warn-fg);
+}
+
+.results-rail__sensitivity-level--error {
+  border-color: var(--badge-error-bg);
+  background: var(--badge-error-bg);
+  color: var(--badge-error-fg);
+}
+
+.results-rail__sensitivity-level--neutral {
+  border-color: var(--border-color);
+  background: var(--bg-surface-raised);
+  color: var(--text-muted);
+}
+
+/* Small muted validity label on component rows */
+.results-rail__screening-label {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* Usage-ratio chip on component rows */
+.results-rail__usage-chip {
+  margin-left: auto;
+  padding: 1px 5px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-surface-raised);
+  color: var(--text-secondary);
+  font-size: 9px;
+  font-weight: 500;
+}
+
+/* Limitations sublist inside a disclosure card */
+.disclosure-card__limitations {
+  margin-top: 6px;
+}
+
+/* Components tab: one row per assessed component */
+.results-rail__component {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-surface);
+  font-size: 11px;
+}
+
+.results-rail__component-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.results-rail__component-head code {
+  color: var(--text-primary);
+  font-size: 11px;
+}
+
+.results-rail__component-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.results-rail__component-findings {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.results-rail__finding {
+  padding: 1px 5px;
+  border: 1px solid var(--badge-warn-bg);
+  background: var(--badge-warn-bg);
+  color: var(--badge-warn-fg);
+  font-size: 9px;
+  font-weight: 600;
+  cursor: help;
+}
+
+/* Population tab: failure-rate bars */
+.results-rail__subhead {
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.results-rail__failrates {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.results-rail__failrate {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 40% auto auto;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+}
+
+.results-rail__failrate-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.results-rail__failrate-label code {
+  color: var(--text-primary);
+}
+
+.results-rail__failrate-track {
+  position: relative;
+  height: 6px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border-color);
+}
+
+.results-rail__failrate-fill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  background: var(--color-warn);
+}
+
+.results-rail__failrate-value {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  text-align: right;
+}
+
+.results-rail__failrate-rank {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+.results-rail__weakest ul,
+.results-rail__sensitivity ul {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 11px;
+}
+
+.results-rail__weakest li,
+.results-rail__sensitivity li {
+  color: var(--text-secondary);
+}
+
+.results-rail__sensitivity-value {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+}
+
+.results-rail__survival-block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.results-rail__survival {
+  width: 100%;
+  height: 48px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-inset);
+}
+
+.results-rail__survival polyline {
+  fill: none;
+  stroke: var(--color-brand);
+  stroke-width: 1.5;
+}
+
+/* Qualification gate table column layout */
+.results-rail__gate-key {
+  width: 24%;
+}
+
+.results-rail__gate-status {
+  width: 18%;
+  text-align: center;
+}
+
+.results-rail__gate-status-cell {
+  text-align: center;
+}
+
+.gate-label {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.gate-explanation {
+  margin-left: 6px;
+}
+
+/* Issues table column widths */
+.dense-table--issues th:nth-child(1) {
+  width: 24px;
+}
+
+.dense-table--issues th:nth-child(2) {
+  width: 90px;
+}
+
+.dense-table--issues th:nth-child(3) {
+  width: 150px;
+}
+
+.dense-table--issues th:nth-child(4) {
+  width: 90px;
+}
+
+.dense-table--issues th:nth-child(6) {
+  width: 130px;
+}
+
+/* Disclosure card body lists */
+.disclosure-card__list {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.disclosure-card__list li {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.disclosure-card__list code {
+  color: var(--text-primary);
 }
 
 /* Model Tree Drawer */
@@ -1673,6 +2045,48 @@ h1, h2, h3, h4, h5, h6, th, strong, b, .badge, .btn, .top-bar__project-name {
   display: flex;
   gap: 6px;
   margin-top: 2px;
+}
+
+.settings-quality {
+  display: flex;
+  gap: 4px;
+}
+
+.settings-quality__option {
+  flex: 1;
+  min-height: 24px;
+  padding: 2px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 0px;
+  background: var(--bg-surface-raised);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.settings-quality__option:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-hover);
+}
+
+.settings-quality__option.is-active {
+  border-color: var(--border-strong);
+  background: var(--bg-active);
+  color: #ffffff;
+}
+
+.settings-default-material {
+  background: var(--surface-raised, #1a1d24);
+  color: var(--text-primary);
+  border: 1px solid var(--border-subtle, #333);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 11px;
+  font-family: var(--font-mono, monospace);
+  max-width: 220px;
 }
 
 .btn--sm {

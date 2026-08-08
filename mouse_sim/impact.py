@@ -38,6 +38,15 @@ IMPACT_UNSUPPORTED_FAILURE_MODES = (
 CONTACT_PATCH_ASSUMPTION = "CONTACT_PATCH_ASSUMPTION"
 DESK_EDGE_CONTACT_APPROXIMATION = "DESK_EDGE_CONTACT_APPROXIMATION"
 FATIGUE_ESTIMATE_EXCEEDED = "FATIGUE_ESTIMATE_EXCEEDED"
+FATIGUE_GENERIC_FALLBACK = "FATIGUE_GENERIC_FALLBACK"
+# Generic polymer S-N fallback: fatigue strength 14 MPa at 1e6 cycles with a
+# Basquin slope of 6, ABS-like (polymer fatigue compilations, R ~ 0.1).
+GENERIC_FATIGUE_STRENGTH_AT_1E6_PA = 14e6
+GENERIC_FATIGUE_EXPONENT_K = 6
+FATIGUE_GENERIC_FALLBACK_ASSUMPTION = (
+    "generic polymer fatigue law (14 MPa @ 10^6, slope 6) used; "
+    "material-specific S-N data unavailable"
+)
 INVALID_MASS = "INVALID_MASS"
 INVALID_KINEMATICS = "INVALID_KINEMATICS"
 INVALID_RESTITUTION = "INVALID_RESTITUTION"
@@ -63,8 +72,16 @@ CONTACT_MODEL_HERTZ_NONLINEAR = "hertz_nonlinear"
 CONTACT_MODEL_HALF_SINE = "half_sine"
 CONTACT_MODEL_STOPPING_DISTANCE = "stopping_distance"
 HERTZ_EFFECTIVE_MODULUS_DEFAULT_PA = 1e9
+# Full elastic (e=1) Hertz contact duration factor: t = 2.94*delta_max/v_n.
+# For restitution e the reported compression-phase duration is scaled by
+# (1+e)/2, so plastic impact (e=0) ends at max compression (t ~ 1.47*delta/v)
+# and perfectly elastic impact spans the full contact.
 HERTZ_CONTACT_DURATION_FACTOR = 2.94
 PEAK_FORCE_CONSERVATIVE_FACTOR = 2.0
+IMPACT_ACCELERATION_IMPLAUSIBLE = "IMPACT_ACCELERATION_IMPLAUSIBLE"
+IMPACT_STRESS_IMPLAUSIBLE = "IMPACT_STRESS_IMPLAUSIBLE"
+_ACCELERATION_PLAUSIBILITY_LIMIT_M_S2 = 1e6
+_STRESS_PLAUSIBILITY_LIMIT_PA = 1e11
 _MAX_SCREENING_LIFE_CYCLES = 1e18
 _IMPACT_SOLVER_METADATA = {
     "model_family": "energy_quasi_static_screening",
@@ -267,7 +284,7 @@ def _invert_3x3(matrix):
     )
 
 
-def _energy_partition(total_mass, inertia, normal, impulse, offset):
+def _energy_partition(total_mass, inertia, normal, impulse, offset, energy=None):
     """Estimate the translation vs rotation energy partition of the impact.
 
     Free-body rigid-impulse model (screening estimate only; rotation
@@ -275,6 +292,9 @@ def _energy_partition(total_mass, inertia, normal, impulse, offset):
     contact normal ``n`` at offset ``r`` from the center of mass yields
     T_trans = J^2/(2*M) and T_rot = 0.5*J^2*(r x n)*I^-1*(r x n).  The
     reduced-mass effect of a target is not included in the partition.
+    When ``energy`` is supplied both components are scaled so that
+    T_trans + T_rot equals it exactly (the raw impulse partition does not
+    conserve the reported impact energy in general).
 
     Returns ``(partition_dict, notes)``; ``partition_dict`` is None when
     the partition cannot be estimated (singular inertia tensor).
@@ -313,14 +333,23 @@ def _energy_partition(total_mass, inertia, normal, impulse, offset):
             "rotational energy partition not estimated: partition quantities overflowed "
             "for the screening surrogate"
         ]
+    if energy is not None and total > 0.0:
+        scale = energy / total
+        translational *= scale
+        rotational *= scale
+        notes.append(
+            "raw rigid-impulse partition scaled so T_trans + T_rot equals the "
+            "reported impact energy (energy conservation)"
+        )
+    scaled_total = translational + rotational
     partition = {
         "model": "rigid_body_impulse_partition",
         "total_mass_kg": total_mass,
         "impulse_n_s": impulse,
         "translational_energy_j": translational,
         "rotational_energy_j": rotational,
-        "translational_fraction": (translational / total) if total > 0.0 else 1.0,
-        "rotational_fraction": (rotational / total) if total > 0.0 else 0.0,
+        "translational_fraction": (translational / scaled_total) if scaled_total > 0.0 else 1.0,
+        "rotational_fraction": (rotational / scaled_total) if scaled_total > 0.0 else 0.0,
         "contact_offset_m": list(r) if offset is not None else None,
         "notes": list(notes),
     }
@@ -555,7 +584,11 @@ def estimate_impact(
         peak_force = normal_velocity * math.sqrt(effective_mass * stiffness)
         contact_duration = math.pi * math.sqrt(effective_mass / stiffness) / 2.0
         compression = normal_velocity * math.sqrt(effective_mass / stiffness)
-        force_text = "peak force from linear spring: F = v_n*sqrt(m_eff*k); t = pi*sqrt(m_eff/k)/2"
+        force_text = (
+            "peak force from linear spring: F = v_n*sqrt(m_eff*k);"
+            " t = pi*sqrt(m_eff/k)/2; contact duration covers the compression"
+            " phase; full contact ~ (1+e)*t"
+        )
         contact_model = CONTACT_MODEL_LINEAR
         peak_force_estimate = peak_force
     elif hertz is not None:
@@ -565,12 +598,20 @@ def estimate_impact(
             (5.0 / 4.0) * effective_mass * normal_velocity * normal_velocity / k_h
         ) ** (2.0 / 5.0)
         peak_force = k_h * compression ** 1.5
-        contact_duration = HERTZ_CONTACT_DURATION_FACTOR * compression / normal_velocity
+        contact_duration = (
+            HERTZ_CONTACT_DURATION_FACTOR
+            * (1.0 + restitution)
+            / 2.0
+            * compression
+            / normal_velocity
+        )
         force_text = (
             "peak force from Hertz nonlinear point contact: F = (4/3)*E_eff*sqrt(r)*delta^(3/2)"
             " with E_eff = {:.6g} Pa, r = {:.6g} m; delta_max = ((5/4)*m_eff*v_n^2/k_H)^(2/5)"
-            " = {:.6g} m; contact duration t = {:.3g}*delta_max/v_n".format(
-                modulus, radius, compression, HERTZ_CONTACT_DURATION_FACTOR
+            " = {:.6g} m; compression-phase contact duration t = {:.3g}*(1+e)/2*delta_max/v_n"
+            " (full elastic contact t = {:.3g}*delta_max/v_n)".format(
+                modulus, radius, compression, HERTZ_CONTACT_DURATION_FACTOR,
+                HERTZ_CONTACT_DURATION_FACTOR,
             )
         )
         contact_model = CONTACT_MODEL_HERTZ_NONLINEAR
@@ -593,7 +634,10 @@ def estimate_impact(
         peak_force = math.pi * impulse / (2.0 * duration)
         contact_duration = duration
         compression = energy / peak_force
-        force_text = "peak force from half-sine pulse: F = pi*J/(2*t)"
+        force_text = (
+            "peak force from half-sine pulse: F = pi*J/(2*t); contact duration"
+            " covers the compression phase; full contact ~ (1+e)*t"
+        )
         contact_model = CONTACT_MODEL_HALF_SINE
         peak_force_estimate = peak_force
     else:
@@ -603,7 +647,7 @@ def estimate_impact(
         force_estimated = False
         force_text = "peak force not estimated: supply contact_stiffness_n_per_m, stopping_distance_m, or contact_duration_s (PEAK_FORCE_NOT_ESTIMATED)"
     response_force = peak_force_estimate if peak_force_estimate is not None else peak_force
-    peak_acceleration = response_force / effective_mass
+    peak_acceleration = response_force / mass
     computed = (energy, impulse, peak_force, peak_acceleration, contact_duration, compression)
     if not all(math.isfinite(value) for value in computed):
         return _failed(
@@ -637,15 +681,17 @@ def estimate_impact(
     partition_notes = []
     if inertia is not None:
         partition, partition_notes = _energy_partition(
-            partition_mass, inertia, normal, effective_mass * normal_velocity, offset
+            partition_mass, inertia, normal, effective_mass * normal_velocity, offset,
+            energy=energy,
         )
         if partition is not None:
             partition_notes.append(
                 "energy partition (translation vs rotation) estimated with a free-body"
                 " rigid-impulse model: J at the contact offset along the contact normal"
                 " splits kinetic energy into T_trans = J^2/(2*M) and"
-                " T_rot = 0.5*(r x J)*I^-1*(r x J); screening estimate only,"
-                " rotation response not resolved"
+                " T_rot = 0.5*(r x J)*I^-1*(r x J); both components scaled so"
+                " T_trans + T_rot equals the reported impact energy; screening"
+                " estimate only, rotation response not resolved"
             )
     assumptions = [
         "method {}: quasi-static energy balance, exploration only".format(METHOD_ID),
@@ -667,6 +713,27 @@ def estimate_impact(
     validity = "valid"
     if not force_estimated:
         result_flags.extend((PEAK_FORCE_NOT_ESTIMATED, INSUFFICIENT_PARAMETERS))
+        validity = "inconclusive"
+    if force_estimated and peak_acceleration > _ACCELERATION_PLAUSIBILITY_LIMIT_M_S2:
+        result_flags.append(IMPACT_ACCELERATION_IMPLAUSIBLE)
+        assumptions.append(
+            "peak deceleration {:.6g} m/s^2 exceeds the {:.6g} m/s^2 plausibility"
+            " limit; contact stiffness and/or closing speed are implausibly high"
+            " for the reported body mass ({}; evidence_blocking)".format(
+                peak_acceleration, _ACCELERATION_PLAUSIBILITY_LIMIT_M_S2,
+                IMPACT_ACCELERATION_IMPLAUSIBLE,
+            )
+        )
+        validity = "inconclusive"
+    if stress is not None and stress > _STRESS_PLAUSIBILITY_LIMIT_PA:
+        result_flags.append(IMPACT_STRESS_IMPLAUSIBLE)
+        assumptions.append(
+            "load-path stress {:.6g} Pa exceeds the {:.6g} Pa plausibility limit;"
+            " the screening proxy is not physically meaningful at this magnitude"
+            " ({}; evidence_blocking)".format(
+                stress, _STRESS_PLAUSIBILITY_LIMIT_PA, IMPACT_STRESS_IMPLAUSIBLE
+            )
+        )
         validity = "inconclusive"
     return ImpactResult(
         impact_energy_j=energy,
@@ -749,26 +816,41 @@ def _load_path_stress(force, area, lever, modulus, force_label="peak force"):
     return stress, texts
 
 
-def _cycles_to_failure(stress, curve):
-    """Cycles to failure: exact S-N point, conservative curve bound, or power law."""
+def _cycles_to_failure(stress, curve, fatigue_strength_at_1e6_pa=None, fatigue_exponent_k=None):
+    """Cycles to failure: exact S-N point, conservative curve bound, or
+    per-material Basquin power law N = 1e6*(sigma_ref/sigma)^k.
+
+    Returns ``(life, used_generic_fallback)``.  Without an explicit curve,
+    the Basquin law is evaluated with the supplied material fatigue
+    strength at 1e6 cycles and slope k; when either is missing the
+    conservative generic polymer law (14 MPa @ 1e6, slope 6) is used and
+    ``used_generic_fallback`` is True so the caller can disclose it.  The
+    life is floored at 1 cycle and capped so astronomically low stresses
+    cannot overflow into inf and corrupt JSON output.
+    """
     if curve:
         if stress in curve:
-            return max(1.0, float(curve[stress]))
+            return max(1.0, float(curve[stress])), False
         candidates = [float(life) for key, life in curve.items() if float(key) >= stress]
         if candidates:
-            return min(candidates)
-        return min(max(1.0, float(life)) for life in curve.values())
-    # Conservative screening power law: 1e6 cycles at 1 MPa, exponent 3.
-    # The life is capped so astronomically low stresses cannot overflow into
-    # inf and corrupt JSON output; a capped life contributes ~0 damage.
-    ratio = 1e6 / stress
+            return min(candidates), False
+        return min(max(1.0, float(life)) for life in curve.values()), False
+    sigma_ref = fatigue_strength_at_1e6_pa
+    exponent = fatigue_exponent_k
+    if sigma_ref is None or exponent is None:
+        sigma_ref = GENERIC_FATIGUE_STRENGTH_AT_1E6_PA
+        exponent = GENERIC_FATIGUE_EXPONENT_K
+        used_generic = True
+    else:
+        used_generic = False
+    ratio = sigma_ref / stress
     try:
-        life = 1e6 * ratio ** 3
+        life = 1e6 * ratio ** exponent
     except OverflowError:
         life = float("inf")
     if not math.isfinite(life) or life > _MAX_SCREENING_LIFE_CYCLES:
-        return _MAX_SCREENING_LIFE_CYCLES
-    return max(1.0, life)
+        life = _MAX_SCREENING_LIFE_CYCLES
+    return max(1.0, life), used_generic
 
 
 def _cycle_levels(cycles_n, stress_amplitude_pa):
@@ -797,39 +879,62 @@ def _cycle_levels(cycles_n, stress_amplitude_pa):
     return levels
 
 
-def repeat_impact_cycles(cycles_n, stress_amplitude_pa=None, s_n_curve=None, allowable_pa=None):
+def repeat_impact_cycles(
+    cycles_n,
+    stress_amplitude_pa=None,
+    s_n_curve=None,
+    allowable_pa=None,
+    fatigue_strength_at_1e6_pa=None,
+    fatigue_exponent_k=None,
+):
     """Miner's-rule cumulative damage over repeated impact stress cycles.
 
     ``cycles_n`` is either a single count for ``stress_amplitude_pa`` or
     an iterable of ``(count, stress_pa)`` levels.  Cycles-to-failure comes
     from an exact S-N dict point, the most conservative curve bound, or a
-    coarse power-law estimate.  The label is explicit: this is a coarse
-    screening estimate, not a fatigue prediction.
+    per-material Basquin power law N = 1e6*(sigma_ref/sigma)^k with
+    ``fatigue_strength_at_1e6_pa`` and ``fatigue_exponent_k``; when either
+    is missing the generic polymer law is used and the result carries the
+    ``FATIGUE_GENERIC_FALLBACK`` flag and a disclosure assumption.  The
+    label is explicit: this is a coarse screening estimate, not a fatigue
+    prediction.
     """
     levels = _cycle_levels(cycles_n, stress_amplitude_pa)
     entries = []
     total_cycles = 0.0
     damage = 0.0
+    generic_fallback_used = False
     for count, stress in levels:
         if stress <= 0.0:
             continue
-        life = _cycles_to_failure(stress, s_n_curve or {})
+        life, used_generic = _cycles_to_failure(
+            stress, s_n_curve or {}, fatigue_strength_at_1e6_pa, fatigue_exponent_k
+        )
+        generic_fallback_used = generic_fallback_used or used_generic
         total_cycles += count
         damage += count / life
         entries.append({"cycles": count, "stress_pa": stress, "cycles_to_failure": life})
-    exceeded = damage >= 1.0
+    # Epsilon: exactly one lifetime of exposure (damage_sum == 1.0) is
+    # exhaustion; a 1e-9 tolerance keeps float rounding from hiding it.
+    exceeded = damage >= 1.0 - 1e-9
     allowable_exceeded = False
     if allowable_pa is not None:
         allowable = _finite(allowable_pa, "allowable_pa")
         allowable_exceeded = any(stress > allowable for _, stress in levels if stress > 0.0)
+    flags = [FATIGUE_ESTIMATE_EXCEEDED] if exceeded else []
+    assumptions = []
+    if generic_fallback_used:
+        flags.append(FATIGUE_GENERIC_FALLBACK)
+        assumptions.append(FATIGUE_GENERIC_FALLBACK_ASSUMPTION)
     return {
         "damage_sum": damage,
         "miner_exceeded": exceeded,
         "cycles_evaluated": total_cycles,
-        "flags": [FATIGUE_ESTIMATE_EXCEEDED] if exceeded else [],
+        "flags": flags,
         "label": "coarse screening estimate, not fatigue prediction",
         "levels": entries,
         "allowable_exceeded": allowable_exceeded,
+        "assumptions": assumptions,
     }
 
 
@@ -936,6 +1041,10 @@ __all__ = [
     "CONTACT_PATCH_ASSUMPTION",
     "DESK_EDGE_CONTACT_APPROXIMATION",
     "FATIGUE_ESTIMATE_EXCEEDED",
+    "FATIGUE_GENERIC_FALLBACK",
+    "HERTZ_CONTACT_DURATION_FACTOR",
+    "IMPACT_ACCELERATION_IMPLAUSIBLE",
+    "IMPACT_STRESS_IMPLAUSIBLE",
     "IMPACT_UNSUPPORTED_FAILURE_MODES",
     "INVALID_CONTACT_OFFSET",
     "INVALID_INERTIA_TENSOR",

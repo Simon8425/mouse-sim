@@ -20,7 +20,9 @@ test.describe('model workspace', () => {
 
   test('geometry upload loads model and canvas', async () => {
     await modelLoaded(page);
-    await expect(page.locator('.scene-viewport canvas')).toBeVisible();
+    // Under parallel-suite CPU load the scene mount can be slow; 15 s mirrors
+    // the other mount assertions instead of the default 5 s.
+    await expect(page.locator('.scene-viewport canvas')).toBeVisible({ timeout: 15_000 });
     await expectRunComplete(page);
     await expectNoConsoleErrors(page, errors);
   });
@@ -72,7 +74,12 @@ test.describe('model workspace', () => {
     await page.getByRole('tab', { name: 'structural' }).click();
     await expect(page.getByText(/No structural (evaluation|response)/i)).toBeVisible();
     await page.getByRole('tab', { name: 'issues' }).click();
-    await expect(page.getByText('No issues or validation findings reported.')).toBeVisible();
+    // The analytic fixture parts carry no explicit materials, so the Issues
+    // tab surfaces the Default-material fallback warning instead of an empty
+    // state.
+    await expect(
+      page.locator('.results-rail').getByText(/Default material/i),
+    ).toBeVisible();
   });
 
   test('mode switch triggers rerun and qualification gate view', async () => {
@@ -98,9 +105,11 @@ test.describe('model workspace', () => {
       await page.getByRole('button', { name: 'Toggle model navigator' }).click();
     }
     const viewport = page.locator('.scene-viewport');
-    await expect(viewport).toBeVisible();
+    // Slow scene mount under parallel-suite CPU load; 15 s mirrors the other
+    // mount assertions instead of the default 5 s.
+    await expect(viewport).toBeVisible({ timeout: 15_000 });
     // The rail must sit as a slim right-edge strip, never over the canvas.
-    await expect(page.locator('.results-rail--collapsed')).toBeVisible();
+    await expect(page.locator('.results-rail--collapsed')).toBeVisible({ timeout: 15_000 });
 
     const box = await viewport.boundingBox();
     expect(box).not.toBeNull();

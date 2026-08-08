@@ -711,6 +711,271 @@ def _triangle_area(first, second, third):
     return math.sqrt(_dot(_cross(_sub(second, first), _sub(third, first)), _cross(_sub(second, first), _sub(third, first)))) / 2.0
 
 
+# Above this triangle count the O(n^2) AABB-filtered self-intersection sweep
+# is not attempted; closed meshes are marked ``self_intersection_unverified``
+# (disclosed) instead of silently assumed clean.
+_SELF_INTERSECTION_TRIANGLE_LIMIT = 5000
+
+
+def _mesh_components(triangles):
+    """Partition triangle indices into connected components via shared edges.
+
+    Returns a list of dicts: {"triangles": (indices,), "closed": bool}.
+    """
+    edge_owner = {}
+    for index, triangle in enumerate(triangles):
+        i, j, k = triangle
+        for first, second in ((i, j), (j, k), (k, i)):
+            edge_owner.setdefault(tuple(sorted((first, second))), []).append(index)
+    components = []
+    remaining = set(range(len(triangles)))
+    while remaining:
+        seed = min(remaining)
+        member = []
+        stack = [seed]
+        remaining.discard(seed)
+        while stack:
+            triangle_index = stack.pop()
+            member.append(triangle_index)
+            i, j, k = triangles[triangle_index]
+            for first, second in ((i, j), (j, k), (k, i)):
+                for candidate in edge_owner[tuple(sorted((first, second)))]:
+                    if candidate in remaining:
+                        remaining.discard(candidate)
+                        stack.append(candidate)
+        face_count = {}
+        for triangle_index in member:
+            i, j, k = triangles[triangle_index]
+            for first, second in ((i, j), (j, k), (k, i)):
+                key = tuple(sorted((first, second)))
+                face_count[key] = face_count.get(key, 0) + 1
+        closed = all(count == 2 for count in face_count.values())
+        components.append({"triangles": tuple(member), "closed": closed})
+    return components
+
+
+def _point_inside_mesh(point, triangle_indices, vertices, triangles):
+    """Ray-cast point-in-polyhedron test (crossings along +x).
+
+    The parity test is degenerate when the ray exits through a shared edge
+    (both adjacent triangles count the crossing); the origin is re-probed at
+    tiny offsets and the majority result is taken.
+    """
+    diagonal = 0.0
+    for axis in range(3):
+        lo = min(vertex[axis] for vertex in vertices)
+        hi = max(vertex[axis] for vertex in vertices)
+        diagonal += (hi - lo) ** 2
+    epsilon = math.sqrt(diagonal) * 1e-9 if diagonal > 0.0 else 1e-15
+    outcomes = []
+
+    def parity(origin):
+        crossings = 0
+        px, py, pz = origin
+        for index in triangle_indices:
+            i, j, k = triangles[index]
+            a, b, c = vertices[i], vertices[j], vertices[k]
+            e1 = _sub(b, a)
+            e2 = _sub(c, a)
+            h = _cross((1.0, 0.0, 0.0), e2)
+            det = _dot(e1, h)
+            if abs(det) < 1e-15:
+                continue
+            inv = 1.0 / det
+            s = (px - a[0], py - a[1], pz - a[2])
+            u = _dot(s, h) * inv
+            if u < 0.0 or u > 1.0:
+                continue
+            q = _cross(s, e1)
+            v = _dot((1.0, 0.0, 0.0), q) * inv
+            if v < 0.0 or u + v > 1.0:
+                continue
+            t = _dot(e2, q) * inv
+            if t > 0.0:
+                crossings += 1
+        return crossings % 2 == 1
+
+    for offset in (0.0, 1.0, -1.0):
+        outcomes.append(
+            parity(
+                (
+                    point[0] + offset * epsilon,
+                    point[1] + (offset * 0.7) * epsilon,
+                    point[2] + (offset * 0.3) * epsilon,
+                )
+            )
+        )
+    return sum(1 for inside in outcomes if inside) >= 2
+
+
+def _segment_triangle_intersects(p, q, a, b, c):
+    """Exact segment-triangle intersection (Moller-Trumbore), STRICT interior.
+
+    Boundary-only contacts (the segment touching an edge or vertex of the
+    triangle) return False: for the self-intersection screening purpose a
+    valid union of touching solids legitimately shares edges and faces, and
+    only a genuine interior crossing is a self-intersection.
+    """
+    e1 = _sub(b, a)
+    e2 = _sub(c, a)
+    s = _sub(q, p)
+    h = _cross(s, e2)
+    det = _dot(e1, h)
+    if abs(det) < 1e-15:
+        return None
+    inv = 1.0 / det
+    r = _sub(p, a)
+    u = _dot(r, h) * inv
+    qv = _cross(r, e1)
+    v = _dot(s, qv) * inv
+    t = _dot(e2, qv) * inv
+    # Crossing acceptance rule: a genuine interior crossing requires u, v
+    # strictly interior to the triangle (NOT near a vertex or side edge) and
+    # t strictly interior to the segment.  Crossings on the far diagonal
+    # edge (u+v == 1 with u, v interior) are accepted: axis-aligned
+    # interpenetrating boxes hit face diagonals exactly, and rejecting them
+    # would hide real self-intersections.  Corner and side-edge contacts
+    # (valid touching unions) are rejected by the u/v interior tests of one
+    # of the two triangles involved.
+    if u <= 1e-9 or v <= 1e-9 or t <= 1e-9 or t >= 1.0 - 1e-9:
+        return False
+    if u + v > 1.0 + 1e-9:
+        return False
+    return True
+
+
+def _point_in_triangle_2d(point, a, b, c):
+    def sign2(ox, oy, ux, uy, vx, vy):
+        return (ux - ox) * (vy - oy) - (uy - oy) * (vx - ox)
+
+    d1c = sign2(point[0], point[1], a[0], a[1], b[0], b[1])
+    d2c = sign2(point[0], point[1], b[0], b[1], c[0], c[1])
+    d3c = sign2(point[0], point[1], c[0], c[1], a[0], a[1])
+    has_neg = d1c < -1e-9 or d2c < -1e-9 or d3c < -1e-9
+    has_pos = d1c > 1e-9 or d2c > 1e-9 or d3c > 1e-9
+    return not (has_neg and has_pos)
+
+
+def _triangle_intersects(a0, a1, a2, b0, b1, b2):
+    """Exact triangle-triangle intersection: two triangles intersect iff any
+    edge of one crosses the interior of the other (with a coplanar fallback
+    that checks endpoint containment)."""
+    edges_a = ((a0, a1), (a1, a2), (a2, a0))
+    edges_b = ((b0, b1), (b1, b2), (b2, b0))
+    for edge in edges_b:
+        result = _segment_triangle_intersects(edge[0], edge[1], a0, a1, a2)
+        if result:
+            return True
+    for edge in edges_a:
+        result = _segment_triangle_intersects(edge[0], edge[1], b0, b1, b2)
+        if result:
+            return True
+    # Coplanar overlap fallback: a vertex of either triangle STRICTLY inside
+    # the other's projected 2D triangle means the faces genuinely cross.
+    # Boundary/coincident contact (e.g. the shared wall of two boxes that
+    # touch face-to-face — a VALID union) must not be flagged.
+    e1 = _sub(a1, a0)
+    e2 = _sub(a2, a0)
+    n = _cross(e1, e2)
+    norm = math.sqrt(_dot(n, n))
+    if norm < 1e-30:
+        return True
+    n = (n[0] / norm, n[1] / norm, n[2] / norm)
+    d = -_dot(n, a0)
+    if all(abs(_dot(n, vertex) + d) <= 1e-9 for vertex in (b0, b1, b2)):
+        project = lambda vertex: (
+            vertex[0] - n[0] * (_dot(n, vertex) + d),
+            vertex[1] - n[1] * (_dot(n, vertex) + d),
+            vertex[2] - n[2] * (_dot(n, vertex) + d),
+        )
+        pa = [project(vertex) for vertex in (a0, a1, a2)]
+        pb = [project(vertex) for vertex in (b0, b1, b2)]
+
+        def strict_inside(point, ta, tb, tc):
+            def sign2(ox, oy, ux, uy, vx, vy):
+                return (ux - ox) * (vy - oy) - (uy - oy) * (vx - ox)
+
+            d1c = sign2(point[0], point[1], ta[0], ta[1], tb[0], tb[1])
+            d2c = sign2(point[0], point[1], tb[0], tb[1], tc[0], tc[1])
+            d3c = sign2(point[0], point[1], tc[0], tc[1], ta[0], ta[1])
+            return d1c > 0.0 and d2c > 0.0 and d3c > 0.0
+
+        for vertex in pb:
+            if strict_inside(vertex, pa[0], pa[1], pa[2]):
+                return True
+        for vertex in pa:
+            if strict_inside(vertex, pb[0], pb[1], pb[2]):
+                return True
+    return False
+
+
+def _component_vertex_containment(triangles, vertices, components):
+    """Detect interpenetration via strict vertex containment.
+
+    A vertex belonging to one closed component that lies strictly inside
+    another closed component means the solids interpenetrate.  This catches
+    the axis-aligned case where the pair-edge sweep misses an exact
+    face-diagonal seam crossing.  Bounded to small meshes (called only when
+    the triangle count is already within the self-intersection limit).
+    """
+    closed_components = [component for component in components if component["closed"]]
+    if len(closed_components) < 2:
+        return False
+    for component in closed_components:
+        component_vertices = set()
+        for triangle_index in component["triangles"]:
+            component_vertices.update(triangles[triangle_index])
+        for other in closed_components:
+            if other is component:
+                continue
+            other_vertices = set()
+            for triangle_index in other["triangles"]:
+                other_vertices.update(triangles[triangle_index])
+            for vertex_index in component_vertices - other_vertices:
+                point = vertices[vertex_index]
+                if _point_inside_mesh(point, other["triangles"], vertices, triangles):
+                    return True
+    return False
+
+
+def _mesh_self_intersects(triangles, vertices):
+    """Detect any interior-intersecting triangle pair (AABB filter first;
+    adjacent faces sharing a vertex are skipped)."""
+    bounds = []
+    for triangle in triangles:
+        i, j, k = triangle
+        xs = [vertices[i][0], vertices[j][0], vertices[k][0]]
+        ys = [vertices[i][1], vertices[j][1], vertices[k][1]]
+        zs = [vertices[i][2], vertices[j][2], vertices[k][2]]
+        bounds.append(
+            (
+                (min(xs), max(xs)),
+                (min(ys), max(ys)),
+                (min(zs), max(zs)),
+                frozenset(triangle),
+            )
+        )
+    for first in range(len(triangles)):
+        for second in range(first + 1, len(triangles)):
+            if bounds[first][3] & bounds[second][3]:
+                continue
+            a0b, a1b = bounds[first], bounds[second]
+            if (
+                a0b[0][1] < a1b[0][0] or a1b[0][1] < a0b[0][0]
+                or a0b[1][1] < a1b[1][0] or a1b[1][1] < a0b[1][0]
+                or a0b[2][1] < a1b[2][0] or a1b[2][1] < a0b[2][0]
+            ):
+                continue
+            i0, j0, k0 = triangles[first]
+            i1, j1, k1 = triangles[second]
+            if _triangle_intersects(
+                vertices[i0], vertices[j0], vertices[k0],
+                vertices[i1], vertices[j1], vertices[k1],
+            ):
+                return True
+    return False
+
+
 def _mesh_integrals(vertices, triangles):
     volume = 0.0
     first = (0.0, 0.0, 0.0)
@@ -791,7 +1056,16 @@ class TriangleMesh(Geometry):
         return self.triangles
 
     def _world_vertices(self):
-        return tuple(self.transform.apply_point(vertex) for vertex in self.vertices)
+        """Transformed vertex coordinates, computed once per mesh instance.
+
+        The pipeline runs diagnostics, classification, mass, and validation
+        over the same meshes; caching removes repeated O(V) transform passes.
+        """
+        cached = getattr(self, "_world_vertices_cache", None)
+        if cached is None:
+            cached = tuple(self.transform.apply_point(vertex) for vertex in self.vertices)
+            object.__setattr__(self, "_world_vertices_cache", cached)
+        return cached
 
     def _integrals(self):
         """Volume integrals, computed once per mesh instance.
@@ -813,12 +1087,29 @@ class TriangleMesh(Geometry):
         return sum(_triangle_area(vertices[i], vertices[j], vertices[k]) for i, j, k in self.triangles)
 
     def _topology(self):
+        cached = getattr(self, "_topology_cache", None)
+        if cached is None:
+            cached = self._compute_topology()
+            object.__setattr__(self, "_topology_cache", cached)
+        return cached
+
+    def _compute_topology(self):
         edges = {}
         degenerate = 0
         vertices = self._world_vertices()
+        diagonal = 0.0
+        for axis in range(3):
+            lo = min(vertex[axis] for vertex in vertices)
+            hi = max(vertex[axis] for vertex in vertices)
+            diagonal += (hi - lo) ** 2
+        diagonal = math.sqrt(diagonal)
+        # Degeneracy thresholds are RELATIVE to the mesh scale: an absolute
+        # area floor rejects valid tiny geometry (a 1e-9 m box has triangle
+        # areas ~5e-19 m2, below any fixed 1e-15 floor).
+        area_tolerance = max(1e-30, diagonal ** 2 * 1e-9)
         for triangle in self.triangles:
             i, j, k = triangle
-            if _triangle_area(vertices[i], vertices[j], vertices[k]) <= 1e-15:
+            if _triangle_area(vertices[i], vertices[j], vertices[k]) <= area_tolerance:
                 degenerate += 1
             for first, second in ((i, j), (j, k), (k, i)):
                 key = tuple(sorted((first, second)))
@@ -827,13 +1118,16 @@ class TriangleMesh(Geometry):
         boundary = sum(1 for values in edges.values() if len(values) == 1)
         nonmanifold = sum(1 for values in edges.values() if len(values) > 2)
         inconsistent = any(len(values) == 2 and values[0] == values[1] for values in edges.values())
-        return boundary, nonmanifold, degenerate, inconsistent
+        components = _mesh_components(self.triangles)
+        return boundary, nonmanifold, degenerate, inconsistent, components, diagonal
 
     def diagnostics(self):
-        boundary, nonmanifold, degenerate, inconsistent = self._topology()
+        boundary, nonmanifold, degenerate, inconsistent, components, diagonal = self._topology()
         volume, first, _ = self._integrals()
-        centroid = _scale(first, 1.0 / volume) if abs(volume) > 1e-15 else None
+        volume_tolerance = max(1e-30, diagonal ** 3 * 1e-12)
+        centroid = _scale(first, 1.0 / volume) if abs(volume) > volume_tolerance else None
         closed = boundary == 0 and nonmanifold == 0 and bool(self.triangles)
+        volume_tolerance = max(1e-30, diagonal ** 3 * 1e-12)
         issues = []
         if boundary:
             issues.append("boundary_edges")
@@ -843,9 +1137,64 @@ class TriangleMesh(Geometry):
             issues.append("degenerate_triangles")
         if inconsistent:
             issues.append("inconsistent_winding")
-        if abs(volume) <= 1e-15:
+        if abs(volume) <= volume_tolerance:
             issues.append("zero_signed_volume")
-        safe = closed and degenerate == 0 and not inconsistent and abs(volume) > 1e-15
+        # Shell-connectivity analysis: multiple disconnected components and
+        # nested/cavity shells (a closed component whose centroid lies inside
+        # another closed component) mean the divergence-theorem volume is not
+        # the physical volume of the solid part.
+        if len(components) > 1:
+            issues.append("multiple_components")
+        nested = False
+        vertices = self._world_vertices()
+        for outer in components:
+            if not outer["closed"]:
+                continue
+            outer_vertices = set()
+            for triangle_index in outer["triangles"]:
+                outer_vertices.update(self.triangles[triangle_index])
+            outer_centroid = (
+                sum(vertices[index][0] for index in outer_vertices) / len(outer_vertices),
+                sum(vertices[index][1] for index in outer_vertices) / len(outer_vertices),
+                sum(vertices[index][2] for index in outer_vertices) / len(outer_vertices),
+            )
+            for inner in components:
+                if inner is outer or not inner["closed"]:
+                    continue
+                if _point_inside_mesh(outer_centroid, inner["triangles"], vertices, self.triangles):
+                    nested = True
+                    break
+            if nested:
+                break
+        if nested:
+            issues.append("nested_shells")
+        # Self-intersection: exact pair testing is bounded to meshes small
+        # enough to keep the O(n^2) AABB-filtered sweep tractable; larger
+        # meshes are marked unverified and disclosed rather than silently
+        # assumed clean.
+        self_intersecting = False
+        if len(self.triangles) <= _SELF_INTERSECTION_TRIANGLE_LIMIT:
+            self_intersecting = _mesh_self_intersects(self.triangles, self._world_vertices())
+            if not self_intersecting:
+                # A vertex of one closed component strictly inside another
+                # closed component is interpenetration (the pair sweep can
+                # miss exact face-diagonal seam crossings on axis-aligned
+                # bodies).  Bounded to small meshes for cost.
+                self_intersecting = _component_vertex_containment(
+                    self.triangles, self._world_vertices(), components
+                )
+            if self_intersecting:
+                issues.append("self_intersecting")
+        elif closed:
+            issues.append("self_intersection_unverified")
+        safe = (
+            closed
+            and degenerate == 0
+            and not inconsistent
+            and abs(volume) > volume_tolerance
+            and not nested
+            and not self_intersecting
+        )
         return MeshDiagnostics(closed, boundary, nonmanifold, degenerate, inconsistent, volume, centroid, safe, tuple(issues))
 
     def closed_mesh_diagnostics(self):

@@ -58,7 +58,7 @@ export interface ProjectState {
   draft: PipelineRequest | null;
   resultsTab: string;
   severityFilter: string | null;
-  qualityTier: 'high' | 'medium' | 'low' | null;
+  qualityTier: 'ultra' | 'high' | 'medium' | 'low' | null;
   navOpen: boolean;
   inspectorOpen: boolean;
   webglError: string | null;
@@ -66,6 +66,7 @@ export interface ProjectState {
   controlOpen: boolean;
   runNonce: number;
   objectMaterials: Record<string, string>;
+  defaultMaterialKey: string;
   partGeometry: Record<string, GeometryJson> | null;
 }
 
@@ -117,13 +118,15 @@ export type ProjectAction =
   | { type: 'APPLY_DRAFT' }
   | { type: 'SET_TAB'; tab: string }
   | { type: 'SET_SEVERITY_FILTER'; severity: string | null }
-  | { type: 'SET_QUALITY_TIER'; tier: 'high' | 'medium' | 'low' | null }
+  | { type: 'SET_QUALITY_TIER'; tier: 'ultra' | 'high' | 'medium' | 'low' | null }
   | { type: 'SET_NAV_OPEN'; open: boolean }
   | { type: 'SET_INSPECTOR_OPEN'; open: boolean }
   | { type: 'SET_WEBGL_ERROR'; message: string | null }
   | { type: 'SET_CONTROL_OPEN'; open: boolean }
   | { type: 'RUN_STUDY' }
+  | { type: 'RUN_POPULATION' }
   | { type: 'SET_OBJECT_MATERIAL'; objectId: string; materialKey: string | null }
+  | { type: 'SET_DEFAULT_MATERIAL'; key: string }
   | {
       type: 'PARTS_OK';
       assetId: string;
@@ -139,6 +142,7 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
     case 'LOAD_BASELINE_OK':
       return {
         ...resetGeometryView(state),
+        stale: state.lastResult != null,
         project: action.project,
         projectName: action.name,
         sourceStatus: 'ready',
@@ -212,6 +216,7 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
         const message = action.preview.diagnostics[0]?.message ?? 'Geometry preview is unsupported';
         return {
           ...resetGeometryView(state),
+          stale: state.lastResult != null,
           navOpen: true,
           preview: action.preview,
           previewStatus: 'error',
@@ -247,6 +252,7 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
     case 'CLEAR_PREVIEW':
       return {
         ...resetGeometryView(state),
+        stale: state.lastResult != null,
         preview: null,
         previewStatus: 'idle',
         tempPreview: null,
@@ -323,6 +329,15 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
       }
       return { ...state, objectMaterials };
     }
+    case 'SET_DEFAULT_MATERIAL':
+      if (typeof window !== 'undefined') {
+        try {
+          window.localStorage.setItem(DEFAULT_MATERIAL_STORAGE_KEY, action.key);
+        } catch {
+          // storage unavailable — state still updates
+        }
+      }
+      return { ...state, defaultMaterialKey: action.key };
     case 'PARTS_OK': {
       if (state.preview?.display_asset?.asset_id !== action.assetId) return state;
       const partGeometry: Record<string, GeometryJson> = {};
@@ -343,6 +358,33 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
       return { ...state, controlOpen: action.open };
     case 'RUN_STUDY':
       return { ...state, runNonce: state.runNonce + 1 };
+    case 'RUN_POPULATION':
+      // Worst-case run: 10k virtual units with tolerance variation under an
+      // esports usage profile. A drop test is carried into the run so the
+      // population analysis has impact evidence to correlate failure rates
+      // against; the exclusive-null pattern mirrors RUN_DROP_TEST.
+      return {
+        ...state,
+        draft: {
+          ...(state.draft ?? state.project ?? {}),
+          impact: null,
+          load_case: null,
+          structure: null,
+          drop_simulation: {
+            test: 'drop',
+            height_m: 0.75,
+            drop_count: 1,
+            surface: 'concrete',
+            orientation: 'flat',
+          },
+          population: {
+            sample_count: 10000,
+            profile: 'esports_fps',
+            lifespan_days: 730,
+          },
+        },
+        runNonce: state.runNonce + 1,
+      };
     default:
       return state;
   }
@@ -384,8 +426,22 @@ export const initialState: ProjectState = {
   controlOpen: false,
   runNonce: 0,
   objectMaterials: {},
+  defaultMaterialKey: loadPersistedDefaultMaterial(),
   partGeometry: null,
 };
+
+const DEFAULT_MATERIAL_STORAGE_KEY = 'mouse-sim-default-material';
+
+/** Read the persisted default material key, falling back to 'default'. */
+function loadPersistedDefaultMaterial(): string {
+  if (typeof window === 'undefined') return 'default';
+  try {
+    const stored = window.localStorage.getItem(DEFAULT_MATERIAL_STORAGE_KEY);
+    return typeof stored === 'string' && stored.trim() !== '' ? stored : 'default';
+  } catch {
+    return 'default';
+  }
+}
 
 /** Reset view state that is keyed to the currently displayed geometry source. */
 function resetGeometryView(state: ProjectState): ProjectState {
@@ -418,6 +474,9 @@ export function createAnalysisRequest(state: ProjectState): PipelineRequest | nu
   if (!state.project && !state.draft && !previewGeometry) return null;
   const base: PipelineRequest = state.draft ?? state.project ?? {};
   const request: PipelineRequest = { ...base, mode: state.mode, units: base.units ?? 'mm' };
+  if (state.defaultMaterialKey && state.defaultMaterialKey.trim() !== '') {
+    request.default_material = state.defaultMaterialKey;
+  }
   if (previewGeometry && isGeometryJson(previewGeometry)) {
     const parts = state.preview?.display_asset?.parts ?? null;
     const geometries = state.partGeometry;

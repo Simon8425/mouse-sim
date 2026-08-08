@@ -188,6 +188,17 @@ def _properties(
     friction_coefficient,
     temperature_min_k,
     temperature_max_k,
+    fatigue_strength_at_1e6_pa=None,
+    fatigue_exponent_k=None,
+    young_modulus_transverse_pa=None,
+    young_modulus_thickness_pa=None,
+    shear_modulus_xy_pa=None,
+    shear_modulus_thickness_pa=None,
+    poissons_ratio_xy=None,
+    poissons_ratio_xz=None,
+    weld_line_factor=None,
+    continuous_use_temperature_min_k=None,
+    continuous_use_temperature_max_k=None,
 ):
     return MaterialProperties(
         density=_quantity(density, "density", "density"),
@@ -201,6 +212,29 @@ def _properties(
         friction_coefficient=friction_coefficient,
         temperature_min_k=_temperature(temperature_min_k, "temperature_min_k"),
         temperature_max_k=_temperature(temperature_max_k, "temperature_max_k"),
+        fatigue_strength_at_1e6_pa=_quantity(
+            fatigue_strength_at_1e6_pa, "pressure", "fatigue_strength_at_1e6_pa"
+        ),
+        fatigue_exponent_k=fatigue_exponent_k,
+        young_modulus_transverse_pa=_quantity(
+            young_modulus_transverse_pa, "pressure", "young_modulus_transverse_pa"
+        ),
+        young_modulus_thickness_pa=_quantity(
+            young_modulus_thickness_pa, "pressure", "young_modulus_thickness_pa"
+        ),
+        shear_modulus_xy_pa=_quantity(shear_modulus_xy_pa, "pressure", "shear_modulus_xy_pa"),
+        shear_modulus_thickness_pa=_quantity(
+            shear_modulus_thickness_pa, "pressure", "shear_modulus_thickness_pa"
+        ),
+        poissons_ratio_xy=poissons_ratio_xy,
+        poissons_ratio_xz=poissons_ratio_xz,
+        weld_line_factor=weld_line_factor,
+        continuous_use_temperature_min_k=_temperature(
+            continuous_use_temperature_min_k, "continuous_use_temperature_min_k"
+        ),
+        continuous_use_temperature_max_k=_temperature(
+            continuous_use_temperature_max_k, "continuous_use_temperature_max_k"
+        ),
     )
 
 
@@ -214,6 +248,9 @@ def _temperature(value, field_name):
     if isinstance(value, Mapping):
         return _quantity(value, "temperature", field_name).to_si()
     return float(value)
+
+
+DEFAULT_MATERIAL_KEY = "default"
 
 
 def _builtin_definition(
@@ -230,6 +267,18 @@ def _builtin_definition(
     shear_allowable,
     friction_coefficient,
     condition="nominal room temperature, dry",
+    fatigue_strength_at_1e6_pa=None,
+    fatigue_exponent_k=None,
+    young_modulus_transverse_pa=None,
+    young_modulus_thickness_pa=None,
+    shear_modulus_xy_pa=None,
+    shear_modulus_thickness_pa=None,
+    poissons_ratio_xy=None,
+    poissons_ratio_xz=None,
+    weld_line_factor=None,
+    continuous_use_temperature_min_k=293.15,
+    continuous_use_temperature_max_k=293.15,
+    anisotropy_supported=False,
 ):
     properties = _properties(
         density,
@@ -243,6 +292,17 @@ def _builtin_definition(
         friction_coefficient,
         293.15,
         293.15,
+        fatigue_strength_at_1e6_pa=fatigue_strength_at_1e6_pa,
+        fatigue_exponent_k=fatigue_exponent_k,
+        young_modulus_transverse_pa=young_modulus_transverse_pa,
+        young_modulus_thickness_pa=young_modulus_thickness_pa,
+        shear_modulus_xy_pa=shear_modulus_xy_pa,
+        shear_modulus_thickness_pa=shear_modulus_thickness_pa,
+        poissons_ratio_xy=poissons_ratio_xy,
+        poissons_ratio_xz=poissons_ratio_xz,
+        weld_line_factor=weld_line_factor,
+        continuous_use_temperature_min_k=continuous_use_temperature_min_k,
+        continuous_use_temperature_max_k=continuous_use_temperature_max_k,
     )
     provenance = Provenance(
         source_type="catalog",
@@ -260,6 +320,7 @@ def _builtin_definition(
         properties=properties,
         provenance=provenance,
         approval_state=ApprovalState.DRAFT,
+        anisotropy_supported=anisotropy_supported,
     )
     return with_content_hash(definition)
 
@@ -270,26 +331,194 @@ def builtin_materials():
     Built-ins intentionally use ``approval_state=draft`` and low confidence.
     They are useful for exploration and mass estimates but cannot pass the
     qualification material gate without a separately approved record.
+
+    Fatigue endurance data (stress amplitude at 1e6 cycles, R~0.1) and
+    continuous-use temperature ranges are drawn from the polymer supplier
+    datasheet class (e.g., SABIC/Covestro/BASF modulus-vs-temperature and
+    fatigue curves, MIL-HDBK-5 class values for steel) and are intentionally
+    conservative screening values, not certified data.
     """
 
     entries = (
-        ("ABS", "ABS", "thermoplastic", 1040, 2.3e9, 0.35, 40e6, 45e6, 20e6, 60e6, 25e6, 0.35),
-        ("PC", "Polycarbonate", "thermoplastic", 1200, 2.35e9, 0.37, 65e6, 70e6, 35e6, 80e6, 40e6, 0.30),
-        ("PC/ABS", "PC/ABS blend", "thermoplastic", 1160, 2.2e9, 0.36, 45e6, 55e6, 25e6, 65e6, 30e6, 0.32),
-        ("POM", "Polyoxymethylene", "thermoplastic", 1410, 3.0e9, 0.35, 65e6, 70e6, 35e6, 85e6, 40e6, 0.25),
-        ("nylon", "Nylon 6/6", "thermoplastic", 1140, 2.7e9, 0.39, 50e6, 75e6, 25e6, 70e6, 30e6, 0.30),
-        ("TPU", "Thermoplastic polyurethane", "elastomer", 1200, 25e6, 0.49, 10e6, 25e6, 5e6, 20e6, 8e6, 0.50),
-        ("FR4", "FR-4 glass epoxy", "laminate", 1850, 22e9, 0.14, 250e6, 350e6, 200e6, 300e6, 100e6, 0.40),
-        ("LiPo", "Lithium-polymer battery pack", "battery", 2500, 100e6, 0.30, 5e6, 10e6, 3e6, 5e6, 2e6, 0.40),
-        ("steel", "Low-carbon steel", "metal", 7850, 200e9, 0.30, 250e6, 400e6, 150e6, 250e6, 100e6, 0.45),
-        ("PTFE", "Polytetrafluoroethylene", "polymer", 2200, 0.5e9, 0.46, 20e6, 30e6, 10e6, 25e6, 12e6, 0.10),
-        ("magnesium/aluminum", "Magnesium/Aluminum alloy", "metal", 2235, 57e9, 0.31, 155e6, 265e6, 90e6, 150e6, 58e6, 0.35),
+        {
+            "key": "ABS", "name": "ABS", "family": "thermoplastic",
+            "density": 1040, "young_modulus": 2.3e9, "poissons_ratio": 0.35,
+            "yield_strength": 40e6, "ultimate_strength": 45e6,
+            "tensile_allowable": 20e6, "compressive_allowable": 60e6,
+            "shear_allowable": 25e6, "friction_coefficient": 0.35,
+            "fatigue_strength_at_1e6_pa": 14e6, "fatigue_exponent_k": 6,
+            "continuous_use_temperature_min_k": 233.15,
+            "continuous_use_temperature_max_k": 363.15,
+        },
+        {
+            "key": "PC", "name": "Polycarbonate", "family": "thermoplastic",
+            "density": 1200, "young_modulus": 2.35e9, "poissons_ratio": 0.37,
+            "yield_strength": 65e6, "ultimate_strength": 70e6,
+            "tensile_allowable": 35e6, "compressive_allowable": 80e6,
+            "shear_allowable": 40e6, "friction_coefficient": 0.30,
+            "fatigue_strength_at_1e6_pa": 25e6, "fatigue_exponent_k": 6,
+            "continuous_use_temperature_min_k": 233.15,
+            "continuous_use_temperature_max_k": 398.15,
+        },
+        {
+            "key": "PC/ABS", "name": "PC/ABS blend", "family": "thermoplastic",
+            "density": 1160, "young_modulus": 2.2e9, "poissons_ratio": 0.36,
+            "yield_strength": 45e6, "ultimate_strength": 55e6,
+            "tensile_allowable": 25e6, "compressive_allowable": 65e6,
+            "shear_allowable": 30e6, "friction_coefficient": 0.32,
+            "fatigue_strength_at_1e6_pa": 20e6, "fatigue_exponent_k": 6,
+            "continuous_use_temperature_min_k": 233.15,
+            "continuous_use_temperature_max_k": 373.15,
+        },
+        {
+            "key": "POM", "name": "Polyoxymethylene", "family": "thermoplastic",
+            "density": 1410, "young_modulus": 3.0e9, "poissons_ratio": 0.35,
+            "yield_strength": 65e6, "ultimate_strength": 70e6,
+            "tensile_allowable": 35e6, "compressive_allowable": 85e6,
+            "shear_allowable": 40e6, "friction_coefficient": 0.25,
+            "fatigue_strength_at_1e6_pa": 30e6, "fatigue_exponent_k": 6,
+            "continuous_use_temperature_min_k": 233.15,
+            "continuous_use_temperature_max_k": 363.15,
+        },
+        {
+            "key": "nylon", "name": "Nylon 6/6", "family": "thermoplastic",
+            "density": 1140, "young_modulus": 2.7e9, "poissons_ratio": 0.39,
+            "yield_strength": 50e6, "ultimate_strength": 75e6,
+            "tensile_allowable": 25e6, "compressive_allowable": 70e6,
+            "shear_allowable": 30e6, "friction_coefficient": 0.30,
+            "fatigue_strength_at_1e6_pa": 20e6, "fatigue_exponent_k": 6,
+            "continuous_use_temperature_min_k": 233.15,
+            "continuous_use_temperature_max_k": 373.15,
+        },
+        {
+            "key": "TPU", "name": "Thermoplastic polyurethane", "family": "elastomer",
+            "density": 1200, "young_modulus": 25e6, "poissons_ratio": 0.49,
+            "yield_strength": 10e6, "ultimate_strength": 25e6,
+            "tensile_allowable": 5e6, "compressive_allowable": 20e6,
+            "shear_allowable": 8e6, "friction_coefficient": 0.50,
+            "continuous_use_temperature_min_k": 243.15,
+            "continuous_use_temperature_max_k": 343.15,
+        },
+        {
+            "key": "FR4", "name": "FR-4 glass epoxy", "family": "laminate",
+            "density": 1850, "young_modulus": 22e9, "poissons_ratio": 0.14,
+            "yield_strength": 250e6, "ultimate_strength": 350e6,
+            "tensile_allowable": 200e6, "compressive_allowable": 300e6,
+            "shear_allowable": 100e6, "friction_coefficient": 0.40,
+            "fatigue_strength_at_1e6_pa": 65e6, "fatigue_exponent_k": 10,
+            "young_modulus_transverse_pa": 22e9, "young_modulus_thickness_pa": 9e9,
+            "shear_modulus_xy_pa": 7e9, "shear_modulus_thickness_pa": 3.5e9,
+            "poissons_ratio_xy": 0.14, "poissons_ratio_xz": 0.34,
+            "continuous_use_temperature_min_k": 233.15,
+            "continuous_use_temperature_max_k": 403.15,
+            "anisotropy_supported": True,
+        },
+        {
+            "key": "LiPo", "name": "Lithium-polymer battery pack", "family": "battery",
+            "density": 2500, "young_modulus": 100e6, "poissons_ratio": 0.30,
+            "yield_strength": 5e6, "ultimate_strength": 10e6,
+            "tensile_allowable": 3e6, "compressive_allowable": 5e6,
+            "shear_allowable": 2e6, "friction_coefficient": 0.40,
+            "continuous_use_temperature_min_k": 253.15,
+            "continuous_use_temperature_max_k": 333.15,
+        },
+        {
+            "key": "steel", "name": "Low-carbon steel", "family": "metal",
+            "density": 7850, "young_modulus": 200e9, "poissons_ratio": 0.30,
+            "yield_strength": 250e6, "ultimate_strength": 400e6,
+            "tensile_allowable": 150e6, "compressive_allowable": 250e6,
+            "shear_allowable": 100e6, "friction_coefficient": 0.45,
+            "fatigue_strength_at_1e6_pa": 220e6, "fatigue_exponent_k": 5,
+            "continuous_use_temperature_min_k": 233.15,
+            "continuous_use_temperature_max_k": 473.15,
+        },
+        {
+            "key": "PTFE", "name": "Polytetrafluoroethylene", "family": "polymer",
+            "density": 2200, "young_modulus": 0.5e9, "poissons_ratio": 0.46,
+            "yield_strength": 20e6, "ultimate_strength": 30e6,
+            "tensile_allowable": 10e6, "compressive_allowable": 25e6,
+            "shear_allowable": 12e6, "friction_coefficient": 0.10,
+            "continuous_use_temperature_min_k": 73.15,
+            "continuous_use_temperature_max_k": 533.15,
+        },
+        {
+            "key": "magnesium/aluminum", "name": "Magnesium/Aluminum alloy", "family": "metal",
+            "density": 2235, "young_modulus": 57e9, "poissons_ratio": 0.31,
+            "yield_strength": 155e6, "ultimate_strength": 265e6,
+            "tensile_allowable": 90e6, "compressive_allowable": 150e6,
+            "shear_allowable": 58e6, "friction_coefficient": 0.35,
+            "continuous_use_temperature_min_k": 233.15,
+            "continuous_use_temperature_max_k": 423.15,
+        },
+        {
+            "key": DEFAULT_MATERIAL_KEY,
+            "name": "Default (generic polymer)",
+            "family": "generic_polymer",
+            "density": 1160, "young_modulus": 2.0e9, "poissons_ratio": 0.36,
+            "yield_strength": 40e6, "ultimate_strength": 50e6,
+            "tensile_allowable": 25e6, "compressive_allowable": 60e6,
+            "shear_allowable": 30e6, "friction_coefficient": 0.35,
+            "fatigue_strength_at_1e6_pa": 14e6, "fatigue_exponent_k": 6,
+            "continuous_use_temperature_min_k": 233.15,
+            "continuous_use_temperature_max_k": 363.15,
+        },
     )
     catalog = MaterialCatalog()
     for entry in entries:
-        definition = _builtin_definition(*entry)
-        catalog[entry[0]] = definition
+        definition = _builtin_definition(**entry)
+        catalog[entry["key"]] = definition
     return catalog
+
+
+def default_material_definition():
+    """Return the built-in Default material definition.
+
+    The Default material is the deterministic fallback for any object
+    without an explicit material: it carries full physical properties
+    (density, modulus, Poisson ratio, strength allowables, friction) so a
+    simulation never fails or produces undefined behavior because a
+    component has no assigned material.  It is a conservative generic
+    engineering polymer, intentionally low-confidence and DRAFT.
+    """
+    return _builtin_definition(
+        DEFAULT_MATERIAL_KEY,
+        "Default (generic polymer)",
+        "generic_polymer",
+        1160,
+        2.0e9,
+        0.36,
+        40e6,
+        50e6,
+        25e6,
+        60e6,
+        30e6,
+        0.35,
+        fatigue_strength_at_1e6_pa=14e6,
+        fatigue_exponent_k=6,
+        continuous_use_temperature_min_k=233.15,
+        continuous_use_temperature_max_k=363.15,
+    )
+
+
+def ensure_default_material(catalog):
+    """Ensure a catalog carries a usable Default material entry.
+
+    Returns a catalog of the SAME type (a ``MaterialCatalog`` is preserved so
+    case-insensitive and alias lookup keep working — a plain dict rebuild
+    silently disabled them).  User-supplied catalogs that define their own
+    'default' key keep it; otherwise the built-in Default material is added
+    so fallback assignment is always possible.
+    """
+    if DEFAULT_MATERIAL_KEY in catalog:
+        return catalog
+    if isinstance(catalog, MaterialCatalog):
+        rebuilt = MaterialCatalog()
+        for key, value in catalog.items():
+            rebuilt[key] = value
+    else:
+        rebuilt = dict(catalog)
+    rebuilt[DEFAULT_MATERIAL_KEY] = default_material_definition()
+    return rebuilt
 
 
 def _provenance(value):
@@ -337,6 +566,39 @@ def _definition_from_mapping(payload, default_key=None):
             raw_properties.get("friction_coefficient", raw_properties.get("friction")),
             raw_properties.get("temperature_min_k", raw_properties.get("temperature_min")),
             raw_properties.get("temperature_max_k", raw_properties.get("temperature_max")),
+            fatigue_strength_at_1e6_pa=raw_properties.get(
+                "fatigue_strength_at_1e6_pa", raw_properties.get("fatigue_strength_pa")
+            ),
+            fatigue_exponent_k=raw_properties.get("fatigue_exponent_k"),
+            young_modulus_transverse_pa=raw_properties.get(
+                "young_modulus_transverse_pa",
+                raw_properties.get("young_modulus_e2_pa", raw_properties.get("e2_pa")),
+            ),
+            young_modulus_thickness_pa=raw_properties.get(
+                "young_modulus_thickness_pa",
+                raw_properties.get("young_modulus_e3_pa", raw_properties.get("e3_pa")),
+            ),
+            shear_modulus_xy_pa=raw_properties.get(
+                "shear_modulus_xy_pa",
+                raw_properties.get("shear_modulus_g12_pa", raw_properties.get("g12_pa")),
+            ),
+            shear_modulus_thickness_pa=raw_properties.get(
+                "shear_modulus_thickness_pa",
+                raw_properties.get("shear_modulus_g13_pa", raw_properties.get("g13_pa")),
+            ),
+            poissons_ratio_xy=raw_properties.get(
+                "poissons_ratio_xy", raw_properties.get("poissons_ratio_12")
+            ),
+            poissons_ratio_xz=raw_properties.get(
+                "poissons_ratio_xz", raw_properties.get("poissons_ratio_13")
+            ),
+            weld_line_factor=raw_properties.get("weld_line_factor"),
+            continuous_use_temperature_min_k=raw_properties.get(
+                "continuous_use_temperature_min_k", raw_properties.get("continuous_use_temp_min_k")
+            ),
+            continuous_use_temperature_max_k=raw_properties.get(
+                "continuous_use_temperature_max_k", raw_properties.get("continuous_use_temp_max_k")
+            ),
         )
     approval = data.get("approval_state", ApprovalState.DRAFT)
     if not isinstance(approval, ApprovalState):
@@ -474,22 +736,90 @@ def material_validation_errors(material, require_structural=True, required_field
         "tensile_allowable",
         "compressive_allowable",
         "shear_allowable",
+        "fatigue_strength_at_1e6_pa",
+        "young_modulus_transverse_pa",
+        "young_modulus_thickness_pa",
+        "shear_modulus_xy_pa",
+        "shear_modulus_thickness_pa",
     ):
         errors.extend(_quantity_errors(getattr(properties, field_name), field_name, "pressure", positive=True))
+    # Plausibility bounds: absurd-but-finite values (density 1e12 kg/m^3,
+    # modulus 1e15 Pa) were silently used and produced confident results.
+    # The bounds are far outside any engineering polymer/metal/ceramic data
+    # and act as a sanity floor, not a tight specification.
+    def quantity_value(quantity):
+        try:
+            return float(quantity.value_si)
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    if properties.density is not None:
+        density_value = quantity_value(properties.density)
+        if density_value is not None and density_value > 3e4:
+            errors.append("density {} kg/m^3 is implausible (max screening bound 3e4)".format(density_value))
+    if properties.young_modulus is not None:
+        modulus_value = quantity_value(properties.young_modulus)
+        if modulus_value is not None and modulus_value > 1e13:
+            errors.append("young_modulus {} Pa is implausible (max screening bound 1e13)".format(modulus_value))
+    e1 = quantity_value(properties.young_modulus)
+    e2 = quantity_value(properties.young_modulus_transverse_pa)
+    e3 = quantity_value(properties.young_modulus_thickness_pa)
+    if e1 is not None and e1 > 0.0:
+        for label, value in (("E2", e2), ("E3", e3)):
+            if value is not None and (value > 100.0 * e1 or value < e1 / 100.0):
+                errors.append(
+                    "{} {:g} Pa is inconsistent with E1 {:g} Pa (screening bound: within 100x)".format(
+                        label, value, e1
+                    )
+                )
+    if (properties.fatigue_strength_at_1e6_pa is None) != (properties.fatigue_exponent_k is None):
+        errors.append(
+            "fatigue_strength_at_1e6_pa and fatigue_exponent_k must be set together"
+        )
+    if definition.anisotropy_supported:
+        for field_name in (
+            "young_modulus_transverse_pa",
+            "young_modulus_thickness_pa",
+            "shear_modulus_xy_pa",
+            "poissons_ratio_xy",
+        ):
+            if getattr(properties, field_name) is None:
+                errors.append(
+                    "anisotropy_supported requires {} (E2, E3, G12, nu12 quartet)".format(field_name)
+                )
     ratio = properties.poissons_ratio
     if ratio is not None:
         if not _finite_number(ratio) or not (-1.0 < float(ratio) < 0.5):
             errors.append("poissons_ratio must be finite and between -1 and 0.5")
+    for field_name in ("poissons_ratio_xy", "poissons_ratio_xz"):
+        ratio = getattr(properties, field_name)
+        if ratio is not None and (not _finite_number(ratio) or not (-1.0 < float(ratio) < 0.5)):
+            errors.append("{} must be finite and between -1 and 0.5".format(field_name))
     friction = properties.friction_coefficient
     if friction is not None and (not _finite_number(friction) or float(friction) < 0):
         errors.append("friction_coefficient must be finite and non-negative")
+    weld = properties.weld_line_factor
+    if weld is not None and (not _finite_number(weld) or not (0.4 <= float(weld) <= 0.8)):
+        errors.append("weld_line_factor must be finite and between 0.4 and 0.8")
     for field_name in ("temperature_min_k", "temperature_max_k"):
+        value = getattr(properties, field_name)
+        if value is not None and (not _finite_number(value) or float(value) <= 0):
+            errors.append("{} must be finite and positive".format(field_name))
+    for field_name in ("continuous_use_temperature_min_k", "continuous_use_temperature_max_k"):
         value = getattr(properties, field_name)
         if value is not None and (not _finite_number(value) or float(value) <= 0):
             errors.append("{} must be finite and positive".format(field_name))
     if properties.temperature_min_k is not None and properties.temperature_max_k is not None:
         if properties.temperature_min_k > properties.temperature_max_k:
             errors.append("temperature_min_k must not exceed temperature_max_k")
+    if (
+        properties.continuous_use_temperature_min_k is not None
+        and properties.continuous_use_temperature_max_k is not None
+        and properties.continuous_use_temperature_min_k > properties.continuous_use_temperature_max_k
+    ):
+        errors.append(
+            "continuous_use_temperature_min_k must not exceed continuous_use_temperature_max_k"
+        )
     provenance = definition.provenance
     if provenance.confidence not in VALID_CONFIDENCE:
         errors.append("provenance.confidence must be low, medium, or high")

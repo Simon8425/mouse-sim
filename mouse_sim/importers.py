@@ -250,6 +250,7 @@ def _parse_ascii_stl(data, units):
     text = data.decode("utf-8-sig")
     vertices = []
     triangles = []
+    index_by_point = {}
     current = []
     for line_number, raw_line in enumerate(text.splitlines(), 1):
         fields = raw_line.strip().split()
@@ -261,13 +262,14 @@ def _parse_ascii_stl(data, units):
         if len(current) == 3:
             indices = []
             # STL commonly repeats vertices. Deduplicate exact source values
-            # while retaining deterministic first-seen ordering.
+            # with a point -> index dict, preserving deterministic
+            # first-seen ordering (list.index would be quadratic).
             for point in current:
-                try:
-                    index = vertices.index(point)
-                except ValueError:
+                index = index_by_point.get(point)
+                if index is None:
                     index = len(vertices)
                     vertices.append(point)
+                    index_by_point[point] = index
                 indices.append(index)
             triangles.append(tuple(indices))
             current = []
@@ -297,17 +299,18 @@ def _parse_binary_stl(data, units):
         raise ValueError("binary STL length does not match its triangle count")
     vertices = []
     triangles = []
+    index_by_point = {}
     for index in range(count):
         offset = 84 + index * 50
         values = struct.unpack_from("<12f", data, offset)
         triangle = []
         for point in (values[3:6], values[6:9], values[9:12]):
             point = tuple(float(item) for item in point)
-            try:
-                vertex_index = vertices.index(point)
-            except ValueError:
+            vertex_index = index_by_point.get(point)
+            if vertex_index is None:
                 vertex_index = len(vertices)
                 vertices.append(point)
+                index_by_point[point] = vertex_index
             triangle.append(vertex_index)
         triangles.append(tuple(triangle))
     return TriangleMesh(vertices, triangles, units=units)

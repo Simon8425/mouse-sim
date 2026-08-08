@@ -39,9 +39,9 @@ export async function modelLoaded(page: Page): Promise<void> {
   await expect(page.locator('.model-row')).toHaveCount(1, { timeout: 15_000 });
 }
 
-/** Waits until the analysis run reports 'Complete' in the Mission Control panel. */
+/** Waits until the analysis run reports 'Complete' in the Settings panel. */
 export async function expectRunComplete(page: Page): Promise<void> {
   await page.getByRole('button', { name: 'Control panel' }).click();
   await expect(page.locator('.mission-control')).toContainText('Complete', { timeout: 15_000 });
-  await page.getByRole('button', { name: 'Close control panel' }).click();
+  await page.getByRole('button', { name: 'Close settings panel' }).click();
 }

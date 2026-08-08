@@ -3,8 +3,23 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { useEffect } from 'react';
 import { TopBar } from '../components/TopBar';
-import { ProjectProvider, useProjectStore } from '../state/projectStore';
+import { ProjectProvider, useProjectStore, type ProjectAction } from '../state/projectStore';
 import type { ProjectState } from '../state/projectStore';
+import type { PipelineRequest } from '../api/contracts';
+import { IDENTITY_TRANSFORM } from '../api/contracts';
+
+const mockBaselineProject: PipelineRequest = {
+  schema_id: 'gms.project/1',
+  mode: 'exploration',
+  units: 'mm',
+  objects: [
+    {
+      id: 'shell_top',
+      geometry: { type: 'box', size: [110, 65, 2.5], units: 'mm', transform: IDENTITY_TRANSFORM },
+      material: 'ABS',
+    },
+  ],
+};
 
 function StateProbe({ onState }: { onState: (state: ProjectState) => void }) {
   const { state } = useProjectStore();
@@ -14,9 +29,20 @@ function StateProbe({ onState }: { onState: (state: ProjectState) => void }) {
   return null;
 }
 
-function renderTopBar(onState: (state: ProjectState) => void) {
+function DispatchHelper({ action }: { action: ProjectAction }) {
+  const { dispatch } = useProjectStore();
+  useEffect(() => {
+    dispatch(action);
+  }, [dispatch, action]);
+  return null;
+}
+
+function renderTopBar(onState: (state: ProjectState) => void, actions: ProjectAction[] = []) {
   return render(
     <ProjectProvider>
+      {actions.map((action, index) => (
+        <DispatchHelper key={index} action={action} />
+      ))}
       <StateProbe onState={onState} />
       <TopBar
         onOpenNav={vi.fn()}
@@ -57,9 +83,9 @@ describe('TopBar run test menu', () => {
     expect(screen.getByRole('menuitem', { name: 'Run Qualification' })).toBeInTheDocument();
   });
 
-  it('dispatches RUN_DROP_TEST with the test defaults and closes the menu', async () => {
+  it('opens the test dialog from the menu without dispatching yet', async () => {
     const user = userEvent.setup();
-    let captured: ProjectState | null = null;
+    let captured: ProjectState | null | undefined;
     renderTopBar((state) => {
       captured = state;
     });
@@ -67,27 +93,27 @@ describe('TopBar run test menu', () => {
     await user.click(screen.getByRole('button', { name: 'Run test menu' }));
     await user.click(screen.getByRole('menuitem', { name: 'Drop Test' }));
 
-    await waitFor(() => {
-      expect(captured?.draft?.drop_simulation).toMatchObject({
-        test: 'drop',
-        height_m: 0.75,
-        surface: 'concrete',
-        drop_count: 3,
-        orientation: 'flat',
-      });
-    });
     expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: 'Drop Test' })).toBeInTheDocument();
+    expect(captured?.draft?.drop_simulation).toBeUndefined();
+    expect(captured?.runNonce).toBe(0);
   });
 
-  it('dispatches RUN_DROP_TEST for impact and tumble defaults', async () => {
+  it('runs impact and tumble from their dialogs with the test defaults', async () => {
     const user = userEvent.setup();
-    let captured: ProjectState | null = null;
-    renderTopBar((state) => {
-      captured = state;
-    });
+    let captured: ProjectState | null | undefined;
+    renderTopBar(
+      (state) => {
+        captured = state;
+      },
+      [{ type: 'LOAD_BASELINE_OK', project: mockBaselineProject, name: 'mouse_baseline' }],
+    );
 
     await user.click(screen.getByRole('button', { name: 'Run test menu' }));
     await user.click(screen.getByRole('menuitem', { name: 'Impact Test' }));
+    expect(screen.getByRole('dialog', { name: 'Impact Test' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Run Impact Test' }));
     await waitFor(() => {
       expect(captured?.draft?.drop_simulation).toMatchObject({
         test: 'impact',
@@ -96,9 +122,13 @@ describe('TopBar run test menu', () => {
         drop_count: 1,
       });
     });
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: 'Run test menu' }));
     await user.click(screen.getByRole('menuitem', { name: 'Tumble Test' }));
+    expect(screen.getByRole('dialog', { name: 'Tumble Test' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Run Tumble Test' }));
     await waitFor(() => {
       expect(captured?.draft?.drop_simulation).toMatchObject({
         test: 'tumble',
@@ -107,11 +137,12 @@ describe('TopBar run test menu', () => {
         spin_rps: 4,
       });
     });
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 
   it('Run Qualification keeps the current behavior and closes the menu', async () => {
     const user = userEvent.setup();
-    let captured: ProjectState | null = null;
+    let captured: ProjectState | null | undefined;
     renderTopBar((state) => {
       captured = state;
     });
@@ -153,10 +184,13 @@ describe('TopBar run test menu', () => {
 
   it('supports arrow-key navigation and Enter activation', async () => {
     const user = userEvent.setup();
-    let captured: ProjectState | null = null;
-    renderTopBar((state) => {
-      captured = state;
-    });
+    let captured: ProjectState | null | undefined;
+    renderTopBar(
+      (state) => {
+        captured = state;
+      },
+      [{ type: 'LOAD_BASELINE_OK', project: mockBaselineProject, name: 'mouse_baseline' }],
+    );
 
     await user.click(screen.getByRole('button', { name: 'Run test menu' }));
     expect(screen.getByRole('menuitem', { name: 'Drop Test' })).toHaveFocus();
@@ -176,9 +210,13 @@ describe('TopBar run test menu', () => {
     await user.keyboard('{ArrowUp}');
     expect(screen.getByRole('menuitem', { name: 'Impact Test' })).toHaveFocus();
     await user.keyboard('{Enter}');
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: 'Impact Test' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Run Impact Test' }));
     await waitFor(() => {
       expect(captured?.draft?.drop_simulation).toMatchObject({ test: 'impact' });
     });
-    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 });

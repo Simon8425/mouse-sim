@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import type { Vec3, GeometryJson, RigidTransformJson, CompoundGeometryJson } from '../api/contracts';
 import { IDENTITY_TRANSFORM } from '../api/contracts';
-import { paletteKeyForComponent, type PaletteKey } from './materialPalette';
+import { paletteKeyForComponent, type PaletteKey, type QualityTier } from './materialPalette';
 
 export interface ObjectSceneEntry {
   id: string;
@@ -12,7 +12,7 @@ export interface ObjectSceneEntry {
 }
 
 export interface FactoryOptions {
-  quality?: 'high' | 'medium' | 'low';
+  quality?: QualityTier;
   materials?: Partial<Record<PaletteKey, THREE.Material>>;
   wireframe?: boolean;
 }

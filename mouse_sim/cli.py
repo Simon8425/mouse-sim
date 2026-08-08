@@ -121,8 +121,9 @@ def _cmd_run(args):
     document_options = document.get("options")
     options = dict(document_options) if isinstance(document_options, Mapping) else {}
     options["strict"] = bool(options.get("strict", False) or args.strict)
-    if args.cache_dir:
-        options["cache_dir"] = args.cache_dir
+    # The cache directory is an execution detail, not a request input:
+    # injecting it into options would change the run id for the same
+    # analysis across cache locations and defeat cross-dir cache reuse.
     request["options"] = options
     cache = ArtifactCache(args.cache_dir) if args.cache_dir else None
     try:

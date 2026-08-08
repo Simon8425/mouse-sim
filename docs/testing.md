@@ -41,4 +41,4 @@ The browser tests use semantic/product selectors such as `.run-status__value`; t
 - `validity=inconclusive` means the result is not safe to use for a decision, even if some intermediate quantities were calculated.
 - A missing contact stiffness, stopping distance, or contact duration cannot produce a valid peak-force result.
 - Qualification can reach only `qualification_pending_review`; a human review and physical evidence are still required.
-- The five integrity gates are shown separately from the twelve readiness gates in the results rail, so reviewers can see why evidence is blocked.
+- The six integrity gates are shown separately from the twelve readiness gates in the results rail, so reviewers can see why evidence is blocked.

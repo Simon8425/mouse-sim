@@ -409,6 +409,24 @@ class MaterialProperties(ModelBase):
     friction_coefficient: Optional[float] = None
     temperature_min_k: Optional[float] = None
     temperature_max_k: Optional[float] = None
+    # Fatigue data: stress amplitude at 1e6 cycles (R ~ 0.1) and Basquin
+    # slope k (S = S_1e6 * (N/1e6)^(-1/k)); both must be set together.
+    fatigue_strength_at_1e6_pa: Optional[Quantity] = None
+    fatigue_exponent_k: Optional[float] = None
+    # Directional (orthotropic laminate / flow-oriented polymer) stiffness.
+    # E1 is young_modulus; E2/E3/G12/G13 and nu12/nu13 complete the plate data.
+    young_modulus_transverse_pa: Optional[Quantity] = None
+    young_modulus_thickness_pa: Optional[Quantity] = None
+    shear_modulus_xy_pa: Optional[Quantity] = None
+    shear_modulus_thickness_pa: Optional[Quantity] = None
+    poissons_ratio_xy: Optional[float] = None
+    poissons_ratio_xz: Optional[float] = None
+    # Weld-line strength knockdown factor (0.4-0.8 for molded thermoplastics).
+    weld_line_factor: Optional[float] = None
+    # Continuous-use service temperature range (K). The legacy
+    # temperature_min_k/max_k remain data-validity fields for the data record.
+    continuous_use_temperature_min_k: Optional[float] = None
+    continuous_use_temperature_max_k: Optional[float] = None
 
     def validation_errors(self):
         errors = []
@@ -428,6 +446,27 @@ class MaterialProperties(ModelBase):
             quantity = getattr(self, name)
             if quantity is not None and quantity.value_si <= 0:
                 errors.append("{} must be positive".format(name))
+        for name in (
+            "fatigue_strength_at_1e6_pa",
+            "young_modulus_transverse_pa",
+            "young_modulus_thickness_pa",
+            "shear_modulus_xy_pa",
+            "shear_modulus_thickness_pa",
+        ):
+            quantity = getattr(self, name)
+            if quantity is not None and quantity.value_si <= 0:
+                errors.append("{} must be positive".format(name))
+        if self.fatigue_strength_at_1e6_pa is not None or self.fatigue_exponent_k is not None:
+            if self.fatigue_strength_at_1e6_pa is None or self.fatigue_exponent_k is None:
+                errors.append(
+                    "fatigue_strength_at_1e6_pa and fatigue_exponent_k must be set together"
+                )
+        for name in ("poissons_ratio_xy", "poissons_ratio_xz"):
+            ratio = getattr(self, name)
+            if ratio is not None and not (-1.0 < ratio < 0.5):
+                errors.append("{} must be between -1 and 0.5".format(name))
+        if self.weld_line_factor is not None and not (0.4 <= self.weld_line_factor <= 0.8):
+            errors.append("weld_line_factor must be between 0.4 and 0.8")
         if self.friction_coefficient is not None and self.friction_coefficient < 0:
             errors.append("friction_coefficient must be non-negative")
         return tuple(errors)

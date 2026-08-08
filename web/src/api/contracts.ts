@@ -220,10 +220,27 @@ export interface DropSimulationDrop {
   start_s: number;
   end_s: number;
   settled_s: number;
+  settled?: boolean;
   impact_count: number;
   peak_impact_speed_m_s: number;
   peak_kinetic_energy_j: number;
+  peak_raw_kinetic_energy_j?: number;
   orientation: DropOrientation;
+  energy?: {
+    release_j: number | null;
+    first_impact_j: number | null;
+    settled_j: number | null;
+    lost_contact_j: number;
+    lost_drag_j: number;
+    drift_pct: number;
+  };
+  checks?: DropSimulationCheck[];
+}
+
+export interface DropSimulationCheck {
+  code: string;
+  severity: 'error' | 'warning';
+  message: string;
 }
 
 export interface DropSimulationImpact {
@@ -231,6 +248,13 @@ export interface DropSimulationImpact {
   t_s: number;
   impact_speed_m_s: number;
   kinetic_energy_j: number;
+  raw_kinetic_energy_j?: number;
+  contact_location?: number[];
+  contact_normal?: number[];
+  contact_point_speed?: number;
+  tangent_speed?: number;
+  incidence_angle_deg?: number;
+  manifold_size?: number;
 }
 
 export type DropTrajectorySample = [
@@ -255,9 +279,21 @@ export interface DropSimulationResult {
     timestep_s: number;
     gravity_m_s2: number;
     surface: DropSurface;
+    restitution?: number;
+    friction?: number;
+    com_offset_m?: number[];
+    variation?: {
+      unit_seed: number | null;
+      mass_scale: number;
+      inertia_scale: number[];
+      com_offset_m: number[];
+      friction_scale: number;
+      restitution_scale: number;
+    };
   };
   drops: DropSimulationDrop[];
   impacts: DropSimulationImpact[];
+  checks?: DropSimulationCheck[];
   peak: DropSimulationImpact | null;
   peak_force_estimate_n: number | null;
   trajectory: DropTrajectorySample[];
@@ -269,12 +305,15 @@ export interface PipelineRequest {
   units?: string;
   objects?: ProjectObject[] | Record<string, unknown>;
   materials?: unknown;
+  default_material?: string;
   load_case?: Record<string, unknown> | null;
   structure?: Record<string, unknown> | null;
   fixtures?: unknown;
   impact?: Record<string, unknown> | null;
   drop_simulation?: Partial<DropSimulationConfig> | null;
   tolerance_profile?: Record<string, unknown> | null;
+  components?: unknown[];
+  population?: Record<string, unknown> | null;
   options?: Record<string, unknown>;
   [key: string]: unknown;
 }
@@ -460,6 +499,193 @@ export interface QualificationResult {
   summary: string;
 }
 
+export interface MaterialAssignment {
+  object_id: string;
+  material: string;
+  source: 'explicit' | 'default';
+}
+
+export type ComponentStatus = 'pass' | 'warn' | 'fail' | 'not_evaluated';
+
+export interface ComponentFinding {
+  code?: string;
+  severity?: string;
+  message?: string;
+}
+
+export interface ComponentAssessment {
+  component_id?: string;
+  type?: string;
+  status?: ComponentStatus | string;
+  validity?: string;
+  metrics?: Record<string, number | string | null>;
+  findings?: ComponentFinding[];
+  assumptions?: string[];
+  flags?: string[];
+  usage_ratio?: number | null;
+}
+
+export interface ComponentWeakest {
+  component_id?: string;
+  type?: string;
+  status?: ComponentStatus | string;
+}
+
+export interface ComponentResult {
+  components?: ComponentAssessment[];
+  summary?: {
+    fail_count?: number;
+    warn_count?: number;
+    weakest?: ComponentWeakest | null;
+  } | null;
+}
+
+export type ShellStatus = 'pass' | 'warn' | 'fail' | 'not_evaluated';
+export type ShellClassification =
+  | 'safe'
+  | 'marginal'
+  | 'failed'
+  | 'unsupported'
+  | 'invalid_input'
+  | 'insufficient_evidence';
+export type SensitivityLevel = 'HIGH' | 'MEDIUM' | 'LOW' | 'NOT_OBSERVED';
+
+/** Drop-impact loading derived for the shell model. */
+export interface ShellDropLoading {
+  drop_peak_speed_m_s?: number | null;
+  drop_peak_energy_j?: number | null;
+  drop_peak_force_n?: number | null;
+}
+
+/** Probe stability of the identified critical region across FE solves. */
+export interface ShellCriticalRegionStability {
+  stable?: boolean;
+  probe_solves?: number;
+  max_location_shift_m?: number;
+  tolerance_m?: number;
+  statement?: string;
+}
+
+/** Statistical basis of the shell verdict. */
+export interface ShellStatisticalConfidence {
+  kind?: string;
+}
+
+/**
+ * Authoritative shell FEA result. Every field is optional — the backend may
+ * omit any of them, so consumers must guard every read.
+ */
+export interface ShellResult {
+  status?: ShellStatus | string | null;
+  classification?: ShellClassification | string | null;
+  peak_stress_pa?: number | null;
+  max_displacement_m?: number | null;
+  min_safety_factor?: number | null;
+  critical_region?: number[] | null;
+  critical_region_stability?: ShellCriticalRegionStability | null;
+  failure_mode?: string | null;
+  physical_model_confidence?: 'high' | 'medium' | 'low' | string | null;
+  statistical_confidence?: ShellStatisticalConfidence | null;
+  statement?: string | null;
+  assumptions?: string[];
+  limitations?: string[];
+  loading?: ShellDropLoading | null;
+}
+
+/** One component in the secondary screening list. */
+export interface ScreeningComponentAssessment {
+  component_id?: string;
+  type?: string;
+  status?: ComponentStatus | string;
+  validity?: 'approximate' | 'not_evaluated' | string;
+  metrics?: Record<string, number | string | null>;
+  findings?: ComponentFinding[];
+  assumptions?: string[];
+  flags?: string[];
+  usage_ratio?: number | null;
+}
+
+/** Secondary component screening block (low-confidence surrogate models). */
+export interface ComponentScreeningResult {
+  components?: ScreeningComponentAssessment[];
+  summary?: {
+    fail_count?: number;
+    warn_count?: number;
+    weakest?: ComponentWeakest | null;
+  } | null;
+  confidence?: string;
+  note?: string;
+}
+
+export interface WilsonCi {
+  low?: number;
+  high?: number;
+}
+
+export interface ComponentFailureRate {
+  component_id?: string;
+  type?: string;
+  failures?: number;
+  rate?: number;
+  wilson_ci?: WilsonCi | null;
+  rank?: number;
+}
+
+export interface WeakestComponent {
+  component_id?: string;
+  type?: string;
+  rate?: number;
+  rank?: number;
+}
+
+export interface SensitivityEntry {
+  parameter?: string;
+  correlation?: number;
+  mean_value?: number;
+  std_value?: number;
+  level?: SensitivityLevel | string;
+}
+
+export interface SurvivalPoint {
+  usage_fraction?: number;
+  survival_rate?: number;
+}
+
+/** Shell block inside a population result — Monte Carlo aggregates or a single worst-case run. */
+export interface PopulationShell {
+  nominal?: Record<string, unknown> | null;
+  failures?: number;
+  failure_rate?: number;
+  wilson_ci?: WilsonCi | null;
+  sensitivity?: SensitivityEntry[];
+  assumptions?: string[];
+  safety_factor?: number;
+  peak_stress_pa?: number;
+  max_displacement_m?: number;
+  verdict?: string;
+}
+
+export interface PopulationResult {
+  mode?: string;
+  verdict?: string;
+  drop?: Record<string, unknown> | null;
+  sample_count?: number;
+  profile?: string;
+  lifespan_days?: number;
+  units_failed?: number;
+  failure_rate?: number;
+  wilson_ci?: WilsonCi | null;
+  component_failure_rates?: ComponentFailureRate[];
+  weakest_components?: WeakestComponent[];
+  sensitivity?: SensitivityEntry[];
+  survival?: SurvivalPoint[];
+  components?: ComponentAssessment[] | null;
+  assumptions?: string[];
+  shell?: PopulationShell | null;
+  diagnostics?: string[];
+  model?: Record<string, unknown> | null;
+}
+
 export interface PipelineResult {
   schema_id: string;
   engine_version: string;
@@ -475,6 +701,11 @@ export interface PipelineResult {
   impact: ImpactSection | null;
   drop_simulation: DropSimulationResult | null;
   qualification: QualificationResult | null;
+  material_assignments?: MaterialAssignment[] | null;
+  components?: ComponentResult | null;
+  component_screening?: ComponentScreeningResult | null;
+  shell?: ShellResult | null;
+  population?: PopulationResult | null;
   manifest: Record<string, unknown> | null;
   errors: ErrorEntry[];
 }

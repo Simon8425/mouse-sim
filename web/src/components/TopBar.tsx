@@ -1,8 +1,9 @@
 import * as React from 'react';
 import { useProjectStore } from '../state/projectStore';
 import { selectSourceLabel } from '../state/selectors';
-import { DROP_TESTS, configForTest } from '../lib/studies';
+import { DROP_TESTS } from '../lib/studies';
 import type { DropTestDefinition } from '../lib/studies';
+import { TestRunDialog } from './TestRunCard';
 
 export interface TopBarProps {
   onOpenNav: () => void;
@@ -16,6 +17,7 @@ export function TopBar(props: TopBarProps): React.ReactElement {
   const sourceReadyLabel = selectSourceLabel(state);
 
   const [menuOpen, setMenuOpen] = React.useState(false);
+  const [pendingTest, setPendingTest] = React.useState<DropTestDefinition | null>(null);
   const menuRef = React.useRef<HTMLDivElement | null>(null);
   const triggerRef = React.useRef<HTMLButtonElement | null>(null);
 
@@ -35,9 +37,9 @@ export function TopBar(props: TopBarProps): React.ReactElement {
       break;
   }
 
-  const runDropTest = (test: DropTestDefinition) => {
-    dispatch({ type: 'RUN_DROP_TEST', test: test.test, config: configForTest(test) });
+  const openTestDialog = (test: DropTestDefinition) => {
     setMenuOpen(false);
+    setPendingTest(test);
   };
 
   const runQualification = () => {
@@ -141,7 +143,7 @@ export function TopBar(props: TopBarProps): React.ReactElement {
                   type="button"
                   role="menuitem"
                   className="top-bar__menu-item"
-                  onClick={() => runDropTest(test)}
+                  onClick={() => openTestDialog(test)}
                 >
                   {test.title}
                 </button>
@@ -189,6 +191,9 @@ export function TopBar(props: TopBarProps): React.ReactElement {
           INFO
         </button>
       </div>
+      {pendingTest ? (
+        <TestRunDialog test={pendingTest} onClose={() => setPendingTest(null)} />
+      ) : null}
     </header>
   );
 }

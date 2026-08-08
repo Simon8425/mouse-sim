@@ -555,6 +555,35 @@ def _result_error_response(result):
     return None
 
 
+def slim_result_for_web(result):
+    """Return a response copy with geometry-heavy manifest inputs replaced.
+
+    The pipeline manifest snapshots the full request for reproducibility and
+    cache verification, but the web client only consumes the manifest hashes.
+    Echoing per-object meshes (tens of MB) back in every analyze response
+    dominates the payload; the objects entry is replaced by its object count
+    and the canonical sha256 already computed by the pipeline. Everything else
+    is shared unchanged and stays byte-identical to the pipeline result.
+    """
+    slim = dict(result)
+    manifest = result.get("manifest")
+    if isinstance(manifest, dict):
+        manifest_slim = dict(manifest)
+        inputs = manifest.get("inputs")
+        if isinstance(inputs, dict) and "objects" in inputs:
+            input_hashes = manifest.get("input_hashes")
+            raw = inputs["objects"]
+            count = len(raw) if isinstance(raw, (list, tuple, dict)) else 0
+            summary = {"count": count, "sha256": None}
+            if isinstance(input_hashes, dict):
+                summary["sha256"] = input_hashes.get("objects")
+            slim_inputs = dict(inputs)
+            slim_inputs["objects"] = summary
+            manifest_slim["inputs"] = slim_inputs
+        slim["manifest"] = manifest_slim
+    return slim
+
+
 def handle_analyze(config, cache, payload):
     """Validate the analysis envelope and execute the pipeline."""
     from .pipeline import ENGINE_VERSION, run_pipeline
@@ -597,7 +626,7 @@ def handle_analyze(config, cache, payload):
             "schema_id": WEB_ANALYSIS_RESPONSE_SCHEMA_ID,
             "run_id": result["run_id"],
             "engine_version": ENGINE_VERSION,
-            "result": result,
+            "result": slim_result_for_web(result),
             "materials": material_catalog_projection(catalog),
         },
     )
@@ -835,7 +864,13 @@ class WebApiHandler(BaseHTTPRequestHandler):
             else:
                 self._serve_static(head_only=head_only)
         except WebRequestError as exc:
-            extra = {"Connection": "close"} if exc.status == 413 else None
+            # 400/413 may leave the request body unread on the socket; keeping
+            # the connection open would let leftover bytes be parsed as the
+            # next request line (keep-alive poisoning).
+            close = exc.status in (400, 413)
+            if close:
+                self.close_connection = True
+            extra = {"Connection": "close"} if close else None
             self._send_api(exc.status, exc.envelope(), extra_headers=extra)
         except Exception as exc:
             self.log_message("internal error: %r", exc)
@@ -855,9 +890,13 @@ class WebApiHandler(BaseHTTPRequestHandler):
                 )
             self._send_api(status, payload)
         except WebRequestError as exc:
-            if exc.status == 413:
+            # 400/413 may leave the request body unread on the socket; keeping
+            # the connection open would let leftover bytes be parsed as the
+            # next request line (keep-alive poisoning).
+            close = exc.status in (400, 413)
+            if close:
                 self.close_connection = True
-            extra = {"Connection": "close"} if exc.status == 413 else None
+            extra = {"Connection": "close"} if close else None
             self._send_api(exc.status, exc.envelope(), extra_headers=extra)
         except Exception as exc:
             self.log_message("internal error: %r", exc)
@@ -994,6 +1033,7 @@ __all__ = [
     "handle_materials",
     "handle_normalize",
     "handle_analyze",
+    "slim_result_for_web",
     "build_server",
     "serve",
 ]

@@ -376,8 +376,46 @@ describe('projectStore state reducer and selectors', () => {
     expect(req?.options?.display_tessellation).toBe(true);
   });
 
-  it('assigns a material override to an uploaded object and clears it', () => {
+  it('sets the default material key via SET_DEFAULT_MATERIAL', () => {
+    const state = reducer(initialState, { type: 'SET_DEFAULT_MATERIAL', key: 'ABS' });
+    expect(state.defaultMaterialKey).toBe('ABS');
+  });
+
+  it('includes default_material in the analysis request when set', () => {
     const preview: GeometryPreview = {
+      schema_id: 'gms.geometry-preview/1',
+      supported: true,
+      format: 'json',
+      source_units: 'mm',
+      geometry: {
+        type: 'box',
+        size: [40, 20, 4],
+        units: 'mm',
+        transform: IDENTITY_TRANSFORM,
+      },
+      diagnostics: [],
+      source_name: 'case.stl',
+    };
+    let state = reducer(initialState, { type: 'PREVIEW_OK', preview });
+    state = reducer(state, { type: 'SET_DEFAULT_MATERIAL', key: 'ABS' });
+
+    const req = createAnalysisRequest(state);
+    expect(req?.default_material).toBe('ABS');
+    expect(req?.objects).toEqual([{ id: 'case.stl', geometry: preview.geometry }]);
+  });
+
+  it('omits default_material when the default material key is empty', () => {
+    const state = reducer({ ...initialState, defaultMaterialKey: '' }, {
+      type: 'LOAD_BASELINE_OK',
+      project: mockBaselineProject,
+      name: 'mouse_baseline',
+    });
+    const req = createAnalysisRequest(state);
+    expect(req).not.toBeNull();
+    expect(req?.default_material).toBeUndefined();
+  });
+
+  it('assigns a material override to an uploaded object and clears it', () => {    const preview: GeometryPreview = {
       schema_id: 'gms.geometry-preview/1',
       supported: true,
       format: 'json',
@@ -591,6 +629,37 @@ describe('mission control store actions and selectors', () => {
   it('bumps the run nonce on RUN_STUDY to re-trigger analysis', () => {
     const state = reducer(initialState, { type: 'RUN_STUDY' });
     expect(state.runNonce).toBe(1);
+  });
+
+  it('prefills the worst-case population draft and bumps the run nonce on RUN_POPULATION', () => {
+    let state = reducer(initialState, {
+      type: 'LOAD_BASELINE_OK',
+      project: mockBaselineProject,
+      name: 'mouse_baseline',
+    });
+    expect(state.runNonce).toBe(0);
+
+    state = reducer(state, { type: 'RUN_POPULATION' });
+    expect(state.runNonce).toBe(1);
+    expect(state.draft?.population).toEqual({
+      sample_count: 10000,
+      profile: 'esports_fps',
+      lifespan_days: 730,
+    });
+    expect(state.draft?.drop_simulation).toMatchObject({
+      test: 'drop',
+      height_m: 0.75,
+      drop_count: 1,
+      surface: 'concrete',
+      orientation: 'flat',
+    });
+    expect(state.draft?.impact).toBeNull();
+    expect(state.draft?.load_case).toBeNull();
+    expect(state.draft?.structure).toBeNull();
+
+    const nonceBefore = state.runNonce;
+    state = reducer(state, { type: 'RUN_POPULATION' });
+    expect(state.runNonce).toBe(nonceBefore + 1);
   });
 
   it('prefills drop test configs through RUN_DROP_TEST with exclusive nulls', () => {

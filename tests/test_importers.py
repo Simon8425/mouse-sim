@@ -96,6 +96,31 @@ class SampleFileImportTests(unittest.TestCase):
         result = load_geometry(binary, fmt="stl", units="mm")
         self.assertEqual(result.geometry.vertices[1], (0.001, 0.0, 0.0))
 
+    def test_binary_stl_two_thousand_triangles_parse_completes(self):
+        count = 2000
+        binary = b" " * 80 + struct.pack("<I", count)
+        for index in range(count):
+            base = index * 3
+            binary += struct.pack(
+                "<12f",
+                0.0, 0.0, 1.0,
+                float(base), 0.0, 0.0,
+                float(base + 1), 0.0, 0.0,
+                float(base + 1), float(base + 2), 0.0,
+            ) + struct.pack("<H", 0)
+        result = load_geometry(binary, fmt="stl", units="mm")
+        self.assertEqual(len(result.geometry.triangles), count)
+        self.assertEqual(len(result.geometry.vertices), count * 3)
+        self.assertEqual(result.geometry.vertices[0], (0.0, 0.0, 0.0))
+
+    def test_stl_dedup_preserves_first_seen_vertex_order(self):
+        binary = b" " * 80 + struct.pack("<I", 2)
+        binary += struct.pack("<12f", 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0) + struct.pack("<H", 0)
+        binary += struct.pack("<12f", 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0) + struct.pack("<H", 0)
+        result = load_geometry(binary, fmt="stl", units="mm")
+        self.assertEqual(len(result.geometry.vertices), 3)
+        self.assertEqual(result.geometry.triangles, ((0, 1, 2), (0, 1, 2)))
+
     def test_faceted_step_parses(self):
         path = os.path.join(FIXTURES, "faceted_cube.step")
         result = load_geometry(path)

@@ -29,6 +29,7 @@ def approved_inputs(**overrides):
                 "required": True,
                 "required_record_types": ("static_correlation",),
                 "require_reviewed_records": True,
+                "maximum_error_fraction": 0.25,
             },
         },
         "geometry": {
@@ -190,17 +191,21 @@ class AnalysisValidityIntegrityTests(unittest.TestCase):
         self.assertEqual(result.evidence_disposition, "qualification_blocked")
         self.assertIn("ANALYSIS_VALIDITY", result.blocking_keys)
 
-    def test_unsupported_failure_modes_block_even_when_validity_valid(self):
+    def test_unsupported_failure_modes_disclosed_but_not_blocking(self):
         result = evaluate_qualification("qualification", **approved_inputs(
             structural_response={
                 "validity": "valid",
                 "unsupported_failure_modes": ["UNSUPPORTED_BUCKLING"],
             },
         ))
-        self.assertEqual(result.evidence_disposition, "qualification_blocked")
-        self.assertIn("ANALYSIS_VALIDITY", result.blocking_keys)
+        # Unsupported modes describe model scope, not analysis failure: they
+        # are disclosed in the gate explanation but do not block.
+        self.assertEqual(result.evidence_disposition, "qualification_pending_review")
+        self.assertNotIn("ANALYSIS_VALIDITY", result.blocking_keys)
         gate = {item.key: item for item in result.integrity_gates}["ANALYSIS_VALIDITY"]
+        self.assertTrue(gate.passed)
         self.assertIn("UNSUPPORTED_BUCKLING", gate.explanation)
+        self.assertIn("disclosed", gate.explanation)
 
     def test_validation_report_status_fail_blocks(self):
         result = evaluate_qualification("qualification", **approved_inputs(
@@ -216,15 +221,27 @@ class AnalysisValidityIntegrityTests(unittest.TestCase):
         self.assertEqual(result.evidence_disposition, "qualification_pending_review")
         self.assertNotIn("ANALYSIS_VALIDITY", result.blocking_keys)
 
-    def test_claimed_evidence_without_structural_response_is_blocked(self):
+    def test_pinned_load_case_without_structural_analysis_blocks(self):
+        # A pinned load case that produced no analysis is a zero-evidence
+        # bypass: it must block on ANALYSIS_VALIDITY itself.
         result = evaluate_qualification("qualification", **approved_inputs(structural_response=None))
         self.assertEqual(result.evidence_disposition, "qualification_blocked")
         gate = {item.key: item for item in result.integrity_gates}["ANALYSIS_VALIDITY"]
-        self.assertTrue(gate.passed)
-        self.assertTrue(gate.explanation.strip())
+        self.assertFalse(gate.passed)
+        self.assertTrue(gate.blocker)
+        self.assertIn("load case pinned but no structural analysis performed", gate.explanation)
         gate = {item.key: item for item in result.integrity_gates}["CONVERGENCE_EVIDENCE"]
         self.assertFalse(gate.passed)
         self.assertIn("cannot be substantiated", gate.explanation)
+
+    def test_no_load_case_without_structural_analysis_still_clean(self):
+        result = evaluate_qualification("qualification", **approved_inputs(
+            structural_response=None, load_case=None,
+        ))
+        gate = {item.key: item for item in result.integrity_gates}["ANALYSIS_VALIDITY"]
+        self.assertTrue(gate.passed)
+        self.assertNotIn("ANALYSIS_VALIDITY", result.blocking_keys)
+        self.assertIn("no structural analysis performed", gate.explanation)
 
 
 class ImpactIntegrityTests(unittest.TestCase):
@@ -351,11 +368,22 @@ class CorrelationErrorTests(unittest.TestCase):
         self.assertEqual(result.evidence_disposition, "qualification_blocked")
         self.assertIn("CORRELATION_ERROR", result.blocking_keys)
 
-    def test_no_maximum_configured_does_not_block(self):
-        result = evaluate_qualification("qualification", **approved_inputs())
+    def test_no_maximum_configured_blocks(self):
+        # B6: a required correlation policy without a configured maximum
+        # error fraction cannot be evaluated and must block, never pass.
+        data = approved_inputs()
+        data["method"] = dict(data["method"])
+        data["method"]["required_correlation_policy"] = {
+            "required": True,
+            "required_record_types": ("static_correlation",),
+            "require_reviewed_records": True,
+        }
+        result = evaluate_qualification("qualification", **data)
         gate = {item.key: item for item in result.integrity_gates}["CORRELATION_ERROR"]
-        self.assertTrue(gate.passed)
-        self.assertNotIn("CORRELATION_ERROR", result.blocking_keys)
+        self.assertFalse(gate.passed)
+        self.assertTrue(gate.blocker)
+        self.assertIn("no maximum error fraction configured", gate.explanation)
+        self.assertIn("CORRELATION_ERROR", result.blocking_keys)
 
     def test_correlation_not_required_does_not_block(self):
         data = approved_inputs()
@@ -364,6 +392,106 @@ class CorrelationErrorTests(unittest.TestCase):
         result = evaluate_qualification("qualification", **data)
         gate = {item.key: item for item in result.integrity_gates}["CORRELATION_ERROR"]
         self.assertTrue(gate.passed)
+
+
+class CorrelationMeasuredGateTests(unittest.TestCase):
+    """CORRELATION_MEASURED: predicted vs measured drop response."""
+
+    def _correlation(self, conditions=None, r_squared=0.90, bias=0.05):
+        if conditions is None:
+            conditions = [
+                {
+                    "drop_id": "drop-{}".format(index),
+                    "metrics": [
+                        {"metric_key": "peak_force_n", "measured": 10.0,
+                         "predicted": 10.5, "pass": True},
+                        {"metric_key": "peak_acceleration_m_s2", "measured": 100.0,
+                         "predicted": 98.0, "pass": True},
+                    ],
+                }
+                for index in range(3)
+            ]
+        return {
+            "conditions": conditions,
+            "r_squared": r_squared,
+            "bias": bias,
+            "verdict": "pass",
+            "explanation": "measured-drop campaign",
+        }
+
+    def test_measured_correlation_within_acceptance_passes(self):
+        result = evaluate_qualification(
+            "qualification",
+            **approved_inputs(pipeline_result={"correlation": self._correlation()}),
+        )
+        self.assertEqual(result.evidence_disposition, "qualification_pending_review")
+        gate = {item.key: item for item in result.integrity_gates}["CORRELATION_MEASURED"]
+        self.assertTrue(gate.passed)
+        self.assertTrue(gate.evaluable)
+        self.assertNotIn("CORRELATION_MEASURED", result.blocking_keys)
+        self.assertIn("within acceptance", gate.explanation)
+
+    def test_measured_correlation_too_few_conditions_blocks(self):
+        correlation = self._correlation(conditions=self._correlation()["conditions"][:2])
+        result = evaluate_qualification(
+            "qualification", **approved_inputs(pipeline_result={"correlation": correlation})
+        )
+        self.assertEqual(result.evidence_disposition, "qualification_blocked")
+        self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
+        gate = {item.key: item for item in result.integrity_gates}["CORRELATION_MEASURED"]
+        self.assertIn("minimum 3 required", gate.explanation)
+
+    def test_measured_correlation_excess_relative_error_blocks(self):
+        conditions = self._correlation()["conditions"]
+        conditions[1]["metrics"][0]["measured"] = 20.0  # rel error 0.9 vs 10.5
+        result = evaluate_qualification(
+            "qualification",
+            **approved_inputs(pipeline_result={"correlation": self._correlation(conditions=conditions)}),
+        )
+        self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
+        gate = {item.key: item for item in result.integrity_gates}["CORRELATION_MEASURED"]
+        self.assertIn("exceeds maximum 0.25", gate.explanation)
+
+    def test_measured_correlation_low_r_squared_blocks(self):
+        result = evaluate_qualification(
+            "qualification",
+            **approved_inputs(pipeline_result={"correlation": self._correlation(r_squared=0.70)}),
+        )
+        self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
+        gate = {item.key: item for item in result.integrity_gates}["CORRELATION_MEASURED"]
+        self.assertIn("r_squared 0.700 below minimum 0.80", gate.explanation)
+
+    def test_measured_correlation_high_bias_blocks(self):
+        result = evaluate_qualification(
+            "qualification",
+            **approved_inputs(pipeline_result={"correlation": self._correlation(bias=0.25)}),
+        )
+        self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
+        gate = {item.key: item for item in result.integrity_gates}["CORRELATION_MEASURED"]
+        self.assertIn("|bias|", gate.explanation)
+
+    def test_measured_correlation_missing_metric_pair_blocks(self):
+        conditions = self._correlation()["conditions"]
+        conditions[0]["metrics"] = [{"metric_key": "peak_force_n", "pass": True}]
+        result = evaluate_qualification(
+            "qualification",
+            **approved_inputs(pipeline_result={"correlation": self._correlation(conditions=conditions)}),
+        )
+        self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
+        gate = {item.key: item for item in result.integrity_gates}["CORRELATION_MEASURED"]
+        self.assertIn("lacks numeric measured/predicted values", gate.explanation)
+
+    def test_measured_correlation_absent_is_non_blocking(self):
+        # No measured-drop campaign: the gate is reported as not evaluated
+        # and must not block an otherwise clean qualification.
+        result = evaluate_qualification("qualification", **approved_inputs())
+        self.assertEqual(result.evidence_disposition, "qualification_pending_review")
+        gate = {item.key: item for item in result.integrity_gates}["CORRELATION_MEASURED"]
+        self.assertFalse(gate.passed)
+        self.assertFalse(gate.evaluable)
+        self.assertFalse(gate.blocker)
+        self.assertIn("no measured-drop correlation supplied", gate.explanation)
+        self.assertNotIn("CORRELATION_MEASURED", result.blocking_keys)
 
 
 class RequirementEvaluationTests(unittest.TestCase):
@@ -426,6 +554,11 @@ class RequirementEvaluationTests(unittest.TestCase):
         self.assertEqual(result.evidence_disposition, "qualification_pending_review")
         self.assertEqual(result.requirement_evaluations[0]["status"], "not_evaluated")
         self.assertNotIn("REQUIREMENT_EVALUATION", result.blocking_keys)
+        gate = {item.key: item for item in result.integrity_gates}["REQUIREMENT_EVALUATION"]
+        self.assertFalse(gate.passed)
+        self.assertFalse(gate.evaluable)
+        self.assertFalse(gate.blocker)
+        self.assertIn("not applicable", gate.explanation)
 
     def test_requirements_list_is_evaluated(self):
         requirement = {"status": "active", "target": {"metric": "mass_kg", "max": 0.05}}
@@ -448,7 +581,7 @@ class RequirementEvaluationTests(unittest.TestCase):
             "structural_validity",
         ):
             self.assertIn(key, payload)
-        self.assertEqual(len(payload["integrity_gates"]), 5)
+        self.assertEqual(len(payload["integrity_gates"]), 6)
 
 
 class ConvergenceEvidenceTests(unittest.TestCase):
@@ -494,7 +627,10 @@ class ConvergenceEvidenceTests(unittest.TestCase):
 
 
 class RobustnessQualificationTests(unittest.TestCase):
-    def test_nan_correlation_values_do_not_crash(self):
+    def test_unparsable_correlation_values_block_fail_closed(self):
+        # Fail-closed (audit B3): unparsable comparisons - NaN measured,
+        # zero predicted, inf relative_error with no pair, negative measured
+        # - must produce a failing gate with explicit reasons, never pass.
         data = approved_inputs()
         data["method"] = dict(data["method"])
         data["method"]["required_correlation_policy"] = {
@@ -511,12 +647,47 @@ class RobustnessQualificationTests(unittest.TestCase):
                     {"metric_key": "deflection", "measured": float("nan"), "predicted": 1.0},
                     {"metric_key": "stress", "predicted": 0.0, "measured": 1.0},
                     {"metric_key": "force", "relative_error": float("inf")},
+                    {"metric_key": "mass", "measured": -0.5, "predicted": 1.0},
                 ),
             },
         )
         result = evaluate_qualification("qualification", **data)
-        self.assertEqual(result.evidence_disposition, "qualification_pending_review")
-        self.assertNotIn("CORRELATION_ERROR", result.blocking_keys)
+        self.assertEqual(result.evidence_disposition, "qualification_blocked")
+        self.assertIn("CORRELATION_ERROR", result.blocking_keys)
+        gate = {item.key: item for item in result.integrity_gates}["CORRELATION_ERROR"]
+        self.assertFalse(gate.passed)
+        self.assertIn("lacks measured/predicted values", gate.explanation)
+        self.assertIn("predicted value is zero", gate.explanation)
+        self.assertIn("measured value is negative", gate.explanation)
+        self.assertIn("not numeric or finite", gate.explanation)
+
+    def test_relative_error_field_no_longer_overrides_pair(self):
+        # B3: the reported relative_error must not override the value
+        # computed from the measured/predicted pair.  The pair computes to
+        # 0.5 > 0.1, so the gate fails despite the 0.02 relative_error.
+        data = approved_inputs()
+        data["method"] = dict(data["method"])
+        data["method"]["required_correlation_policy"] = {
+            "required": True,
+            "required_record_types": ("static_correlation",),
+            "require_reviewed_records": True,
+            "maximum_error_fraction": 0.1,
+        }
+        data["correlation_records"] = (
+            {
+                "record_type": "static_correlation",
+                "review_state": "approved",
+                "comparisons": (
+                    {"metric_key": "deflection", "predicted": 1.0, "measured": 1.5,
+                     "relative_error": 0.02},
+                ),
+            },
+        )
+        result = evaluate_qualification("qualification", **data)
+        self.assertEqual(result.evidence_disposition, "qualification_blocked")
+        self.assertIn("CORRELATION_ERROR", result.blocking_keys)
+        gate = {item.key: item for item in result.integrity_gates}["CORRELATION_ERROR"]
+        self.assertIn("0.5", gate.explanation)
 
     def test_missing_evidence_with_conflicting_claims_blocks(self):
         result = evaluate_qualification("qualification", **approved_inputs(
@@ -527,10 +698,21 @@ class RobustnessQualificationTests(unittest.TestCase):
         self.assertIn("NO_BLOCKING_ISSUES", result.blocking_keys)
         self.assertIn("ANALYSIS_VALIDITY", result.blocking_keys)
         failed_gates = [gate.key for gate in result.integrity_gates if not gate.passed]
+        # CORRELATION_MEASURED is listed as not-passed without a measured-drop
+        # campaign, but it is non-evaluable and non-blocking in that state.
         self.assertEqual(
             sorted(failed_gates),
-            sorted(("ANALYSIS_VALIDITY", "CONVERGENCE_EVIDENCE")),
+            sorted((
+                "ANALYSIS_VALIDITY",
+                "CONVERGENCE_EVIDENCE",
+                "REQUIREMENT_EVALUATION",
+                "CORRELATION_MEASURED",
+            )),
         )
+        measured = {item.key: item for item in result.integrity_gates}["CORRELATION_MEASURED"]
+        self.assertFalse(measured.passed)
+        self.assertFalse(measured.evaluable)
+        self.assertFalse(measured.blocker)
 
     def test_requirements_list_only_still_evaluates_governing_requirement_gate(self):
         requirement = {"status": "active", "acceptance": {"metric_key": "deflection"}}

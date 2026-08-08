@@ -199,6 +199,19 @@ endsolid triangle
         self.assertIsNone(unsupported.geometry)
         self.assertEqual(unsupported.diagnostic.code, "unsupported_format")
 
+    def test_mesh_derived_values_are_cached_per_instance(self):
+        """Repeated diagnostics passes reuse the per-mesh topology and world
+        vertex caches; identical inputs must yield identical objects."""
+        mesh = cube_mesh()
+        self.assertIs(mesh._world_vertices(), mesh._world_vertices())
+        self.assertIs(mesh._topology(), mesh._topology())
+        self.assertIs(mesh._integrals(), mesh._integrals())
+        first = cube_mesh()
+        second = cube_mesh()
+        self.assertEqual(first._topology(), second._topology())
+        self.assertEqual(first._world_vertices(), second._world_vertices())
+        self.assertIsNot(first._world_vertices(), second._world_vertices())
+
 
 if __name__ == "__main__":
     unittest.main()
