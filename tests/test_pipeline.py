@@ -82,7 +82,13 @@ def qualification_request(**overrides):
             "fixtures": {"fixture_type": "simply_supported", "reviewed": True},
             "tolerance_profile": {"process_profile": "molding"},
             "correlation_records": [
-                {"record_type": "static_correlation", "review_state": "approved"},
+                {
+                    "record_type": "static_correlation",
+                    "review_state": "approved",
+                    "comparisons": [
+                        {"metric_key": "deflection", "measured": 1.0, "predicted": 1.05},
+                    ],
+                },
             ],
             "requirement": {"status": "active", "acceptance": {"metric_key": "deflection"}},
             "reviewed_flags": {"geometry_reviewed": True, "load_case_reviewed": True},
@@ -489,14 +495,16 @@ class QualificationIntegrityPipelineTests(unittest.TestCase):
     def test_correlation_measured_drops_verdict(self):
         def run_correlation(measured_values):
             drops = []
-            for index, measured in enumerate(measured_values):
+            for index, (height, measured) in enumerate(measured_values):
                 drops.append(
                     {
                         "drop_id": "D{}".format(index + 1),
-                        "height_m": 0.5,
+                        "height_m": height,
                         "surface": "concrete",
                         "orientation": "flat",
                         "measured_peak_accel_g": measured,
+                        "sensor": {"quantity": "resultant_peak_g",
+                                   "location_body_m": [0.0, 0.0, 0.0]},
                     }
                 )
             request = mouse_project_request(
@@ -505,16 +513,17 @@ class QualificationIntegrityPipelineTests(unittest.TestCase):
             )
             return run_pipeline(request)
 
-        # Measured values close to the prediction pass the acceptance band
-        # (the fixture predicts ~187 g at 0.5 m on concrete).
-        plausible = run_correlation([190.0, 200.0, 180.0])
+        # Measured values close to the prediction at three independent
+        # heights pass the acceptance band (the fixture predicts ~187 g at
+        # 0.5 m, ~230 g at 0.75 m, ~266 g at 1.0 m on concrete).
+        plausible = run_correlation([(0.5, 190.0), (0.75, 233.0), (1.0, 269.0)])
         self.assertEqual(plausible["errors"], [])
         correlation = plausible["correlation"]
         self.assertIsNotNone(correlation)
         self.assertEqual(correlation["verdict"], "pass")
         self.assertEqual(len(correlation["conditions"]), 3)
         # Wildly different measured values fail the correlation honestly.
-        implausible = run_correlation([20.0, 30.0, 25.0])
+        implausible = run_correlation([(0.5, 20.0), (0.75, 30.0), (1.0, 25.0)])
         self.assertEqual(implausible["correlation"]["verdict"], "fail")
         self.assertGreaterEqual(len(implausible["correlation"]["explanation"]), 1)
 

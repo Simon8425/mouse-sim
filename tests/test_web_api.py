@@ -99,6 +99,25 @@ class WebApiTests(unittest.TestCase):
             self.assertEqual(response.status, 200)
             self.assertTrue(json.loads(data)["cache_active"])
 
+    def test_health_step_kernel_probe_failure_is_structured_200(self):
+        """The health endpoint must stay 200 with structured step fields even
+        when the optional FreeCAD kernel probe itself raises."""
+        server, base_url = self.start_server()
+        with mock.patch(
+            "mouse_sim.step_kernel.kernel_available",
+            side_effect=RuntimeError("probe exploded"),
+        ):
+            response, data = request(base_url, "GET", "/api/health")
+        self.assertEqual(response.status, 200)
+        payload = json.loads(data)
+        self.assertEqual(payload["schema_id"], "gms.web-health/1")
+        self.assertIs(payload["step_kernel_available"], False)
+        self.assertEqual(payload["step_kernel_backend"], "freecad-occt")
+        self.assertEqual(payload["advanced_step_backend"], "kernel")
+        self.assertTrue(payload["advanced_step_uses_kernel"])
+        self.assertNotIn(b"probe exploded", data)
+        self.assertNotIn(b"Traceback", data)
+
     def test_baseline(self):
         server, base_url = self.start_server()
         response, data = request(base_url, "GET", "/api/projects/baseline")
@@ -188,9 +207,12 @@ class WebApiTests(unittest.TestCase):
         self.assertTrue(payload["materials"])
         self.assertEqual(payload["materials"][0]["approval_state"], "draft")
 
-    def test_analyze_manifest_objects_slimmed(self):
-        """The web response replaces geometry-heavy manifest inputs with their
-        canonical hashes so per-object meshes are not echoed back."""
+    def test_analyze_manifest_stays_replayable(self):
+        """W5-04: the web response must NOT slim the manifest inputs — a
+        slimmed manifest no longer matched its recorded manifest_hash, so
+        every web-served manifest was rejected by reproduce_from_manifest
+        (replay impossible on the web path).  The served manifest is now
+        byte-identical to the pipeline result's manifest."""
         document = self.load_baseline()
         envelope = {
             "schema_id": "gms.web-analysis-request/1",
@@ -205,14 +227,15 @@ class WebApiTests(unittest.TestCase):
         self.assertIsInstance(manifest, dict)
         inputs = manifest["inputs"]
         self.assertIsInstance(inputs, dict)
+        # The full objects snapshot must be present (not a count/sha summary).
         objects = inputs["objects"]
-        self.assertIsInstance(objects, dict)
-        self.assertEqual(objects["count"], len(document["objects"]))
-        digest = objects["sha256"]
-        self.assertIsInstance(digest, str)
-        self.assertEqual(len(digest), 64)
-        # The mesh payload itself must not be echoed back to the client.
-        self.assertNotIn("geometry", json.dumps(objects))
+        self.assertIsInstance(objects, list)
+        self.assertEqual(len(objects), len(document["objects"]))
+        # The served manifest must replay on the web path.
+        from mouse_sim.pipeline import reproduce_from_manifest
+
+        replay = reproduce_from_manifest(manifest)
+        self.assertTrue(replay["supported"], replay)
 
     def test_analyze_cache_reuse(self):
         document = self.load_baseline()
@@ -576,6 +599,74 @@ class WebApiTests(unittest.TestCase):
         diagnostic = payload["diagnostics"][0]
         self.assertEqual(diagnostic["code"], "unsupported_format")
         self.assertEqual(diagnostic["severity"], "blocker")
+
+    def test_normalize_step_kernel_unavailable_is_structured_422(self):
+        """An assembly STEP upload with no usable kernel must yield the
+        structured step_kernel_unavailable diagnostic, never a 500 with a raw
+        exception string."""
+        server, base_url = self.start_server()
+        body = (
+            b"ISO-10303-21;\nDATA;\n"
+            b"#1=CONTEXT_DEPENDENT_SHAPE_REPRESENTATION(#2,#3);\n"
+            b"#2=SHAPE_REPRESENTATION_RELATIONSHIP();\n"
+            b"#3=MANIFOLD_SOLID_BREP('',#4);\n"
+            b"ENDSEC;\nEND-ISO-10303-21;"
+        )
+        with mock.patch("mouse_sim.step_kernel.freecadcmd_path", return_value=None):
+            response, data = request(
+                base_url,
+                "POST",
+                "/api/geometry/normalize?format=step",
+                body=body,
+            )
+        self.assertEqual(response.status, 422)
+        payload = json.loads(data)
+        self.assertEqual(payload["schema_id"], "gms.geometry-preview/1")
+        self.assertFalse(payload["supported"])
+        self.assertIsNone(payload["geometry"])
+        self.assertEqual(payload["format"], "step")
+        diagnostic = payload["diagnostics"][0]
+        self.assertEqual(diagnostic["code"], "step_kernel_unavailable")
+        self.assertEqual(diagnostic["severity"], "blocker")
+        self.assertNotIn(b"Traceback", data)
+
+    def test_normalize_step_kernel_error_types_map_to_422(self):
+        """StepKernelUnavailable/StepKernelFailure raised by the importer must
+        map to structured 422 preview failures, not the generic 500 handler."""
+        from mouse_sim.step_kernel import StepKernelFailure, StepKernelUnavailable
+
+        server, base_url = self.start_server()
+        with mock.patch(
+            "mouse_sim.importers.load_geometry",
+            side_effect=StepKernelUnavailable("FreeCADCmd is unavailable"),
+        ):
+            response, data = request(
+                base_url,
+                "POST",
+                "/api/geometry/normalize?format=step",
+                body=b"step",
+            )
+        self.assertEqual(response.status, 422)
+        payload = json.loads(data)
+        self.assertEqual(payload["schema_id"], "gms.geometry-preview/1")
+        self.assertFalse(payload["supported"])
+        diagnostic = payload["diagnostics"][0]
+        self.assertEqual(diagnostic["code"], "step_kernel_unavailable")
+        self.assertEqual(diagnostic["message"], "FreeCADCmd is unavailable")
+        with mock.patch(
+            "mouse_sim.importers.load_geometry",
+            side_effect=StepKernelFailure("worker exploded"),
+        ):
+            response, data = request(
+                base_url,
+                "POST",
+                "/api/geometry/normalize?format=step",
+                body=b"step",
+            )
+        self.assertEqual(response.status, 422)
+        payload = json.loads(data)
+        self.assertEqual(payload["diagnostics"][0]["code"], "step_kernel_failed")
+        self.assertNotIn(b"Traceback", data)
 
     def test_registered_step_asset_serving_is_sanitized(self):
         asset_id = "a" * 64

@@ -9,7 +9,7 @@
 - imports geometry (analytic primitives, OBJ/STL meshes, and kernel-tessellated STEP assemblies) and computes mass properties;
 - conservatively classifies components and runs DFM-lite validation (wall thickness, geometry health, material approval, PCB clearance, classification);
 - screens loads with closed-form surrogates (Navier thin-plate and Euler-Bernoulli beam) and estimates drop-impact response by energy balance;
-- evaluates a 17-gate qualification readiness model (12 readiness gates + 5 analysis-integrity gates) with a hard exploration/qualification separation;
+- evaluates an 18-gate qualification readiness model (12 readiness gates + 6 analysis-integrity gates) with a hard exploration/qualification separation;
 - emits byte-deterministic JSON, HTML, and manifest artifacts plus a digest-verified content-addressed cache.
 
 Every artifact is a pure function of the inputs: no timestamps, no random state — identical inputs produce byte-identical outputs.
@@ -72,6 +72,26 @@ python3 -S -m mouse_sim import --input part.obj --format obj --units mm --out pa
 
 `run` writes `reports/report.json`, `reports/report.html`, and `reports/manifest.json`; stdout prints a `mode=... decision=... run_id=...` summary. `python3 -S` runs the package against the standard library only.
 
+### STEP import backend (optional)
+
+- Simple STEP (faceted / AP242), OBJ, STL, and JSON imports need nothing — they are handled entirely by the stdlib.
+- Advanced **BREP STEP** uses the optional FreeCAD/OCCT backend, auto-detected on Windows (`C:\Program Files\FreeCAD*\bin\freecadcmd.exe`), macOS (`/Applications/FreeCAD.app`), and via `PATH`.
+- Override detection with `MOUSE_SIM_FREECADCMD=/path/to/freecadcmd`.
+
+Check the backend first:
+
+```bash
+python scripts/find_freecad.py
+```
+
+Then import (the backend is used only when the file actually needs it):
+
+```bash
+python -m mouse_sim import --input part.step --format step --units mm --out part.json
+```
+
+When FreeCAD is absent, advanced STEP uploads fail with a clear `FreeCADCmd is unavailable` error instead of fabricating geometry — fail-closed by design.
+
 ### Run the web console
 
 ```bash
@@ -88,13 +108,13 @@ Open `http://127.0.0.1:8000/` (single-process serve) or `http://localhost:5173/`
 ### Run the test suites
 
 ```bash
-# Python backend suite (353 tests, stdlib only):
+# Python backend suite (926 tests, stdlib only):
 python3 -m unittest discover -s tests -q
 
-# Frontend unit tests (Vitest, 56 tests):
+# Frontend unit tests (Vitest, 178 tests):
 cd web && npm test
 
-# End-to-end Playwright matrix (52 tests: Chromium desktop/tablet/mobile + Firefox):
+# End-to-end Playwright matrix (68 tests: Chromium desktop/tablet/mobile + Firefox):
 cd web && npm run e2e
 ```
 
@@ -137,7 +157,7 @@ Layered and acyclic — foundations never import analysis layers, and each layer
 | | `classification.py` | Name-synonym and topology-based conservative classification |
 | Screening | `collision.py` | AABB clearance with tolerances and pair rules |
 | | `validation.py` | DFM-lite structured findings (thickness, health, PCB, material) |
-| | `qualification.py` | 17-gate readiness + integrity model with hard mode separation |
+| | `qualification.py` | 18-gate readiness + integrity model with hard mode separation |
 | Physics | `physics.py` | Navier shell / Euler-Bernoulli beam surrogates, load templates, preflight |
 | | `impact.py` | Energy-based impact estimate, fatigue screening, desk-edge helper |
 | Orchestration | `pipeline.py` | Deterministic run orchestration, run manifests, cache integration |
@@ -173,7 +193,7 @@ python3 -S -m compileall -q mouse_sim
 python3 -S -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Full suite: **353 tests, all green** (16 test modules, no third-party dependencies).
+Full suite: **926 tests, all green** (33 test modules, no third-party dependencies).
 
 See [`docs/testing.md`](docs/testing.md) for the test groups, engineering purpose of each group,
 expected validity semantics, and the complete validation command matrix.
@@ -185,9 +205,13 @@ expected validity semantics, and the complete validation command matrix.
 - Cloud / service deployment
 - Optional FreeCAD/OCCT worker for advanced STEP tessellation is now implemented; the original STEP remains the CAD source of truth and the GLB is a display tessellation.
 
-## Web console — Mission Control dashboard
+## Web console
 
-`mouse_sim` includes a web-based 3D engineering console in the `web/` directory built with React 18, TypeScript, and Three.js. It acts as a **Mission Control dashboard**: a centralized control panel that combines **system monitoring** (engine/API versions, cache status, supported formats, health) with a **study launcher** (upload a part or run a durability test) in one screen. Three 3D rigid-body drop tests (Drop, Impact, Tumble) simulate the model falling, bouncing, and settling from real physics data, with configurable height, surface, drop count, orientation, spin, and mass — and play back the trajectory in the viewport. It connects to the Python API (`mouse_sim/web_api.py`) to deliver interactive model navigation, physical property inspection, and real-time visualization of analysis findings and structural overlays.
+`mouse_sim` includes a web-based 3D engineering console in the `web/` directory built with React 18, TypeScript, and Three.js. The workflow is intentionally simple: **upload a model → pick a material → run a test → read the results**. Three 3D rigid-body drop tests (Drop, Impact, Tumble) simulate the model falling, bouncing, and settling from real physics data, with configurable height, surface, drop count, orientation, spin, and mass — and play back the trajectory in the viewport. It connects to the Python API (`mouse_sim/web_api.py`) to deliver interactive model navigation, physical property inspection, and real-time visualization of analysis findings and structural overlays.
+
+### Results
+
+After a run finishes, the results rail opens automatically (desktop) with a single clean panel: an overall **PASS / WARN / FAIL verdict**, the key numbers (mass, impact force, peak acceleration, safety factor, max stress, max deformation), the test configuration and material used, and a short list of actionable issues only. The engineering disclosure data (assumptions, solver metadata, validation preparation) stays in the backend artifacts and the inspector; the results panel shows what matters.
 
 ### Baseline boot flow
 
@@ -271,17 +295,17 @@ Open `http://127.0.0.1:8898/` in your browser.
 ### Verification commands
 
 ```bash
-# Full Python test suite (353 tests, including 31 web-API integration tests):
+# Full Python test suite (926 tests, including 31 web-API integration tests):
 python3 -B -S -m unittest discover -s tests -p 'test_*.py'
 
 # Web frontend typecheck, lint, unit tests, and build:
 cd web
 npm run typecheck
 npm run lint
-npm test -- --run        # 58 unit tests, 12 files
+npm test -- --run        # 178 unit tests, 19 files
 npm run build
 
-# End-to-end Playwright matrix (52 tests across Chromium desktop, Chromium
+# End-to-end Playwright matrix (68 tests across Chromium desktop, Chromium
 # tablet, Chromium mobile, and Firefox desktop projects):
 npx playwright install chromium
 npm run e2e

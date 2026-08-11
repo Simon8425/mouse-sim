@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { resolveDropSample } from '../scene/sceneRuntime';
+import { floorCorrectionForModel, resolveDropSample, rotatedBoundsMinZ } from '../scene/sceneRuntime';
 import { resolveActiveDrop } from '../scene/SceneViewport';
 import type { DropSimulationDrop, DropTrajectorySample } from '../api/contracts';
+import * as THREE from 'three';
 
 function sample(t: number, z: number): DropTrajectorySample {
   return [t, 0, 0, z, 1, 0, 0, 0];
@@ -68,6 +69,36 @@ describe('resolveDropSample', () => {
 
   it('returns null for an empty trajectory', () => {
     expect(resolveDropSample(0, [])).toBeNull();
+  });
+});
+
+describe('floorCorrectionForModel', () => {
+  it('raises a rendered model that has penetrated the display floor', () => {
+    expect(floorCorrectionForModel(-0.12, -0.01)).toBeCloseTo(0.11, 8);
+  });
+
+  it('does not move a model already above the floor or invalid bounds', () => {
+    expect(floorCorrectionForModel(0.02, -0.01)).toBe(0);
+    expect(floorCorrectionForModel(Number.NaN, -0.01)).toBe(0);
+  });
+});
+
+describe('rotatedBoundsMinZ', () => {
+  const MIN = [-0.05, -0.05, -0.03] as [number, number, number];
+  const MAX = [0.05, 0.05, 0.05] as [number, number, number];
+
+  it('returns the static minimum z for the identity orientation', () => {
+    expect(rotatedBoundsMinZ(MIN, MAX, new THREE.Quaternion())).toBeCloseTo(-0.03, 10);
+  });
+
+  it('tracks the lowest corner under rotation (pi about X flips z)', () => {
+    const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI);
+    expect(rotatedBoundsMinZ(MIN, MAX, q)).toBeCloseTo(-0.05, 10);
+  });
+
+  it('falls back to the static minimum for non-finite quaternions', () => {
+    const q = new THREE.Quaternion(Number.NaN, 0, 0, 1);
+    expect(rotatedBoundsMinZ(MIN, MAX, q)).toBeCloseTo(-0.03, 10);
   });
 });
 

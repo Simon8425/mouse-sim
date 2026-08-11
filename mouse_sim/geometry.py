@@ -754,12 +754,23 @@ def _mesh_components(triangles):
     return components
 
 
-def _point_inside_mesh(point, triangle_indices, vertices, triangles):
+def _point_inside_mesh(point, triangle_indices, vertices, triangles, all_inside=False):
     """Ray-cast point-in-polyhedron test (crossings along +x).
 
     The parity test is degenerate when the ray exits through a shared edge
     (both adjacent triangles count the crossing); the origin is re-probed at
     tiny offsets and the majority result is taken.
+
+    With ``all_inside`` the point must read inside for ALL probes.  This is
+    used for vertex-containment interpenetration screening: a vertex that
+    lies ON (or within the probe epsilon of) another component's surface
+    yields mixed probes (some inside, some outside), while a vertex
+    genuinely deep inside yields consistent probes.  Boundary contact (a
+    touching union, or a near-touching union within the probe epsilon)
+    therefore reads "not inside" instead of producing a false-positive
+    interpenetration flag.  The cost is a thin-penetration blind zone of
+    the probe epsilon (mesh diagonal x 1e-9) — a documented screening
+    tolerance, not a certification.
     """
     diagonal = 0.0
     for axis in range(3):
@@ -805,16 +816,27 @@ def _point_inside_mesh(point, triangle_indices, vertices, triangles):
                 )
             )
         )
-    return sum(1 for inside in outcomes if inside) >= 2
+    inside = sum(1 for result in outcomes if result)
+    if all_inside:
+        return inside == 3
+    return inside >= 2
 
 
-def _segment_triangle_intersects(p, q, a, b, c):
+def _segment_triangle_intersects(p, q, a, b, c, strict=False):
     """Exact segment-triangle intersection (Moller-Trumbore), STRICT interior.
 
     Boundary-only contacts (the segment touching an edge or vertex of the
     triangle) return False: for the self-intersection screening purpose a
     valid union of touching solids legitimately shares edges and faces, and
     only a genuine interior crossing is a self-intersection.
+
+    ``strict`` additionally rejects crossings on the far diagonal edge
+    (u+v == 1).  It is used for ALL pairs: legitimate neighbors only ever
+    meet along the shared feature, and a legitimately touching union's
+    edges lie on (not across) the other solid's face diagonals, so any
+    accepted crossing is a genuine fold or interpenetration.  Interpenetrating
+    solids remain detected through interior crossings, vertex containment,
+    and the AABB-overlap-center probe.
     """
     e1 = _sub(b, a)
     e2 = _sub(c, a)
@@ -831,15 +853,17 @@ def _segment_triangle_intersects(p, q, a, b, c):
     t = _dot(e2, qv) * inv
     # Crossing acceptance rule: a genuine interior crossing requires u, v
     # strictly interior to the triangle (NOT near a vertex or side edge) and
-    # t strictly interior to the segment.  Crossings on the far diagonal
-    # edge (u+v == 1 with u, v interior) are accepted: axis-aligned
-    # interpenetrating boxes hit face diagonals exactly, and rejecting them
-    # would hide real self-intersections.  Corner and side-edge contacts
-    # (valid touching unions) are rejected by the u/v interior tests of one
-    # of the two triangles involved.
+    # t strictly interior to the segment.  The far diagonal edge (u+v == 1)
+    # is rejected: legitimate touching unions' edges lie on — not across —
+    # the other solid's face diagonals, so a far-diagonal "crossing" is a
+    # touching contact, not an interpenetration.  Corner and side-edge
+    # contacts (valid touching unions) are rejected by the u/v interior
+    # tests of one of the two triangles involved.
     if u <= 1e-9 or v <= 1e-9 or t <= 1e-9 or t >= 1.0 - 1e-9:
         return False
     if u + v > 1.0 + 1e-9:
+        return False
+    if strict and u + v >= 1.0 - 1e-9:
         return False
     return True
 
@@ -856,22 +880,28 @@ def _point_in_triangle_2d(point, a, b, c):
     return not (has_neg and has_pos)
 
 
-def _triangle_intersects(a0, a1, a2, b0, b1, b2):
+def _triangle_intersects(a0, a1, a2, b0, b1, b2, strict=False):
     """Exact triangle-triangle intersection: two triangles intersect iff any
     edge of one crosses the interior of the other (with a coplanar fallback
-    that checks endpoint containment)."""
+    that checks endpoint containment and strict 2D edge crossings).
+
+    ``strict`` (adjacent pairs sharing a vertex/edge) rejects far-diagonal
+    contact so that legitimate neighbors that only meet along the shared
+    feature are never flagged (see :func:`_segment_triangle_intersects`).
+    """
     edges_a = ((a0, a1), (a1, a2), (a2, a0))
     edges_b = ((b0, b1), (b1, b2), (b2, b0))
     for edge in edges_b:
-        result = _segment_triangle_intersects(edge[0], edge[1], a0, a1, a2)
+        result = _segment_triangle_intersects(edge[0], edge[1], a0, a1, a2, strict)
         if result:
             return True
     for edge in edges_a:
-        result = _segment_triangle_intersects(edge[0], edge[1], b0, b1, b2)
+        result = _segment_triangle_intersects(edge[0], edge[1], b0, b1, b2, strict)
         if result:
             return True
     # Coplanar overlap fallback: a vertex of either triangle STRICTLY inside
-    # the other's projected 2D triangle means the faces genuinely cross.
+    # the other's projected 2D triangle, or a strict 2D crossing between an
+    # edge of one and an edge of the other, means the faces genuinely cross.
     # Boundary/coincident contact (e.g. the shared wall of two boxes that
     # touch face-to-face — a VALID union) must not be flagged.
     e1 = _sub(a1, a0)
@@ -895,10 +925,28 @@ def _triangle_intersects(a0, a1, a2, b0, b1, b2):
             def sign2(ox, oy, ux, uy, vx, vy):
                 return (ux - ox) * (vy - oy) - (uy - oy) * (vx - ox)
 
+            # Orientation-INDEPENDENT strict containment: the point must be
+            # strictly inside under the projected winding, whichever way the
+            # triangle is wound (a CW-wound triangle must be contained just
+            # like a CCW one — the orientation sign alone must not decide).
             d1c = sign2(point[0], point[1], ta[0], ta[1], tb[0], tb[1])
             d2c = sign2(point[0], point[1], tb[0], tb[1], tc[0], tc[1])
             d3c = sign2(point[0], point[1], tc[0], tc[1], ta[0], ta[1])
-            return d1c > 0.0 and d2c > 0.0 and d3c > 0.0
+            return (d1c > 1e-9 and d2c > 1e-9 and d3c > 1e-9) or (
+                d1c < -1e-9 and d2c < -1e-9 and d3c < -1e-9
+            )
+
+        def strict_cross(first0, first1, second0, second1):
+            """Proper (strict interior) crossing of two projected segments."""
+            def orient(o, x, y):
+                return (x[0] - o[0]) * (y[1] - o[1]) - (x[1] - o[1]) * (y[0] - o[0])
+
+            epsilon = 1e-12
+            d1 = orient(second0, first0, first1)
+            d2 = orient(second1, first0, first1)
+            d3 = orient(first0, second0, second1)
+            d4 = orient(first1, second0, second1)
+            return d1 * d2 < -epsilon and d3 * d4 < -epsilon
 
         for vertex in pb:
             if strict_inside(vertex, pa[0], pa[1], pa[2]):
@@ -906,17 +954,28 @@ def _triangle_intersects(a0, a1, a2, b0, b1, b2):
         for vertex in pa:
             if strict_inside(vertex, pb[0], pb[1], pb[2]):
                 return True
+        for edge_a in ((pa[0], pa[1]), (pa[1], pa[2]), (pa[2], pa[0])):
+            for edge_b in ((pb[0], pb[1]), (pb[1], pb[2]), (pb[2], pb[0])):
+                if strict_cross(edge_a[0], edge_a[1], edge_b[0], edge_b[1]):
+                    return True
     return False
 
 
 def _component_vertex_containment(triangles, vertices, components):
-    """Detect interpenetration via strict vertex containment.
+    """Detect interpenetration via vertex containment and overlap probing.
 
-    A vertex belonging to one closed component that lies strictly inside
-    another closed component means the solids interpenetrate.  This catches
-    the axis-aligned case where the pair-edge sweep misses an exact
-    face-diagonal seam crossing.  Bounded to small meshes (called only when
-    the triangle count is already within the self-intersection limit).
+    A vertex of one closed component that lies strictly inside another
+    closed component means the solids interpenetrate; this catches the
+    axis-aligned case where the pair-edge sweep misses an exact
+    face-diagonal seam crossing.  Additionally, when two closed components'
+    bounding boxes overlap with positive volume, the overlap region's center
+    is probed against both solids: a point strictly inside both is a genuine
+    material overlap (interpenetration or a cavity, which is also reported
+    as ``nested_shells`` and never safe for mass).  The center probe catches
+    face-aligned box overlaps where every contact line coincides with an
+    edge and no vertex of either solid lands strictly inside the other.
+    Bounded to small meshes (called only when the triangle count is already
+    within the self-intersection limit).
     """
     closed_components = [component for component in components if component["closed"]]
     if len(closed_components) < 2:
@@ -933,20 +992,81 @@ def _component_vertex_containment(triangles, vertices, components):
                 other_vertices.update(triangles[triangle_index])
             for vertex_index in component_vertices - other_vertices:
                 point = vertices[vertex_index]
-                if _point_inside_mesh(point, other["triangles"], vertices, triangles):
+                if _point_inside_mesh(
+                    point, other["triangles"], vertices, triangles, all_inside=True
+                ):
+                    return True
+            overlap = _component_aabb_overlap_center(component, other, vertices, triangles)
+            if overlap is not None:
+                if _point_inside_mesh(overlap, component["triangles"], vertices, triangles) and _point_inside_mesh(
+                    overlap, other["triangles"], vertices, triangles
+                ):
                     return True
     return False
 
 
+def _component_aabb_overlap_center(first, second, vertices, triangles):
+    """Center of the positive-volume overlap of two components' bounding
+    boxes, or None when the boxes only touch or are disjoint."""
+    first_bounds = [None, None, None]
+    second_bounds = [None, None, None]
+    for bounds, component in ((first_bounds, first), (second_bounds, second)):
+        for triangle_index in component["triangles"]:
+            for vertex_index in triangles[triangle_index]:
+                point = vertices[vertex_index]
+                for axis in range(3):
+                    current = bounds[axis]
+                    bounds[axis] = (
+                        point[axis] if current is None else min(current[0], point[axis]),
+                        point[axis] if current is None else max(current[1], point[axis]),
+                    )
+    overlap = []
+    for axis in range(3):
+        low = max(first_bounds[axis][0], second_bounds[axis][0])
+        high = min(first_bounds[axis][1], second_bounds[axis][1])
+        if high - low <= 1e-12:
+            return None
+        overlap.append(0.5 * (low + high))
+    return tuple(overlap)
+
+
 def _mesh_self_intersects(triangles, vertices):
-    """Detect any interior-intersecting triangle pair (AABB filter first;
-    adjacent faces sharing a vertex are skipped)."""
+    """Detect any interior-intersecting triangle pair (uniform grid filter).
+
+    Pairs are classified by how many vertices they share:
+    - 3 shared vertices (identical faces): skipped here — reported separately
+      as ``duplicate_faces`` by diagnostics().
+    - 1-2 shared vertices (adjacent faces / pinched fans): STRICT interior
+      acceptance — contact along the shared feature is rejected, while a
+      genuine crossing away from it (folds, butterflies) is flagged.
+    - 0 shared vertices (disjoint faces): STRICT interior acceptance as
+      well.  The far-diagonal acceptance that previously applied here was
+      removed: it produced false positives on legitimate partial face-to-face
+      touching unions (an edge of one solid lying exactly on the other's face
+      diagonal).  Axis-aligned interpenetrating boxes remain detected through
+      interior edge crossings, the strict vertex-containment probe, and the
+      AABB-overlap-center probe (see ``_component_vertex_containment``).
+
+    Candidate pairs are found through a uniform grid instead of a full O(n^2)
+    sweep: every triangle is inserted into each grid cell its AABB overlaps,
+    so any pair whose boxes intersect shares at least one cell and is tested
+    exactly as before (identical pair tests, identical results).  A plain
+    AABB pre-filter does not help smooth closed shells — nearly every pair's
+    boxes overlap — which made the old sweep quadratic in the triangle count
+    (tens of thousands of faces per part, hundreds of millions of pair
+    tests).  The grid keeps the test exact while touching only local
+    neighbors; a pair found in several cells is simply tested again.
+    """
+    count = len(triangles)
+    if count < 2:
+        return False
     bounds = []
     for triangle in triangles:
         i, j, k = triangle
-        xs = [vertices[i][0], vertices[j][0], vertices[k][0]]
-        ys = [vertices[i][1], vertices[j][1], vertices[k][1]]
-        zs = [vertices[i][2], vertices[j][2], vertices[k][2]]
+        points = (vertices[i], vertices[j], vertices[k])
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        zs = [point[2] for point in points]
         bounds.append(
             (
                 (min(xs), max(xs)),
@@ -955,24 +1075,78 @@ def _mesh_self_intersects(triangles, vertices):
                 frozenset(triangle),
             )
         )
-    for first in range(len(triangles)):
-        for second in range(first + 1, len(triangles)):
-            if bounds[first][3] & bounds[second][3]:
-                continue
-            a0b, a1b = bounds[first], bounds[second]
-            if (
-                a0b[0][1] < a1b[0][0] or a1b[0][1] < a0b[0][0]
-                or a0b[1][1] < a1b[1][0] or a1b[1][1] < a0b[1][0]
-                or a0b[2][1] < a1b[2][0] or a1b[2][1] < a0b[2][0]
-            ):
-                continue
-            i0, j0, k0 = triangles[first]
-            i1, j1, k1 = triangles[second]
-            if _triangle_intersects(
-                vertices[i0], vertices[j0], vertices[k0],
-                vertices[i1], vertices[j1], vertices[k1],
-            ):
-                return True
+    # Cell size ~2x the median triangle extent: dense tessellated shells then
+    # only pair up genuinely local neighbors (a few dozen candidates per
+    # face instead of the whole mesh), and the per-cell candidate lists stay
+    # dense enough that most pairs are tested once.
+    extents = []
+    for item in bounds:
+        extents.append(
+            max(
+                item[0][1] - item[0][0],
+                item[1][1] - item[1][0],
+                item[2][1] - item[2][0],
+            )
+        )
+    extents.sort()
+    cell_size = extents[count // 2] * 2.0
+    if not math.isfinite(cell_size) or cell_size <= 1e-12:
+        cell_size = 1e-3
+    origin = (
+        min(item[0][0] for item in bounds),
+        min(item[1][0] for item in bounds),
+        min(item[2][0] for item in bounds),
+    )
+
+    def cell_span(item):
+        # Cell-index range the AABB covers per axis; clamped so a freak
+        # sliver spanning the whole mesh cannot blow up the grid.
+        span = []
+        for axis in range(3):
+            low = int(math.floor((item[axis][0] - origin[axis]) / cell_size))
+            high = int(math.floor((item[axis][1] - origin[axis]) / cell_size))
+            low = max(low, -16384)
+            high = min(high, 16383)
+            span.append((low, high))
+        return span
+
+    cells = {}
+    for index, item in enumerate(bounds):
+        (x0, x1), (y0, y1), (z0, z1) = cell_span(item)
+        for cx in range(x0, x1 + 1):
+            for cy in range(y0, y1 + 1):
+                for cz in range(z0, z1 + 1):
+                    cells.setdefault((cx, cy, cz), []).append(index)
+
+    for first in range(count):
+        (x0, x1), (y0, y1), (z0, z1) = cell_span(bounds[first])
+        for cx in range(x0, x1 + 1):
+            for cy in range(y0, y1 + 1):
+                for cz in range(z0, z1 + 1):
+                    for second in cells.get((cx, cy, cz), ()):
+                        if second <= first:
+                            continue
+                        shared = len(bounds[first][3] & bounds[second][3])
+                        if shared >= 3:
+                            # Identical faces: reported separately as
+                            # duplicate_faces by diagnostics(); the pair
+                            # sweep does not classify them.
+                            continue
+                        a0b, a1b = bounds[first], bounds[second]
+                        if (
+                            a0b[0][1] < a1b[0][0] or a1b[0][1] < a0b[0][0]
+                            or a0b[1][1] < a1b[1][0] or a1b[1][1] < a0b[1][0]
+                            or a0b[2][1] < a1b[2][0] or a1b[2][1] < a0b[2][0]
+                        ):
+                            continue
+                        i0, j0, k0 = triangles[first]
+                        i1, j1, k1 = triangles[second]
+                        if _triangle_intersects(
+                            vertices[i0], vertices[j0], vertices[k0],
+                            vertices[i1], vertices[j1], vertices[k1],
+                            strict=True,
+                        ):
+                            return True
     return False
 
 
@@ -1003,7 +1177,10 @@ def _outer(first, second):
 
 def _mesh_inertia_from_integrals(volume, first, second, density=1.0):
     if abs(volume) <= 1e-15:
-        raise ValueError("mesh has zero signed volume")
+        raise ValueError(
+            "mesh volume is below the supported physical scale "
+            "(absolute floor 1e-15 m3); mass/inertia cannot be certified"
+        )
     sign = 1.0 if volume > 0.0 else -1.0
     positive_volume = sign * volume
     positive_first = _scale(first, sign)
@@ -1137,6 +1314,17 @@ class TriangleMesh(Geometry):
             issues.append("degenerate_triangles")
         if inconsistent:
             issues.append("inconsistent_winding")
+        # Duplicated faces (identical vertex-index triples, any rotation)
+        # double-count signed volume in the divergence-theorem integrals and
+        # must never certify mass: explicitly detected rather than relying on
+        # the winding/nonmanifold side effects, which depend on orientation.
+        face_keys = {}
+        for triangle in self.triangles:
+            key = tuple(sorted(triangle))
+            face_keys[key] = face_keys.get(key, 0) + 1
+        duplicate_faces = sum(1 for count in face_keys.values() if count > 1)
+        if duplicate_faces:
+            issues.append("duplicate_faces")
         if abs(volume) <= volume_tolerance:
             issues.append("zero_signed_volume")
         # Shell-connectivity analysis: multiple disconnected components and
@@ -1191,6 +1379,7 @@ class TriangleMesh(Geometry):
             closed
             and degenerate == 0
             and not inconsistent
+            and duplicate_faces == 0
             and abs(volume) > volume_tolerance
             and not nested
             and not self_intersecting

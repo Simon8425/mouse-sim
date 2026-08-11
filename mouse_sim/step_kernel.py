@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 
 from .geometry import TriangleMesh, geometry_from_dict
 
@@ -25,9 +26,25 @@ BACKEND_NAME = "freecad-occt"
 # layout changes so previously cached assets rebuild (parts export added).
 ASSET_FORMAT_VERSION = "parts-v7"
 
-# Per-user asset directory; never a shared world-writable path.
+
+_TESSELLATE_LOCK = threading.Lock()
+
+def _user_tag():
+    """Return a stable per-user identifier (uid on POSIX, fallback on Windows)."""
+    getuid = getattr(os, "getuid", None)
+    if getuid is not None:
+        try:
+            return str(getuid())
+        except (OSError, TypeError, ValueError):
+            pass
+    return "user"
+
+
+# Per-user asset directory; never a shared world-writable path.  On Windows
+# the per-user temp directory already isolates the location, so the fixed
+# fallback tag cannot collide across users.
 _PROCESS_ASSET_DIR = Path(tempfile.gettempdir()) / (
-    "mouse-sim-step-assets-{}".format(os.getuid())
+    "mouse-sim-step-assets-{}".format(_user_tag())
 )
 _STEP_MARKERS = (
     b"CONTEXT_DEPENDENT_SHAPE_REPRESENTATION",
@@ -67,21 +84,78 @@ class StepKernelFailure(RuntimeError):
     """Raised when FreeCADCmd cannot complete a kernel operation."""
 
 
+def _windows_freecadcmd_candidates():
+    r"""Return Windows FreeCADCmd install candidates, newest version first.
+
+    FreeCAD installs ``bin\freecadcmd.exe`` under a versioned folder such as
+    ``C:\Program Files\FreeCAD 1.0\bin\``.  When several side-by-side
+    versions exist, the folder name's numeric version decides the order.
+    """
+    roots = []
+    for key in ("PROGRAMFILES", "PROGRAMFILES(X86)"):
+        value = os.environ.get(key)
+        if value:
+            roots.append(Path(value))
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        roots.append(Path(local_app_data) / "Programs")
+
+    candidates = []
+    for root in roots:
+        try:
+            candidates.extend(root.glob("FreeCAD*/bin/freecadcmd.exe"))
+        except (OSError, ValueError):
+            # Unreadable or malformed install root; skip it.
+            continue
+
+    def _version_key(candidate):
+        match = re.search(r"(\d+(?:\.\d+)*)", candidate.parent.parent.name)
+        if not match:
+            return (0,)
+        return tuple(int(part) for part in match.group(1).split("."))
+
+    candidates.sort(key=_version_key, reverse=True)
+    return candidates
+
+
 def freecadcmd_path():
     """Return the first usable FreeCADCmd path, or ``None``."""
+    candidates = []
     configured = os.environ.get(FREECADCMD_ENV)
-    candidates = [configured, DEFAULT_FREECADCMD, shutil.which("freecadcmd")]
+    if configured:
+        candidates.append(configured)
+    if os.name == "nt":
+        candidates.extend(_windows_freecadcmd_candidates())
+    via_which = shutil.which("freecadcmd")
+    if via_which:
+        candidates.append(via_which)
+    if sys.platform == "darwin":
+        candidates.append(DEFAULT_FREECADCMD)
+    elif sys.platform.startswith("linux"):
+        candidates.append("/usr/bin/freecadcmd")
+        try:
+            candidates.extend(Path("/usr/lib").glob("freecad*/bin/freecadcmd"))
+        except OSError:
+            pass
     for candidate in candidates:
         if not candidate:
             continue
-        path = Path(candidate).expanduser()
-        if path.is_file() and os.access(str(path), os.X_OK):
-            return path.resolve()
+        try:
+            path = Path(candidate).expanduser()
+            if path.is_file() and os.access(str(path), os.X_OK):
+                return path.resolve()
+        except Exception:
+            # A configured candidate may be unusable (broken home expansion,
+            # unreadable directory, removed mount); treat it as absent.
+            continue
     return None
 
 
 def kernel_available():
-    return freecadcmd_path() is not None
+    try:
+        return freecadcmd_path() is not None
+    except Exception:
+        return False
 
 
 def requires_kernel(data, backend="auto"):
@@ -149,7 +223,10 @@ def _secure_asset_dir(root):
         stat_result = root.stat()
     except OSError:
         raise StepKernelFailure("STEP asset directory is not accessible: {}".format(root))
-    if stat_result.st_uid != os.geteuid() or not stat_result.st_mode & 0o040000:
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is not None and stat_result.st_uid != geteuid():
+        raise StepKernelFailure("STEP asset directory is not owned by this user: {}".format(root))
+    if not stat_result.st_mode & 0o040000:
         raise StepKernelFailure("STEP asset directory is not owned by this user: {}".format(root))
     try:
         os.chmod(str(root), 0o700)
@@ -388,110 +465,129 @@ def tessellate_step(data, source_name, source_units, asset_dir, timeout=DEFAULT_
     cached = _cached_result(asset_id, root, settings, source_sha256, assumed_units)
     if cached is not None:
         return cached
-    command_path = freecadcmd_path()
-    if command_path is None:
-        raise StepKernelUnavailable(
-            "FreeCADCmd is unavailable; set {} or install FreeCAD at {}".format(
-                FREECADCMD_ENV, DEFAULT_FREECADCMD
-            )
-        )
-    if timeout is None:
-        timeout = DEFAULT_TIMEOUT
-    try:
-        timeout = float(timeout)
-    except (TypeError, ValueError):
-        raise StepKernelFailure("STEP kernel timeout must be a finite positive number")
-    if not math.isfinite(timeout) or timeout <= 0.0:
-        raise StepKernelFailure("STEP kernel timeout must be a finite positive number")
+    with _TESSELLATE_LOCK:
+        # Double check cache under the lock, in case another thread compiled it
+        cached = _cached_result(asset_id, root, settings, source_sha256, assumed_units)
+        if cached is not None:
+            return cached
 
-    try:
-        # Write the STEP input privately and atomically; never follow a
-        # pre-planted symlink in the asset directory.
-        temp_input = input_path.with_suffix(".stp.tmp")
-        descriptor = os.open(
-            str(temp_input), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
-        )
-        try:
-            with os.fdopen(descriptor, "wb") as stream:
-                stream.write(data)
-        except OSError:
-            try:
-                os.remove(temp_input)
-            except OSError:
-                pass
-            raise
-        os.replace(temp_input, input_path)
-    except OSError as exc:
-        raise StepKernelFailure("cannot write temporary STEP input: {}".format(exc))
-
-    worker_script = Path(__file__).with_name("freecad_step_worker.py").resolve()
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "HOME": os.environ.get("HOME", ""),
-        "TMPDIR": os.environ.get("TMPDIR", tempfile.gettempdir()),
-        "MOUSE_SIM_STEP_INPUT": str(input_path),
-        "MOUSE_SIM_STEP_MESH_OUTPUT": str(mesh_path),
-        "MOUSE_SIM_STEP_GLB_OUTPUT": str(glb_path),
-        "MOUSE_SIM_STEP_PARTS_OUTPUT": str(parts_path),
-        "MOUSE_SIM_STEP_MESH_DEFLECTION_MM": str(settings["mesh_deflection_mm"]),
-        "MOUSE_SIM_STEP_GLB_DEFLECTION_MM": str(settings["glb_deflection_mm"]),
-        "MOUSE_SIM_STEP_SCALE": str(settings["scale_to_m"]),
-        "MOUSE_SIM_STEP_SOURCE_UNITS": str(effective_units),
-        "MOUSE_SIM_STEP_SOURCE_SHA256": source_sha256,
-    }
-    expression = "exec(open({}).read())".format(repr(str(worker_script)))
-    command = [str(command_path), "-c", expression]
-
-    def _limit_worker():
-        # macOS rejects lowering RLIMIT_AS from an inherited unlimited limit,
-        # so CPU/NOFILE are set first, each guarded separately; failures are
-        # reported instead of silently dropping every limit.
-        try:
-            import resource
-
-            try:
-                resource.setrlimit(resource.RLIMIT_CPU, (600, 600))
-            except Exception as exc:
-                sys.stderr.write("mouse_sim step worker: RLIMIT_CPU failed: {}\n".format(exc))
-            try:
-                resource.setrlimit(resource.RLIMIT_NOFILE, (1024, 1024))
-            except Exception as exc:
-                sys.stderr.write("mouse_sim step worker: RLIMIT_NOFILE failed: {}\n".format(exc))
-            try:
-                resource.setrlimit(
-                    resource.RLIMIT_AS, (6 * 1024 * 1024 * 1024, 6 * 1024 * 1024 * 1024)
+        command_path = freecadcmd_path()
+        if command_path is None:
+            raise StepKernelUnavailable(
+                "FreeCADCmd is unavailable; set {} or install FreeCAD at {}".format(
+                    FREECADCMD_ENV, DEFAULT_FREECADCMD
                 )
-            except Exception as exc:
-                sys.stderr.write("mouse_sim step worker: RLIMIT_AS failed: {}\n".format(exc))
-        except Exception as exc:
-            sys.stderr.write("mouse_sim step worker: resource module unavailable: {}\n".format(exc))
-
-    try:
-        completed = subprocess.run(
-            command,
-            env=env,
-            preexec_fn=_limit_worker,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        raise StepKernelFailure("FreeCAD STEP tessellation timed out after {} seconds".format(timeout))
-    except OSError as exc:
-        raise StepKernelUnavailable("FreeCADCmd could not be started: {}".format(exc))
-    if completed.returncode != 0:
-        raise StepKernelFailure(
-            "FreeCAD STEP worker exited with status {}: {}".format(
-                completed.returncode, _failure_output(completed)
             )
+        if timeout is None:
+            timeout = DEFAULT_TIMEOUT
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError):
+            raise StepKernelFailure("STEP kernel timeout must be a finite positive number")
+        if not math.isfinite(timeout) or timeout <= 0.0:
+            raise StepKernelFailure("STEP kernel timeout must be a finite positive number")
+
+        try:
+            # Write the STEP input privately and atomically; never follow a
+            # pre-planted symlink in the asset directory.  O_NOFOLLOW is a no-op
+            # on platforms without symlinks in the temp dir.
+            temp_input = input_path.with_suffix(".stp.tmp")
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(
+                str(temp_input), os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600
+            )
+            try:
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(data)
+            except OSError:
+                try:
+                    os.remove(temp_input)
+                except OSError:
+                    pass
+                raise
+            os.replace(temp_input, input_path)
+        except OSError as exc:
+            raise StepKernelFailure("cannot write temporary STEP input: {}".format(exc))
+
+        worker_script = Path(__file__).with_name("freecad_step_worker.py").resolve()
+        # Inherit the FULL caller environment and layer the worker settings on
+        # top.  A minimal env (PATH/HOME/TMPDIR only) breaks FreeCAD on Windows:
+        # its Qt/OpenCASCADE bootstrap requires SYSTEMROOT/WINDIR/COMSPEC etc.,
+        # and the worker then dies at init with "Unknown runtime error occurred
+        # while initializing FreeCAD" (exit 101) instead of tessellating.
+        env = dict(os.environ)
+        env.update(
+            {
+                "MOUSE_SIM_STEP_INPUT": str(input_path),
+                "MOUSE_SIM_STEP_MESH_OUTPUT": str(mesh_path),
+                "MOUSE_SIM_STEP_GLB_OUTPUT": str(glb_path),
+                "MOUSE_SIM_STEP_PARTS_OUTPUT": str(parts_path),
+                "MOUSE_SIM_STEP_MESH_DEFLECTION_MM": str(settings["mesh_deflection_mm"]),
+                "MOUSE_SIM_STEP_GLB_DEFLECTION_MM": str(settings["glb_deflection_mm"]),
+                "MOUSE_SIM_STEP_SCALE": str(settings["scale_to_m"]),
+                "MOUSE_SIM_STEP_SOURCE_UNITS": str(effective_units),
+                "MOUSE_SIM_STEP_SOURCE_SHA256": source_sha256,
+            }
         )
-    if not (mesh_path.is_file() and parts_path.is_file() and glb_path.is_file() and glb_path.stat().st_size > 0):
-        raise StepKernelFailure("FreeCAD STEP worker completed without mesh, parts, and GLB outputs")
-    result = _cached_result(asset_id, root, settings, source_sha256, assumed_units, cached=False)
-    if result is None:
-        raise StepKernelFailure("FreeCAD STEP worker produced invalid mesh or GLB metadata")
-    return result
+        expression = "exec(open({}).read())".format(repr(str(worker_script)))
+        command = [str(command_path), "-c", expression]
+
+        def _limit_worker():
+            # macOS rejects lowering RLIMIT_AS from an inherited unlimited limit,
+            # so CPU/NOFILE are set first, each guarded separately; failures are
+            # reported instead of silently dropping every limit.
+            try:
+                import resource
+
+                try:
+                    resource.setrlimit(resource.RLIMIT_CPU, (600, 600))
+                except Exception as exc:
+                    sys.stderr.write("mouse_sim step worker: RLIMIT_CPU failed: {}\n".format(exc))
+                try:
+                    resource.setrlimit(resource.RLIMIT_NOFILE, (1024, 1024))
+                except Exception as exc:
+                    sys.stderr.write("mouse_sim step worker: RLIMIT_NOFILE failed: {}\n".format(exc))
+                try:
+                    resource.setrlimit(
+                        resource.RLIMIT_AS, (6 * 1024 * 1024 * 1024, 6 * 1024 * 1024 * 1024)
+                    )
+                except Exception as exc:
+                    sys.stderr.write("mouse_sim step worker: RLIMIT_AS failed: {}\n".format(exc))
+            except Exception as exc:
+                sys.stderr.write("mouse_sim step worker: resource module unavailable: {}\n".format(exc))
+
+        worker_kwargs = {}
+        if os.name == "posix":
+            worker_kwargs["preexec_fn"] = _limit_worker
+        else:
+            # preexec_fn is POSIX-only; start in the caller's process group.
+            worker_kwargs["start_new_session"] = False
+        try:
+            completed = subprocess.run(
+                command,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+                **worker_kwargs,
+            )
+        except subprocess.TimeoutExpired:
+            raise StepKernelFailure("FreeCAD STEP tessellation timed out after {} seconds".format(timeout))
+        except OSError as exc:
+            raise StepKernelUnavailable("FreeCADCmd could not be started: {}".format(exc))
+        if completed.returncode != 0:
+            raise StepKernelFailure(
+                "FreeCAD STEP worker exited with status {}: {}".format(
+                    completed.returncode, _failure_output(completed)
+                )
+            )
+        if not (mesh_path.is_file() and parts_path.is_file() and glb_path.is_file() and glb_path.stat().st_size > 0):
+            raise StepKernelFailure("FreeCAD STEP worker completed without mesh, parts, and GLB outputs")
+        result = _cached_result(asset_id, root, settings, source_sha256, assumed_units, cached=False)
+        if result is None:
+            raise StepKernelFailure("FreeCAD STEP worker produced invalid mesh or GLB metadata")
+        return result
 
 
 __all__ = [

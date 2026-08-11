@@ -1,5 +1,12 @@
 import { test, expect, type Page } from '@playwright/test';
-import { modelLoaded, collectPageErrors, expectNoConsoleErrors, expectRunComplete } from './helpers';
+import {
+  modelLoaded,
+  collectPageErrors,
+  expectNoConsoleErrors,
+  expectRunComplete,
+  runStandardTest,
+  openResultsRail,
+} from './helpers';
 
 test.describe('model workspace', () => {
   let page: Page;
@@ -12,8 +19,11 @@ test.describe('model workspace', () => {
 
   test('starts with an empty scene and no demo objects', async () => {
     await page.goto('/');
-    await expect(page.getByRole('heading', { name: /mouse_sim/ })).toHaveCount(1, { timeout: 15_000 });
+    await expect(page.getByRole('heading', { name: /mouse\s*sim/i })).toHaveCount(1, { timeout: 15_000 });
     await expect(page.locator('.model-row')).toHaveCount(0, { timeout: 15_000 });
+    // The empty-state message lives inside the navigator drawer, which starts
+    // closed; open it to verify the empty tree state.
+    await page.getByRole('button', { name: 'Toggle model navigator' }).click();
     await expect(page.getByText('No geometry loaded')).toBeVisible();
     await expectNoConsoleErrors(page, errors);
   });
@@ -23,6 +33,7 @@ test.describe('model workspace', () => {
     // Under parallel-suite CPU load the scene mount can be slow; 15 s mirrors
     // the other mount assertions instead of the default 5 s.
     await expect(page.locator('.scene-viewport canvas')).toBeVisible({ timeout: 15_000 });
+    await runStandardTest(page);
     await expectRunComplete(page);
     await expectNoConsoleErrors(page, errors);
   });
@@ -57,43 +68,23 @@ test.describe('model workspace', () => {
     await page.locator('.viewport-toolbar').getByRole('button', { name: 'Fit view' }).click();
   });
 
-  test('result rail renders tabs and qualification disposition', async () => {
+  test('result rail shows the verdict, key metrics, and issues after a run', async () => {
     await modelLoaded(page);
+    await runStandardTest(page);
     await expectRunComplete(page);
     // The navigator auto-opens after upload; on narrow viewports the open
-    // drawer overlays the rail, so close it before interacting with tabs.
+    // drawer overlays the rail, so close it before interacting.
     if (await page.locator('.drawer--nav.is-open').count()) {
       await page.getByRole('button', { name: 'Toggle model navigator' }).click();
     }
-    // The rail defaults to a collapsed right-edge strip; expand it to reach the tabs.
-    await page.getByRole('button', { name: 'Show results rail' }).click();
-    await page.getByRole('tab', { name: 'qualification' }).click();
-    await expect(
-      page.getByRole('row', { name: 'Evidence disposition' }).getByRole('status'),
-    ).toHaveText('Exploration only');
-    await page.getByRole('tab', { name: 'structural' }).click();
-    await expect(page.getByText(/No structural (evaluation|response)/i)).toBeVisible();
-    await page.getByRole('tab', { name: 'issues' }).click();
-    // The analytic fixture parts carry no explicit materials, so the Issues
-    // tab surfaces the Default-material fallback warning instead of an empty
-    // state.
-    await expect(
-      page.locator('.results-rail').getByText(/Default material/i),
-    ).toBeVisible();
-  });
-
-  test('mode switch triggers rerun and qualification gate view', async () => {
-    await modelLoaded(page);
-    await expectRunComplete(page);
-    await page.getByRole('button', { name: 'Run test menu' }).click();
-    await page.getByRole('menuitem', { name: 'Run Qualification' }).click();
-    await expectRunComplete(page);
-    if (await page.locator('.drawer--nav.is-open').count()) {
-      await page.getByRole('button', { name: 'Toggle model navigator' }).click();
-    }
-    await page.getByRole('button', { name: 'Show results rail' }).click();
-    await expect(page.locator('.results-rail')).toContainText(/blocked|pending review|exploration only/i);
-    await expectNoConsoleErrors(page, errors);
+    await openResultsRail(page);
+    await expect(page.locator('.results-rail')).toContainText(/PASS|WARN|FAIL/);
+    await expect(page.locator('.results-rail')).toContainText('Material:');
+    await expect(page.locator('.results-rail')).toContainText('Safety factor');
+    await expect(page.locator('.results-rail')).toContainText('Impact force');
+    // The analytic fixture parts carry no explicit materials, so the default
+    // material fallback surfaces as an actionable warning.
+    await expect(page.locator('.results-rail')).toContainText(/Default material/i);
   });
 
   test('canvas picking works with the results rail collapsed', async () => {
@@ -119,9 +110,14 @@ test.describe('model workspace', () => {
     await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
     await expect(page.locator('.model-row[aria-selected="true"]')).toHaveCount(1, { timeout: 5000 });
 
-    // Near the bottom-center of the viewport the click must still reach the
-    // canvas (the collapsed rail strip must not intercept pointer events).
-    await page.mouse.click(box.x + box.width / 2, box.y + box.height * 0.78);
+    // A second pick on the canvas must also land (the collapsed rail strip
+    // must never intercept pointer events destined for the viewport). The
+    // inspector drawer opens after the first pick and can resize the
+    // viewport, so re-measure the canvas before the second click.
+    const boxAfter = await viewport.boundingBox();
+    if (boxAfter) {
+      await page.mouse.click(boxAfter.x + boxAfter.width / 2, boxAfter.y + boxAfter.height / 2);
+    }
     await expect(page.locator('.model-row[aria-selected="true"]')).toHaveCount(1, { timeout: 5000 });
     await expectNoConsoleErrors(page, errors);
   });

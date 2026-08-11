@@ -126,14 +126,13 @@ test.describe('drop simulation playback', () => {
     });
 
     await page.goto('/');
-    await page.getByRole('button', { name: 'Choose geometry file' }).click();
+    await page.getByRole('button', { name: /Drop geometry file/i }).click();
     await page.locator('input[type="file"]').setInputFiles(fixturePath('analytic.json'));
     await page.locator('.model-row__name', { hasText: 'analytic' }).waitFor({ state: 'attached', timeout: 15000 });
 
-    await page.getByRole('button', { name: 'Run test menu' }).click();
-    await page.getByRole('menuitem', { name: 'Drop Test' }).click();
-    await page.getByRole('button', { name: 'Run Drop Test' }).click();
-    await expect(page.locator('.mission-control')).toHaveCount(0, { timeout: 5000 });
+    // The run bar selects the test type and runs it directly — no dialog.
+    await page.getByLabel('Test type').selectOption({ label: 'Drop Test' });
+    await page.getByRole('button', { name: 'Run test' }).click();
 
     // The drop simulation controls appear once the (mocked) result lands.
     await page.locator('.drop-sim-controls').waitFor({ state: 'visible', timeout: 15000 });
@@ -177,14 +176,17 @@ test.describe('drop simulation playback', () => {
     // resets to ~0.00s and the PLAY state resumes.
     await restartPlayback(page);
 
-    // The results rail shows the drop simulation table on the Impact tab.
-    // The rail defaults to a collapsed right-edge strip; expand it first.
-    await page.getByRole('button', { name: 'Show results rail' }).click();
+    // The results rail opens automatically on wide viewports once the
+    // (mocked) result lands; on narrow viewports it stays collapsed, so open
+    // it explicitly for the content assertions.
+    if (await page.locator('.results-rail--collapsed').count()) {
+      await page.getByRole('button', { name: 'Show results rail' }).click();
+    }
     await page.locator('.results-rail').waitFor({ state: 'visible', timeout: 5000 });
-    await page.getByRole('tab', { name: 'impact' }).click();
-    await expect(page.locator('.results-rail')).toContainText('Drop Simulation');
-    await expect(page.locator('.results-rail')).toContainText('Worst impact: 3.13 m/s');
-    await expect(page.locator('.results-rail')).toContainText('estimated peak force 313 N');
+    await expect(page.locator('.results-rail')).toContainText('Drop Test');
+    await expect(page.locator('.results-rail')).toContainText('0.50 m');
+    await expect(page.locator('.results-rail')).toContainText('190 N');
+    await expect(page.locator('.results-rail')).toContainText('100 g');
 
     await expectNoConsoleErrors(page, errors);
   });
@@ -202,13 +204,12 @@ test.describe('drop simulation playback', () => {
     });
 
     await page.goto('/');
-    await page.getByRole('button', { name: 'Choose geometry file' }).click();
+    await page.getByRole('button', { name: /Drop geometry file/i }).click();
     await page.locator('input[type="file"]').setInputFiles(fixturePath('analytic.json'));
     await page.locator('.model-row__name', { hasText: 'analytic' }).waitFor({ state: 'attached', timeout: 15000 });
 
-    await page.getByRole('button', { name: 'Run test menu' }).click();
-    await page.getByRole('menuitem', { name: 'Drop Test' }).click();
-    await page.getByRole('button', { name: 'Run Drop Test' }).click();
+    await page.getByLabel('Test type').selectOption({ label: 'Drop Test' });
+    await page.getByRole('button', { name: 'Run test' }).click();
 
     await page.locator('.drop-sim-controls').waitFor({ state: 'visible', timeout: 15000 });
     if (await page.locator('.drawer--nav.is-open').count()) {

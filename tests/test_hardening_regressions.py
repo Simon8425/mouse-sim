@@ -277,20 +277,26 @@ class ConfidenceSeparationTests(unittest.TestCase):
                     "surface": "concrete",
                     "orientation": "flat",
                     "measured_peak_accel_g": 190.0,
+                    "sensor": {"quantity": "resultant_peak_g",
+                               "location_body_m": [0.0, 0.0, 0.0]},
                 },
                 {
                     "drop_id": "D2",
-                    "height_m": 0.5,
+                    "height_m": 0.75,
                     "surface": "concrete",
                     "orientation": "flat",
-                    "measured_peak_accel_g": 200.0,
+                    "measured_peak_accel_g": 233.0,
+                    "sensor": {"quantity": "resultant_peak_g",
+                               "location_body_m": [0.0, 0.0, 0.0]},
                 },
                 {
                     "drop_id": "D3",
-                    "height_m": 0.5,
+                    "height_m": 1.0,
                     "surface": "concrete",
                     "orientation": "flat",
-                    "measured_peak_accel_g": 180.0,
+                    "measured_peak_accel_g": 269.0,
+                    "sensor": {"quantity": "resultant_peak_g",
+                               "location_body_m": [0.0, 0.0, 0.0]},
                 },
             ],
         }
@@ -410,27 +416,32 @@ class MaterialPlausibilityTests(unittest.TestCase):
 
 
 class LifecycleNonFiniteCountsTests(unittest.TestCase):
-    def test_inf_prior_drops_zero_damage_no_raise(self):
-        _, _, damage, _ = lifecycle.degradation_factors(
-            {"prior_drops": float("inf"), "prior_impact_energy_j": 5.0}
-        )
-        self.assertEqual(damage["fatigue_index"], 0.0)
+    def test_inf_prior_drops_rejected_as_invalid_input(self):
+        # Audit fix: Inf must never be converted into a valid physical value
+        # (the old behavior silently turned it into 0); it is an explicit
+        # invalid-input state.
+        with self.assertRaises(ValueError):
+            lifecycle.degradation_factors(
+                {"prior_drops": float("inf"), "prior_impact_energy_j": 5.0}
+            )
 
-    def test_inf_string_prior_drops_zero(self):
-        _, _, damage, _ = lifecycle.degradation_factors(
-            {"prior_drops": "inf", "prior_impact_energy_j": 5.0}
-        )
-        self.assertEqual(damage["fatigue_index"], 0.0)
+    def test_inf_string_prior_drops_rejected_as_invalid_input(self):
+        with self.assertRaises(ValueError):
+            lifecycle.degradation_factors(
+                {"prior_drops": "inf", "prior_impact_energy_j": 5.0}
+            )
 
-    def test_pipeline_inf_string_prior_drops_completes(self):
+    def test_pipeline_inf_string_prior_drops_reports_invalid_input(self):
         request = mouse_project_request(
             drop_simulation={"height_m": 0.5},
             lifecycle={"prior_drops": "inf", "prior_impact_energy_j": 1.0},
         )
         result = run_pipeline(request)
-        self.assertEqual(result["errors"], [])
-        self.assertEqual(result["lifecycle"]["usage_snapshot"]["prior_drops"], 0)
-        self.assertEqual(result["lifecycle"]["damage"]["fatigue_index"], 0.0)
+        self.assertNotEqual(result["errors"], [])
+        self.assertTrue(
+            any(item["code"] == "DROP_SIMULATION_FAILED" for item in result["issues"])
+        )
+        self.assertEqual(result["lifecycle_state"], "failed")
 
 
 class PhysicalInvariantsTests(unittest.TestCase):

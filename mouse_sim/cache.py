@@ -86,7 +86,15 @@ class ArtifactCache:
         stored_digest = data.get("_digest")
         if not isinstance(stored_digest, str):
             return None
-        if self._digest_of(data) != stored_digest:
+        try:
+            digest_matches = self._digest_of(data) == stored_digest
+        except Exception:
+            # A tampered payload with non-finite values raises inside the
+            # digest computation (audit finding: it previously escaped the
+            # guard and hard-failed the run as PIPELINE_INTERNAL).  Any
+            # corruption — including non-finite JSON — is a cache miss.
+            return None
+        if not digest_matches:
             return None
         data.pop("_digest", None)
         return data

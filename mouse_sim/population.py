@@ -45,6 +45,95 @@ LCG_STREAM_MULTIPLIER = 1664525
 LCG_STREAM_INCREMENT = 1013904223
 LCG_MODULUS = 4294967296.0
 
+# Unit-level component outcome vocabulary.  pass and warn count as
+# evaluated-and-non-failed; fail counts as a failed unit; every other outcome
+# lands in the "unevaluated" bucket (never ok, never failed) and is disclosed
+# via units_unevaluated / analysis_incomplete instead of silently counting as
+# a pass.
+COMPONENT_OUTCOME_PASS = "pass"
+COMPONENT_OUTCOME_FAIL = "fail"
+COMPONENT_OUTCOME_WARN = "warn"
+COMPONENT_OUTCOME_UNSUPPORTED = "unsupported"
+COMPONENT_OUTCOME_INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+COMPONENT_OUTCOME_INVALID_INPUT = "invalid_input"
+COMPONENT_OUTCOME_NOT_EVALUATED = "not_evaluated"
+_COMPONENT_OUTCOMES = frozenset(
+    {
+        COMPONENT_OUTCOME_PASS,
+        COMPONENT_OUTCOME_FAIL,
+        COMPONENT_OUTCOME_WARN,
+        COMPONENT_OUTCOME_UNSUPPORTED,
+        COMPONENT_OUTCOME_INSUFFICIENT_EVIDENCE,
+        COMPONENT_OUTCOME_INVALID_INPUT,
+        COMPONENT_OUTCOME_NOT_EVALUATED,
+    }
+)
+_UNEVALUATED_OUTCOMES = frozenset(
+    {
+        COMPONENT_OUTCOME_UNSUPPORTED,
+        COMPONENT_OUTCOME_INSUFFICIENT_EVIDENCE,
+        COMPONENT_OUTCOME_INVALID_INPUT,
+        COMPONENT_OUTCOME_NOT_EVALUATED,
+    }
+)
+# Analyzer synonyms mapped onto the canonical vocabulary.  Anything not
+# listed (unknown strings, malformed statuses) maps to not_evaluated — never
+# to ok.
+_COMPONENT_STATUS_CANONICAL = {
+    COMPONENT_OUTCOME_PASS: COMPONENT_OUTCOME_PASS,
+    "ok": COMPONENT_OUTCOME_PASS,
+    "passed": COMPONENT_OUTCOME_PASS,
+    "good": COMPONENT_OUTCOME_PASS,
+    "healthy": COMPONENT_OUTCOME_PASS,
+    "within_limit": COMPONENT_OUTCOME_PASS,
+    "within_spec": COMPONENT_OUTCOME_PASS,
+    "normal": COMPONENT_OUTCOME_PASS,
+    COMPONENT_OUTCOME_FAIL: COMPONENT_OUTCOME_FAIL,
+    "failed": COMPONENT_OUTCOME_FAIL,
+    "critical": COMPONENT_OUTCOME_FAIL,
+    "failure": COMPONENT_OUTCOME_FAIL,
+    "exceeded": COMPONENT_OUTCOME_FAIL,
+    "over_limit": COMPONENT_OUTCOME_FAIL,
+    "over": COMPONENT_OUTCOME_FAIL,
+    "broken": COMPONENT_OUTCOME_FAIL,
+    COMPONENT_OUTCOME_WARN: COMPONENT_OUTCOME_WARN,
+    "warning": COMPONENT_OUTCOME_WARN,
+    "marginal": COMPONENT_OUTCOME_WARN,
+    "caution": COMPONENT_OUTCOME_WARN,
+    COMPONENT_OUTCOME_UNSUPPORTED: COMPONENT_OUTCOME_UNSUPPORTED,
+    "not_supported": COMPONENT_OUTCOME_UNSUPPORTED,
+    COMPONENT_OUTCOME_INSUFFICIENT_EVIDENCE: COMPONENT_OUTCOME_INSUFFICIENT_EVIDENCE,
+    "insufficient_data": COMPONENT_OUTCOME_INSUFFICIENT_EVIDENCE,
+    "no_data": COMPONENT_OUTCOME_INSUFFICIENT_EVIDENCE,
+    "indeterminate": COMPONENT_OUTCOME_INSUFFICIENT_EVIDENCE,
+    COMPONENT_OUTCOME_INVALID_INPUT: COMPONENT_OUTCOME_INVALID_INPUT,
+    "invalid": COMPONENT_OUTCOME_INVALID_INPUT,
+    "missing_input": COMPONENT_OUTCOME_INVALID_INPUT,
+    "missing_data": COMPONENT_OUTCOME_INVALID_INPUT,
+    "bad_data": COMPONENT_OUTCOME_INVALID_INPUT,
+    "bad_input": COMPONENT_OUTCOME_INVALID_INPUT,
+    "error": COMPONENT_OUTCOME_INVALID_INPUT,
+    COMPONENT_OUTCOME_NOT_EVALUATED: COMPONENT_OUTCOME_NOT_EVALUATED,
+    "unevaluated": COMPONENT_OUTCOME_NOT_EVALUATED,
+    "unknown": COMPONENT_OUTCOME_NOT_EVALUATED,
+    "pending": COMPONENT_OUTCOME_NOT_EVALUATED,
+    "n/a": COMPONENT_OUTCOME_NOT_EVALUATED,
+    "na": COMPONENT_OUTCOME_NOT_EVALUATED,
+}
+
+
+def _normalize_component_status(raw_status):
+    """Map an analyzer status string onto the canonical outcome vocabulary.
+
+    Missing or unknown statuses map to ``not_evaluated`` — an absent or
+    unrecognized verdict must never be treated as a pass.
+    """
+    if raw_status is None:
+        return COMPONENT_OUTCOME_NOT_EVALUATED
+    key = str(raw_status).strip().lower()
+    return _COMPONENT_STATUS_CANONICAL.get(key, COMPONENT_OUTCOME_NOT_EVALUATED)
+
+
 MANUFACTURING_TOLERANCES = (
     ("mass_scale", "+/-3%"),
     ("inertia_scale_x", "+/-5%"),
@@ -157,8 +246,19 @@ def _sig(value, digits=3):
 
 
 def clamp_sample_count(value):
-    """Clamp a sample count into [MIN_SAMPLE_COUNT, MAX_SAMPLE_COUNT]."""
-    return max(MIN_SAMPLE_COUNT, min(MAX_SAMPLE_COUNT, int(value)))
+    """Clamp a sample count into [MIN_SAMPLE_COUNT, MAX_SAMPLE_COUNT].
+
+    NaN/Inf (and any non-numeric input) are rejected with ValueError rather
+    than being coerced by min/max; negative counts are invalid input, never
+    silently clamped into the valid range.
+    """
+    try:
+        count = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("sample_count must be an integer")
+    if count <= 0:
+        raise ValueError("sample_count must be positive")
+    return max(MIN_SAMPLE_COUNT, min(MAX_SAMPLE_COUNT, count))
 
 
 def _support_or_default(support):
@@ -208,7 +308,19 @@ def draw_unit_parameters(seed, tolerance_scale=1.0, support=None):
     for point in support:
         for axis in range(3):
             extent[axis] = max(extent[axis], abs(float(point[axis])))
-    scale = max(0.0, min(2.0, float(tolerance_scale or 0.0)))
+    raw_scale = tolerance_scale if tolerance_scale is not None else 0.0
+    try:
+        scale = float(raw_scale)
+    except (TypeError, ValueError):
+        raise ValueError("tolerance_scale must be numeric")
+    if not math.isfinite(scale):
+        raise ValueError("tolerance_scale must be a finite number (got {!r})".format(raw_scale))
+    if scale < 0.0:
+        raise ValueError("tolerance_scale must be >= 0 (got {!r})".format(raw_scale))
+    # Finite values above the documented screening range clamp to 2.0 (the
+    # config-level normalization discloses the clamp); NaN/Inf were rejected
+    # above and are never converted into a valid value via min/max.
+    scale = 2.0 if scale > 2.0 else scale
     state = (_mix_seed(seed) & 0xFFFFFFFF)
 
     def next_unit():
@@ -368,7 +480,25 @@ def _normalize_components(components):
     return specs
 
 
-def _normalize_config(config, context):
+def _config_int(value, name, minimum=None):
+    """Coerce an integer config field, rejecting NaN/Inf and (optionally)
+    out-of-range values with an explicit ValueError — never silently
+    clamping non-finite input."""
+    try:
+        number = float(value)
+        result = int(number)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("config {} must be an integer".format(name))
+    if not math.isfinite(number):
+        raise ValueError(
+            "config {} must be a finite number (got {!r})".format(name, value)
+        )
+    if minimum is not None and result < minimum:
+        raise ValueError("config {} must be >= {}".format(name, minimum))
+    return result
+
+
+def _normalize_config(config, context, diagnostics=None):
     source = dict(config or {})
     allowed = {
         "sample_count",
@@ -397,25 +527,40 @@ def _normalize_config(config, context):
     except (TypeError, ValueError):
         raise ValueError("config sample_count must be an integer")
     profile = str(source.get("profile", "esports_fps"))
+    lifespan_days = _config_int(
+        source.get("lifespan_days", 730), "lifespan_days", minimum=1
+    )
+    base_seed = _config_int(source.get("base_seed", 0), "base_seed", minimum=0)
+    workers = _config_int(
+        source.get("workers", min(8, os.cpu_count() or 1)), "workers", minimum=1
+    )
+    if workers > 1024:
+        raise ValueError(
+            "config workers {} exceeds the documented maximum 1024".format(workers)
+        )
+    raw_tolerance_scale = source.get("tolerance_scale", 1.0)
     try:
-        lifespan_days = int(source.get("lifespan_days", 730))
-    except (TypeError, ValueError):
-        raise ValueError("config lifespan_days must be an integer")
-    lifespan_days = max(1, lifespan_days)
-    try:
-        base_seed = int(source.get("base_seed", 0))
-    except (TypeError, ValueError):
-        raise ValueError("config base_seed must be an integer")
-    try:
-        workers = int(source.get("workers", min(8, os.cpu_count() or 1)))
-    except (TypeError, ValueError):
-        raise ValueError("config workers must be an integer")
-    workers = max(1, workers)
-    try:
-        tolerance_scale = float(source.get("tolerance_scale", 1.0))
+        tolerance_scale = float(raw_tolerance_scale)
     except (TypeError, ValueError):
         raise ValueError("config tolerance_scale must be numeric")
-    tolerance_scale = max(0.0, min(2.0, tolerance_scale))
+    if not math.isfinite(tolerance_scale):
+        raise ValueError(
+            "config tolerance_scale must be a finite number (got {!r})".format(
+                raw_tolerance_scale
+            )
+        )
+    if tolerance_scale < 0.0:
+        raise ValueError(
+            "config tolerance_scale must be >= 0 (got {!r}); a negative "
+            "tolerance scale is invalid".format(raw_tolerance_scale)
+        )
+    if tolerance_scale > 2.0:
+        if diagnostics is not None:
+            diagnostics.append(
+                "config tolerance_scale {!r} exceeds the documented screening "
+                "range [0.0, 2.0]; clamped to 2.0".format(raw_tolerance_scale)
+            )
+        tolerance_scale = 2.0
     try:
         drop_height_m = float(source.get("drop_height_m", 0.75))
     except (TypeError, ValueError):
@@ -432,6 +577,16 @@ def _normalize_config(config, context):
         raise ValueError(
             "config drop_orientation must be one of {}".format(", ".join(drop_sim.ORIENTATIONS))
         )
+    raw_stiffness = source.get("contact_stiffness_n_per_m", CONTACT_STIFFNESS_N_PER_M)
+    try:
+        contact_stiffness = float(raw_stiffness)
+    except (TypeError, ValueError):
+        raise ValueError("config contact_stiffness_n_per_m must be numeric")
+    if not math.isfinite(contact_stiffness) or contact_stiffness <= 0.0:
+        raise ValueError(
+            "config contact_stiffness_n_per_m must be a positive finite number "
+            "(got {!r})".format(raw_stiffness)
+        )
     return {
         "sample_count": sample_count,
         "profile": profile,
@@ -442,9 +597,7 @@ def _normalize_config(config, context):
         "drop_height_m": drop_height_m,
         "drop_surface": drop_surface,
         "drop_orientation": drop_orientation,
-        "contact_stiffness_n_per_m": _finite_float(
-            source.get("contact_stiffness_n_per_m"), CONTACT_STIFFNESS_N_PER_M
-        ),
+        "contact_stiffness_n_per_m": contact_stiffness,
         "components": _normalize_components(source.get("components")),
         "worst_case": worst_case,
     }
@@ -496,16 +649,6 @@ def _normalize_worst_case(raw):
     }
 
 
-def _finite_float(value, default=0.0):
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return default
-    if not math.isfinite(number):
-        return default
-    return number
-
-
 def _validate_context(context):
     if not isinstance(context, dict):
         raise ValueError("population context must be a dict with mass_kg, inertia_kg_m2, support")
@@ -530,25 +673,31 @@ def _apply_unit_dimensions(spec, params):
     ctype = applied["type"]
     # Tolerance scaling applies to spec-provided design values only; absent
     # fields keep the component module's design defaults (the population
-    # must not silently override the platform reference design).
-    if ctype == "screw" and "preload_n" in applied:
-        applied["preload_n"] = float(applied["preload_n"]) * params["screw_preload_scale"]
-    elif ctype == "clip" and "beam_thickness_m" in applied:
-        applied["beam_thickness_m"] = (
-            float(applied["beam_thickness_m"]) * params["clip_thickness_scale"]
-        )
-    elif ctype == "pcb" and "thickness_m" in applied:
-        applied["thickness_m"] = (
-            float(applied["thickness_m"]) * params["pcb_thickness_scale"]
-        )
-    elif ctype == "adhesive" and "area_m2" in applied:
-        applied["area_m2"] = float(applied["area_m2"]) * params["adhesive_area_scale"]
-    elif ctype == "battery":
-        applied["battery_offset_m"] = params["battery_offset_m"]
-    elif ctype == "switch" and "actuation_force_n" in applied:
-        applied["actuation_force_n"] = (
-            float(applied["actuation_force_n"]) * params["switch_force_scale"]
-        )
+    # must not silently override the platform reference design).  A spec
+    # field that is missing or non-numeric is left untouched here; the
+    # analyzer stage reports the component as not_evaluated instead of
+    # crashing the run.
+    try:
+        if ctype == "screw" and "preload_n" in applied:
+            applied["preload_n"] = float(applied["preload_n"]) * params["screw_preload_scale"]
+        elif ctype == "clip" and "beam_thickness_m" in applied:
+            applied["beam_thickness_m"] = (
+                float(applied["beam_thickness_m"]) * params["clip_thickness_scale"]
+            )
+        elif ctype == "pcb" and "thickness_m" in applied:
+            applied["thickness_m"] = (
+                float(applied["thickness_m"]) * params["pcb_thickness_scale"]
+            )
+        elif ctype == "adhesive" and "area_m2" in applied:
+            applied["area_m2"] = float(applied["area_m2"]) * params["adhesive_area_scale"]
+        elif ctype == "battery":
+            applied["battery_offset_m"] = params["battery_offset_m"]
+        elif ctype == "switch" and "actuation_force_n" in applied:
+            applied["actuation_force_n"] = (
+                float(applied["actuation_force_n"]) * params["switch_force_scale"]
+            )
+    except (TypeError, ValueError):
+        return applied
     return applied
 
 
@@ -692,19 +841,43 @@ def _run_worst_case(config, context, usage, diagnostics):
     analysis = _analyze_components(applied_specs, component_context)
     component_rows = []
     any_component_fail = False
+    any_unevaluated = False
     for result in analysis:
-        failed = result.get("status") == "fail"
-        if failed:
+        outcome = result.get("status", "not_evaluated")
+        if outcome == "fail":
             any_component_fail = True
+        elif outcome in _UNEVALUATED_OUTCOMES:
+            any_unevaluated = True
         component_rows.append(
             {
                 "component_id": result.get("component_id", "unknown"),
                 "type": result.get("type", "unknown"),
-                "status": "fail" if failed else "ok",
+                "status": outcome,
                 "usage_ratio": _r(float(result.get("usage_ratio") or 0.0)),
             }
         )
-    verdict = "fail" if (shell_failed or any_component_fail) else "pass"
+    if shell_failed or any_component_fail:
+        verdict = "fail"
+    elif any_unevaluated:
+        # A component that could not be evaluated must never make the unit
+        # look like a pass.
+        verdict = "unevaluated"
+    else:
+        verdict = "pass"
+    assumptions = [
+        "every tolerance at its worst-case band edge (tolerance_scale = {})".format(ts),
+        "deterministic — no sampling, no CI; replay requires only the same config",
+        "worst-case drop at {:.2f} m, {} orientation, maximum restitution/friction".format(
+            wc["drop_height"], wc["orientation"]
+        ),
+        "physical-model confidence: screening (uncalibrated closed-form laws)",
+    ]
+    if any_unevaluated:
+        assumptions.append(
+            "component analysis incomplete: unevaluated components are disclosed "
+            "as not_evaluated/unsupported/insufficient_evidence/invalid_input, "
+            "never treated as passing"
+        )
     return {
         "mode": "deterministic_worst_case",
         "sample_count": 1,
@@ -723,14 +896,11 @@ def _run_worst_case(config, context, usage, diagnostics):
         },
         "components": component_rows,
         "verdict": verdict,
-        "assumptions": [
-            "every tolerance at its worst-case band edge (tolerance_scale = {})".format(ts),
-            "deterministic — no sampling, no CI; replay requires only the same config",
-            "worst-case drop at {:.2f} m, {} orientation, maximum restitution/friction".format(
-                wc["drop_height"], wc["orientation"]
-            ),
-            "physical-model confidence: screening (uncalibrated closed-form laws)",
-        ],
+        "units_failed": 1 if verdict == "fail" else 0,
+        "units_unevaluated": 1 if any_unevaluated else 0,
+        "evaluated_units": 0 if any_unevaluated else 1,
+        "analysis_incomplete": any_unevaluated,
+        "assumptions": assumptions,
         "diagnostics": diagnostics + ["mode: deterministic worst-case (no Monte Carlo sampling)"],
         "model": _model(config, context),
     }
@@ -804,23 +974,39 @@ def _fallback_ratio(spec, ctx, ctype):
         remaining_mm = max(0.0, initial_mm - rate_mm * max(0.0, slide_km))
         ratio = 1.0 - remaining_mm / initial_mm if initial_mm > 0.0 else 0.0
     else:
-        ratio = 0.0
+        # Unknown component type: no screening law exists, so the component
+        # is NOT evaluated — it must not silently count as a pass.
+        return 0.0, "not_evaluated"
     if not math.isfinite(ratio) or ratio < 0.0:
         ratio = 0.0
-    return ratio, "fail" if ratio >= 1.0 else "ok"
+    return ratio, "fail" if ratio >= 1.0 else "pass"
 
 
 def _fallback_analyze_one(spec, ctx):
-    ctype = spec.get("type", "unknown")
-    ratio, status = _fallback_ratio(spec, ctx, ctype)
-    return {
-        "component_id": spec.get("component_id", "unknown"),
-        "type": ctype,
-        "status": status,
-        "usage_ratio": _r(ratio),
-        "margin": _r(1.0 - ratio),
-        "model": "fallback_screening_v1",
-    }
+    # A missing/invalid spec field must never crash the population run; the
+    # component is reported as not_evaluated instead.
+    try:
+        ctype = spec.get("type", "unknown")
+        ratio, status = _fallback_ratio(spec, ctx, ctype)
+        return {
+            "component_id": spec.get("component_id", "unknown"),
+            "type": ctype,
+            "status": status,
+            "usage_ratio": _r(ratio),
+            "usage_ratio_raw": ratio,
+            "margin": _r(1.0 - ratio),
+            "model": "fallback_screening_v1",
+        }
+    except Exception:
+        return {
+            "component_id": spec.get("component_id", "unknown"),
+            "type": spec.get("type", "unknown"),
+            "status": "not_evaluated",
+            "usage_ratio": 0.0,
+            "usage_ratio_raw": 0.0,
+            "margin": None,
+            "model": "fallback_screening_v1_error",
+        }
 
 
 def _fallback_analyze(specs, ctx):
@@ -841,11 +1027,8 @@ def _normalize_module_results(raw, specs):
             get = lambda key, default=None: getattr(item, key, default)
         component_id = get("component_id", None) or spec.get("component_id", "unknown")
         ctype = get("type", None) or get("component_type", None) or spec.get("type", "unknown")
-        status = get("status", None) or get("verdict", None) or get("result", None) or "ok"
-        status = str(status).strip().lower()
-        failed = status in (
-            "fail", "failed", "critical", "failure", "exceeded", "over_limit", "unsupported",
-        )
+        status = get("status", None) or get("verdict", None) or get("result", None)
+        outcome = _normalize_component_status(status)
         usage_ratio = get("usage_ratio", None)
         if usage_ratio is None:
             usage_ratio = get("cycles_ratio", None)
@@ -863,7 +1046,7 @@ def _normalize_module_results(raw, specs):
             {
                 "component_id": component_id,
                 "type": ctype,
-                "status": "fail" if failed else "ok",
+                "status": outcome,
                 "usage_ratio": _r(usage_ratio),
                 "usage_ratio_raw": usage_ratio,
                 "margin": None,
@@ -875,6 +1058,23 @@ def _normalize_module_results(raw, specs):
 
 def _analyze_components(component_specs, component_context):
     results = []
+    known_types = set(ELEC_TYPES) | set(MECH_TYPES)
+    for spec in component_specs:
+        if spec["type"] not in known_types:
+            # Unknown component type: no analyzer exists, so the component is
+            # NOT evaluated — it must not be silently dropped or counted as a
+            # pass.
+            results.append(
+                {
+                    "component_id": spec.get("component_id", "unknown"),
+                    "type": spec.get("type", "unknown"),
+                    "status": "not_evaluated",
+                    "usage_ratio": 0.0,
+                    "usage_ratio_raw": 0.0,
+                    "margin": None,
+                    "model": "unknown_component_type",
+                }
+            )
     elec_specs = [spec for spec in component_specs if spec["type"] in ELEC_TYPES]
     mech_specs = [spec for spec in component_specs if spec["type"] in MECH_TYPES]
     for module, specs in ((_elec_module(), elec_specs), (_mech_module(), mech_specs)):
@@ -943,6 +1143,7 @@ def _process_unit(index, config, context):
     applied_specs = [_apply_unit_dimensions(spec, params) for spec in config["components"]]
     analysis = _analyze_components(applied_specs, component_context)
     failed_components = []
+    unevaluated_components = []
     worst_ratio = 0.0
     worst_component_id = None
     for result in analysis:
@@ -950,11 +1151,20 @@ def _process_unit(index, config, context):
         if ratio > worst_ratio:
             worst_ratio = ratio
             worst_component_id = result.get("component_id")
-        if result.get("status") == "fail":
+        outcome = result.get("status", "not_evaluated")
+        if outcome == "fail":
             failed_components.append(
                 {
                     "component_id": result.get("component_id", "unknown"),
                     "type": result.get("type", "unknown"),
+                }
+            )
+        elif outcome in _UNEVALUATED_OUTCOMES:
+            unevaluated_components.append(
+                {
+                    "component_id": result.get("component_id", "unknown"),
+                    "type": result.get("type", "unknown"),
+                    "status": outcome,
                 }
             )
     # SHELL analysis: the primary engineering question.  The nominal
@@ -1001,6 +1211,8 @@ def _process_unit(index, config, context):
         "seed": seed,
         "failed": bool(failed_components),
         "failed_components": failed_components,
+        "unevaluated": bool(unevaluated_components),
+        "unevaluated_components": unevaluated_components,
         "worst_ratio": _r(worst_ratio),
         "worst_ratio_raw": worst_ratio,
         "worst_component_id": worst_component_id,
@@ -1036,6 +1248,8 @@ def _parameter_values(params):
 def _empty_stats(component_ids):
     return {
         "unit_failures": 0,
+        "unit_unevaluated": 0,
+        "unit_unevaluated_clean": 0,
         "component_failures": dict.fromkeys(component_ids, 0),
         "worst_component_counts": dict.fromkeys(component_ids, 0),
         "ratio_bins": [0] * 11,
@@ -1049,6 +1263,16 @@ def _empty_stats(component_ids):
 def _fold_unit(stats, record, params):
     if record["failed"]:
         stats["unit_failures"] += 1
+    if record.get("unevaluated"):
+        stats["unit_unevaluated"] += 1
+    # A unit with an unevaluated component that did NOT fail has an unknown
+    # outcome: it is excluded from the failure-rate denominator AND from the
+    # failure-time (survival) distribution, and disclosed.  A unit that BOTH
+    # failed and has an unevaluated component is a certain failure: it stays
+    # in the numerator and the denominator.
+    unevaluated_clean = record.get("unevaluated") and not record["failed"]
+    if unevaluated_clean:
+        stats["unit_unevaluated_clean"] += 1
     for failed in record["failed_components"]:
         component_id = failed.get("component_id") or "unknown"
         stats["component_failures"][component_id] = stats["component_failures"].get(component_id, 0) + 1
@@ -1060,8 +1284,11 @@ def _fold_unit(stats, record, params):
         ratio = 0.0
     # Failure-time fraction u_f = 1/r: units whose worst ratio is below 1
     # outlive the horizon (survivors); the rest are histogrammed by their
-    # failure time within the horizon.
-    if ratio >= 1.0:
+    # failure time within the horizon.  Units with an unknown outcome are
+    # excluded from the distribution entirely.
+    if unevaluated_clean:
+        pass
+    elif ratio >= 1.0:
         failure_fraction = 1.0 / ratio
         stats["ratio_bins"][min(10, int(failure_fraction * 10.0))] += 1
     else:
@@ -1099,6 +1326,8 @@ def _process_chunk(indices, config, context):
 
 def _merge_stats(total, chunk_stats):
     total["unit_failures"] += chunk_stats["unit_failures"]
+    total["unit_unevaluated"] += chunk_stats["unit_unevaluated"]
+    total["unit_unevaluated_clean"] += chunk_stats["unit_unevaluated_clean"]
     for key, value in chunk_stats["component_failures"].items():
         total["component_failures"][key] += value
     for key, value in chunk_stats["worst_component_counts"].items():
@@ -1211,11 +1440,13 @@ def _survival(bins, survivors, n):
     ``r < 1`` outlive the horizon).  ``bins`` histogram ``min(1, u_f)`` for
     the units that fail within the horizon; ``survivors`` counts the rest.
     ``S(u) = P(u_f > u)`` — the fraction of units still alive at usage
-    fraction ``u`` — so ``S(1.0) = P(r < 1) = 1 - failure_rate``.
+    fraction ``u`` — so ``S(1.0) = P(r < 1) = 1 - failure_rate``.  ``n`` is
+    the failure-rate denominator (units with a determinable outcome); units
+    with unknown outcomes are excluded from the distribution and from ``n``.
     """
     curve = []
     for step in range(1, 11):
-        fraction = (survivors + sum(bins[step:])) / n
+        fraction = (survivors + sum(bins[step:])) / n if n > 0 else 0.0
         curve.append(
             {
                 "usage_fraction": round(step / 10.0, 1),
@@ -1275,6 +1506,13 @@ def _model(config, context):
             "damage) has not yet been reached at usage fraction u (worst ratio >= u); the "
             "curve is monotonic non-increasing",
             "per-unit failure records are capped at 100 entries",
+            "component outcome vocabulary: pass/warn count as evaluated-and-non-failed; "
+            "fail counts as a failed unit; not_evaluated/unsupported/insufficient_evidence/"
+            "invalid_input are unevaluated — units with an unknown outcome (unevaluated "
+            "and not failed) are excluded from failure_rate, wilson_ci and the survival "
+            "curve and disclosed via units_unevaluated/evaluated_units/analysis_incomplete, "
+            "never silently counted as passing; failed units always count, even when "
+            "another component was unevaluated",
         ],
     }
 
@@ -1323,12 +1561,40 @@ def _aggregate_diagnostics(config, context, total, per_unit_records):
             ", ".join("{} {}".format(name, band) for name, band in MANUFACTURING_TOLERANCES)
         ),
     ]
+    if total["unit_unevaluated"] > 0:
+        excluded = total["unit_unevaluated_clean"]
+        lines.append(
+            "analysis incomplete: {} of {} units have unevaluated components "
+            "(unknown/unsupported/insufficient_evidence/invalid_input); {} unit(s) "
+            "with unknown failure status are excluded from failure_rate, wilson_ci "
+            "and the survival curve (never counted as successes) and disclosed via "
+            "units_unevaluated/evaluated_units/analysis_incomplete".format(
+                total["unit_unevaluated"], n, excluded
+            )
+        )
     return lines
 
 
 def _assemble_result(config, context, total, per_unit_records, diagnostics):
     n = config["sample_count"]
     units_failed = total["unit_failures"]
+    units_unevaluated = total["unit_unevaluated"]
+    evaluated_units = n - units_unevaluated
+    analysis_incomplete = units_unevaluated > 0
+    # The failure rate and CI are computed over the units whose failure
+    # status is DETERMINABLE: every failed unit (a unit that both failed and
+    # has an unevaluated component is a certain failure) plus the fully
+    # evaluated non-failed units.  Units with an unevaluated outcome that did
+    # not fail have an unknown status: they are excluded from the denominator
+    # (never counted as successes) and disclosed via units_unevaluated /
+    # analysis_incomplete.
+    failure_denominator = n - total["unit_unevaluated_clean"]
+    if failure_denominator > 0:
+        failure_rate = _r(units_failed / failure_denominator)
+        wilson_ci = _wilson(units_failed, failure_denominator)
+    else:
+        failure_rate = 0.0
+        wilson_ci = {"low": 0.0, "high": 0.0}
     component_ids = [spec.get("component_id") or spec["type"] for spec in config["components"]]
     component_types = {spec.get("component_id") or spec["type"]: spec["type"] for spec in config["components"]}
     component_rates = []
@@ -1394,13 +1660,16 @@ def _assemble_result(config, context, total, per_unit_records, diagnostics):
         "base_seed": config["base_seed"],
         "workers": config["workers"],
         "units_failed": units_failed,
-        "failure_rate": _r(units_failed / n),
-        "wilson_ci": _wilson(units_failed, n),
+        "units_unevaluated": units_unevaluated,
+        "evaluated_units": evaluated_units,
+        "analysis_incomplete": analysis_incomplete,
+        "failure_rate": failure_rate,
+        "wilson_ci": wilson_ci,
         "component_failure_rates": component_rates,
         "weakest_components": weakest,
         "shell": shell_block,
         "sensitivity": _sensitivity(total, n),
-        "survival": _survival(total["ratio_bins"], total["survivors"], n),
+        "survival": _survival(total["ratio_bins"], total["survivors"], failure_denominator),
         "per_unit_failures": _per_unit_failures(per_unit_records),
         "total_component_failures": sum(total["component_failures"].values()),
         "model": _model(config, context),
@@ -1425,9 +1694,10 @@ def run_population(config, context):
     """
 
     context = _validate_context(context)
-    config = _normalize_config(config, context)
+    config_diagnostics = []
+    config = _normalize_config(config, context, config_diagnostics)
     usage = profile_usage(config["profile"], config["lifespan_days"])
-    diagnostics = _base_diagnostics(config, context, usage)
+    diagnostics = config_diagnostics + _base_diagnostics(config, context, usage)
     if config["worst_case"] is not None:
         return _run_worst_case(config, context, usage, diagnostics)
     chunk_ranges = [

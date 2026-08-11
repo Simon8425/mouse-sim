@@ -290,7 +290,10 @@ class ShellSafetyIsolationTests(unittest.TestCase):
         )
         self.assertEqual(string_result["errors"], [])
         for entry in component_entries(string_result):
-            self.assertIn(entry["status"], EVALUATED_STATUSES)
+            # Non-finite spec values are invalid input for a screening model:
+            # the component is honestly reported as not_evaluated (never a
+            # silent pass).
+            self.assertIn(entry["status"], EVALUATED_STATUSES + ("not_evaluated",))
         self.assertEqual(shell_outputs(string_result), shell_outputs(base))
 
     def test_incomplete_component_data_evaluates_with_defaults(self):

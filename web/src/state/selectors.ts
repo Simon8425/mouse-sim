@@ -113,7 +113,11 @@ export function selectMassObject(state: ProjectState, id: string | null): MassOb
 
 export function selectSourceLabel(state: ProjectState): string {
   if (state.preview) {
-    return `${state.projectName || 'Project'} + ${state.preview.source_name ?? 'upload'}`;
+    const sourceName = state.preview.source_name ?? 'upload';
+    const projectName = state.projectName && state.projectName !== 'no project'
+      ? state.projectName
+      : null;
+    return projectName ? `${projectName} + ${sourceName}` : sourceName;
   }
   if (state.tempPreview) {
     return `${state.projectName || 'Project'} + ${state.tempPreview.name}`;
@@ -122,12 +126,13 @@ export function selectSourceLabel(state: ProjectState): string {
 }
 
 export function selectRunStatusLabel(state: ProjectState): {
-  text: 'Idle' | 'Running analysis…' | 'Complete' | 'Failed';
+  text: 'Idle' | 'Running…' | 'Complete' | 'Failed';
   live: boolean;
 } {
   switch (state.runStatus) {
+    case 'loading':
     case 'running':
-      return { text: 'Running analysis…', live: true };
+      return { text: 'Running…', live: true };
     case 'success':
       return { text: 'Complete', live: false };
     case 'error':

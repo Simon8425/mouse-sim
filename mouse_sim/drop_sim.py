@@ -10,6 +10,33 @@ Honest scope: the contact geometry uses extreme support vertices sampled from
 the tessellated mesh (a lightweight convex support model); the table is a
 horizontal plane at z = 0; the integrator is semi-implicit Euler at a fixed
 240 Hz timestep.  No fracture, deformation, or sub-surface contact is modeled.
+
+Coordinate and pose conventions
+-------------------------------
+* World frame: right-handed, z-up.  Gravity acts along -z with magnitude
+  ``GRAVITY_M_S2``; the support plane (table) is z = 0.
+* Body frame: the CAD/model frame of the device at rest on the table.
+  "flat" means the CAD z-axis is vertical (the identity initial orientation).
+* Initial pose: the body's lowest world-frame support point starts exactly
+  ``height_m`` above the support plane; the lateral offset shifts the
+  starting position in the world xy-plane only.
+* Orientation modes (world-frame initial quaternions, deterministic for a
+  fixed seed):
+    - "flat":   identity — the CAD z-axis is vertical (flat-face rest).
+    - "edge":   long-edge rest — 90 deg about the world X axis.
+    - "corner": corner rest — 54.7 deg about the world (1, 1, 0) axis.
+    - "random": seeded uniform orientation, deterministic from the seed.
+* Explicit pose: ``orientation`` may instead be an object
+  ``{"quaternion_wxyz": [w, x, y, z]}`` — a unit quaternion in the world
+  frame (normalized internally; -q is accepted, it is the same orientation).
+  Drop 0 then uses exactly that quaternion (no mode mapping) and drops 1+
+  keep the seeded jitter on top of the explicit pose.
+* Reproducibility: every per-drop result records the actual initial
+  orientation quaternion used (after mode mapping and any jitter), the
+  gravity direction in the body frame (what an accelerometer on the shell
+  reads at release), the initial angular velocity (world frame), the zero
+  initial velocity, and the starting pose — a physical drop recorded as a
+  pose can be re-run in simulation from the recorded numbers.
 """
 
 import math
@@ -92,11 +119,40 @@ def validate_config(config):
         raise DropSimulationError("drop_simulation.drop_count must be an integer")
     if drop_count < 1 or drop_count > 20:
         raise DropSimulationError("drop_simulation.drop_count must be between 1 and 20")
-    orientation = str(config.get("orientation", "flat")).strip().lower()
-    if orientation not in ORIENTATIONS:
-        raise DropSimulationError(
-            "drop_simulation.orientation must be one of {}".format(", ".join(ORIENTATIONS))
-        )
+    orientation = config.get("orientation", "flat")
+    explicit_quaternion = None
+    if isinstance(orientation, dict):
+        quaternion_wxyz = orientation.get("quaternion_wxyz")
+        if not isinstance(quaternion_wxyz, (list, tuple)) or len(quaternion_wxyz) != 4:
+            raise DropSimulationError(
+                "drop_simulation.orientation must be one of {} or an object "
+                "with a quaternion_wxyz list of 4 numbers".format(", ".join(ORIENTATIONS))
+            )
+        components = []
+        for component in quaternion_wxyz:
+            try:
+                numeric = float(component)
+            except (TypeError, ValueError):
+                raise DropSimulationError(
+                    "drop_simulation.orientation.quaternion_wxyz must contain numeric components"
+                )
+            if not math.isfinite(numeric):
+                raise DropSimulationError(
+                    "drop_simulation.orientation.quaternion_wxyz must contain finite components"
+                )
+            components.append(numeric)
+        if _norm(components) <= 0.0:
+            raise DropSimulationError(
+                "drop_simulation.orientation.quaternion_wxyz must have a non-zero norm"
+            )
+        orientation = "explicit"
+        explicit_quaternion = list(_normalize_quaternion(tuple(components)))
+    else:
+        orientation = str(orientation).strip().lower()
+        if orientation not in ORIENTATIONS:
+            raise DropSimulationError(
+                "drop_simulation.orientation must be one of {}".format(", ".join(ORIENTATIONS))
+            )
     spin_rps = config.get("spin_rps")
     if spin_rps is None:
         # A tumble test with no release spin degenerates into a plain drop;
@@ -135,7 +191,7 @@ def validate_config(config):
             raise DropSimulationError("drop_simulation.seed must be an integer")
         if seed < 0 or seed > 0xFFFFFFFF:
             raise DropSimulationError("drop_simulation.seed must be between 0 and 2^32-1")
-    return {
+    validated = {
         "test": test,
         "height_m": height_m,
         "surface": surface,
@@ -146,6 +202,9 @@ def validate_config(config):
         "unit_seed": unit_seed,
         "seed": seed,
     }
+    if explicit_quaternion is not None:
+        validated["orientation_quaternion_wxyz"] = explicit_quaternion
+    return validated
 
 
 def _quaternion_multiply(first, second):
@@ -593,6 +652,7 @@ def _simulate_drop(
         _quaternion_rotate(orientation_q, point)[2] for point in rel_support
     )
     position = (lateral_offset[0], lateral_offset[1], height_m - lowest_world)
+    initial_position = position
     quaternion = orientation_q
     velocity = (0.0, 0.0, 0.0)
     spin_angular = (0.0, spin_rps * 2.0 * math.pi, 0.0) if spin_rps else (0.0, 0.0, 0.0)
@@ -1059,6 +1119,7 @@ def _simulate_drop(
         "settled": settled_flag,
         "energy": energy,
         "checks": checks,
+        "initial_position": initial_position,
     }
 
 
@@ -1090,7 +1151,10 @@ def simulate(
     zero lateral offset).  Every later drop gets a deterministic, seeded
     initial-condition variation (tilt jitter, lateral drift, small release
     spin) so repeated drops are unique while staying bit-reproducible for a
-    fixed seed and configuration.
+    fixed seed and configuration.  ``orientation`` is a mode string ("flat",
+    "edge", "corner", "random") or an explicit pose dict
+    ``{"quaternion_wxyz": [w, x, y, z]}``; with an explicit pose, drop 0
+    uses exactly that orientation and drops 1+ add the seeded jitter on top.
 
     ``unit_seed`` adds a deterministic manufacturing-tolerance layer: the
     same seed always produces the same unit (mass/inertia/CoM/friction/
@@ -1114,6 +1178,7 @@ def simulate(
             "spin_rps": spin_rps,
             "mass_kg": mass_kg,
             "unit_seed": unit_seed,
+            "seed": seed,
         }
     )
     if mass_kg is None or not math.isfinite(mass_kg) or mass_kg <= 0.0:
@@ -1220,10 +1285,16 @@ def simulate(
     drop_interval_s = 0.35
     t_offset = 0.0
     for drop_index in range(config["drop_count"]):
-        orientation_q = _orientation_quaternion(config["orientation"], seed + drop_index)
-        if config["test"] == "impact" and drop_index == 0:
-            # Impact test drops onto the corner orientation for a harsher hit.
-            orientation_q = _axis_angle_quaternion((1.0, 1.0, 0.0), math.acos(1.0 / math.sqrt(3.0)))
+        explicit_quaternion = config.get("orientation_quaternion_wxyz")
+        if explicit_quaternion is not None:
+            # Explicit pose: drop 0 uses exactly the validated quaternion; no
+            # mode mapping (the impact-test corner override included).
+            orientation_q = tuple(explicit_quaternion)
+        else:
+            orientation_q = _orientation_quaternion(config["orientation"], seed + drop_index)
+            if config["test"] == "impact" and drop_index == 0:
+                # Impact test drops onto the corner orientation for a harsher hit.
+                orientation_q = _axis_angle_quaternion((1.0, 1.0, 0.0), math.acos(1.0 / math.sqrt(3.0)))
         tilt_deg = 0.0
         lateral_offset = (0.0, 0.0)
         initial_angular = (0.0, 0.0, 0.0)
@@ -1266,8 +1337,20 @@ def simulate(
         peak_energy = max((item["kinetic_energy_j"] for item in impacts), default=0.0)
         peak_raw_energy = max((item["raw_kinetic_energy_j"] for item in impacts), default=0.0)
         actual_orientation = config["orientation"]
-        if config["test"] == "impact" and drop_index == 0:
+        if config["test"] == "impact" and drop_index == 0 and explicit_quaternion is None:
             actual_orientation = "corner"
+        # Reproducibility record: the exact initial conditions this drop ran
+        # with (world-frame quaternion, body-frame gravity at release, release
+        # angular velocity, zero initial velocity, starting pose).
+        gravity_body = _quaternion_rotate(
+            _conjugate_quaternion(orientation_q), (0.0, 0.0, -1.0)
+        )
+        if config["test"] == "tumble" and config["spin_rps"]:
+            release_angular = _add(
+                (0.0, config["spin_rps"] * 2.0 * math.pi, 0.0), initial_angular
+            )
+        else:
+            release_angular = initial_angular
         drops.append(
             {
                 "index": drop_index,
@@ -1280,6 +1363,11 @@ def simulate(
                 "peak_kinetic_energy_j": round(peak_energy, 6),
                 "peak_raw_kinetic_energy_j": round(peak_raw_energy, 6),
                 "orientation": actual_orientation,
+                "orientation_quaternion_wxyz": [float(c) for c in orientation_q],
+                "gravity_vector_body": [float(c) for c in gravity_body],
+                "initial_angular_velocity_rad_s": [float(c) for c in release_angular],
+                "initial_velocity_m_s": [0.0, 0.0, 0.0],
+                "starting_pose_m": [float(c) for c in drop_result["initial_position"]],
                 "tilt_deg": round(tilt_deg, 4),
                 "lateral_offset_m": [
                     round(lateral_offset[0], 6),
@@ -1334,6 +1422,13 @@ def simulate(
         "restitution": round(drop_restitution, 6),
         "friction": round(drop_friction, 6),
         "com_offset_m": [round(value, 6) for value in effective_com],
+        # Reference (drop 0) initial conditions, so the run is replayable from
+        # the recorded numbers; per-drop values may differ for drops 1+.
+        "orientation_quaternion_wxyz": drops[0]["orientation_quaternion_wxyz"],
+        "gravity_vector_body": drops[0]["gravity_vector_body"],
+        "initial_angular_velocity_rad_s": drops[0]["initial_angular_velocity_rad_s"],
+        "initial_velocity_m_s": [0.0, 0.0, 0.0],
+        "starting_pose_m": drops[0]["starting_pose_m"],
         "jitter": {
             "max_tilt_deg": JITTER_MAX_TILT_DEG,
             "max_lateral_fraction": JITTER_MAX_LATERAL_FRACTION,

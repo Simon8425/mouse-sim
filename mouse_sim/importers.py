@@ -1458,6 +1458,13 @@ def _parse_step(data):
     ``(geometry, source_units, diagnostics)``.  Unsupported advanced (NURBS)
     B-reps return ``(None, None, (blocker_diagnostic,))``; malformed input
     raises ``ValueError``.
+
+    Topology that removes material (face inner bounds / holes and
+    BREP_WITH_VOIDS void shells) cannot be represented by the faceted
+    importer.  Silently dropping it would turn a shell with holes or voids
+    into a closed solid whose reported volume includes the missing material,
+    so any such file returns ``(None, None, (blocker_diagnostic,))`` and the
+    geometry is marked unsupported instead of certifying a wrong volume.
     """
     text = data.decode("utf-8-sig")
     data_section = _data_section(text)
@@ -1654,22 +1661,24 @@ def _parse_step(data):
         )
         return None, None, (diagnostic,)
     if skipped_holes:
-        diagnostics.append(
+        return None, None, (
             _diagnostic(
-                "step_inner_bounds_skipped",
-                "warning",
-                "STEP face inner bounds (holes) are not cut into the imported mesh",
+                "step_topology_unsupported",
+                "blocker",
+                "STEP face with inner bounds (holes) is not supported by the faceted importer; imported volume may be overestimated; mass is not certified",
+                kind="holes",
                 count=str(skipped_holes),
-            )
+            ),
         )
     if skipped_void_shells:
-        diagnostics.append(
+        return None, None, (
             _diagnostic(
-                "step_void_shells_skipped",
-                "warning",
-                "STEP BREP_WITH_VOIDS base geometry was imported but void shells were not subtracted",
+                "step_topology_unsupported",
+                "blocker",
+                "STEP BREP_WITH_VOIDS void shells are not supported by the faceted importer; imported volume may be overestimated; mass is not certified",
+                kind="voids",
                 count=str(skipped_void_shells),
-            )
+            ),
         )
     if arc_edges:
         diagnostics.append(

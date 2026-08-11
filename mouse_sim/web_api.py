@@ -58,7 +58,7 @@ _ALLOWED_REQUEST_SCHEMA_IDS = (None, "", "gms.project/1")
 # tens of seconds).  Serialize normalize requests so duplicate or concurrent
 # uploads cannot stack several full parses in memory at once.  The lock is
 # scoped to the STEP kernel path only (see handle_normalize).
-_NORMALIZE_LOCK = threading.Lock()
+# Removed _NORMALIZE_LOCK for parser concurrency
 # Analysis is also memory heavy; bounded concurrency prevents several large
 # pipelines from running at once.
 _ANALYZE_SEMAPHORE = threading.BoundedSemaphore(2)
@@ -222,6 +222,31 @@ def register_step_asset(asset):
     return public
 
 
+def _load_registered_asset_objects(asset_id):
+    """Load normalized STEP part geometry for a server-side analysis reference."""
+    with _STEP_ASSET_REGISTRY_LOCK:
+        parts_path = _STEP_ASSET_PARTS_REGISTRY.get(asset_id)
+    if parts_path is None:
+        return None
+    try:
+        with parts_path.open("r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, ValueError, TypeError):
+        return None
+    raw_parts = payload.get("parts") if isinstance(payload, dict) else None
+    if not isinstance(raw_parts, list):
+        return None
+    objects = []
+    for part in raw_parts:
+        if not isinstance(part, dict):
+            continue
+        object_id = str(part.get("id", "")).strip()
+        geometry = part.get("geometry")
+        if object_id and isinstance(geometry, dict):
+            objects.append({"id": object_id, "geometry": geometry})
+    return objects or None
+
+
 def _quantity_si(properties, field_name):
     quantity = getattr(properties, field_name, None) if properties is not None else None
     return quantity.value_si if quantity is not None else None
@@ -306,6 +331,12 @@ def handle_health(config):
     from .physics import SOLVER_CAPABILITIES
     from .step_kernel import kernel_available
 
+    try:
+        step_kernel_available = bool(kernel_available())
+    except Exception:
+        # The optional FreeCAD/OCCT kernel is not required for a healthy
+        # service: report availability instead of failing the whole probe.
+        step_kernel_available = False
     return (
         200,
         {
@@ -320,7 +351,7 @@ def handle_health(config):
             "deterministic": True,
             "step_backend": "auto",
             "step_kernel_backend": "freecad-occt",
-            "step_kernel_available": kernel_available(),
+            "step_kernel_available": step_kernel_available,
             "advanced_step_backend": "kernel",
             "advanced_step_uses_kernel": True,
         },
@@ -412,62 +443,73 @@ def handle_normalize(config, query, body):
     name = sanitize_display_name((query.get("name") or [None])[0])
     asset_dir = Path(config.cache_dir) / "step-assets" if config.cache_dir is not None else None
     # The serialize lock only guards the heavy STEP kernel path; lightweight
-    # formats (json/obj/stl) stay concurrent.
-    if fmt == "step":
-        lock_context = _NORMALIZE_LOCK
-    else:
-        lock_context = nullcontext()
-    with lock_context:
-        try:
-            from .importers import load_geometry
-        except Exception as exc:
-            return make_web_error(500, "E_INTERNAL", "geometry importer is unavailable: {}".format(exc))
-        try:
-            result = load_geometry(
-                body,
-                fmt=fmt,
-                units=units,
-                step_backend="auto",
-                step_asset_dir=asset_dir,
-            )
-        except UnitError as exc:
-            diagnostic = {
-                "code": "invalid_units",
-                "severity": "blocker",
-                "message": str(exc),
-                "details": {},
-            }
-            return _preview_failure(fmt, units, [diagnostic], name)
-        except ValueError as exc:
-            diagnostic = {
-                "code": "parse_failed",
-                "severity": "error",
-                "message": str(exc),
-                "details": {},
-            }
-            return _preview_failure(fmt, units, [diagnostic], name)
-        if result is None or not result.is_supported:
-            diagnostics = [
-                item.to_dict() for item in (result.diagnostics if result is not None else ())
-            ]
-            return _preview_failure(fmt, units, diagnostics, name)
-        raw_display_asset = getattr(result, "display_asset", None)
-        display_asset = register_step_asset(raw_display_asset) if raw_display_asset is not None else None
-        response = {
-            "schema_id": GEOMETRY_PREVIEW_SCHEMA_ID,
-            "supported": True,
-            "format": result.format,
-            "source_units": result.source_units,
-            "geometry": result.geometry.to_dict(),
-            "diagnostics": [item.to_dict() for item in result.diagnostics],
-            "source_name": result.source_name or name,
-        }
-        if display_asset is not None:
-            response["display_asset"] = display_asset
-        return (
-            200,
-            response,
+    try:
+        from .importers import load_geometry
+        from .step_kernel import StepKernelFailure, StepKernelUnavailable
+    except Exception as exc:
+        return make_web_error(500, "E_INTERNAL", "geometry importer is unavailable: {}".format(exc))
+    try:
+        result = load_geometry(
+            body,
+            fmt=fmt,
+            units=units,
+            step_backend="auto",
+            step_asset_dir=asset_dir,
         )
+    except UnitError as exc:
+        diagnostic = {
+            "code": "invalid_units",
+            "severity": "blocker",
+            "message": str(exc),
+            "details": {},
+        }
+        return _preview_failure(fmt, units, [diagnostic], name)
+    except StepKernelUnavailable as exc:
+        diagnostic = {
+            "code": "step_kernel_unavailable",
+            "severity": "blocker",
+            "message": str(exc),
+            "details": {},
+        }
+        return _preview_failure(fmt, units, [diagnostic], name)
+    except StepKernelFailure as exc:
+        diagnostic = {
+            "code": "step_kernel_failed",
+            "severity": "blocker",
+            "message": str(exc),
+            "details": {},
+        }
+        return _preview_failure(fmt, units, [diagnostic], name)
+    except ValueError as exc:
+        diagnostic = {
+            "code": "parse_failed",
+            "severity": "error",
+            "message": str(exc),
+            "details": {},
+        }
+        return _preview_failure(fmt, units, [diagnostic], name)
+    if result is None or not result.is_supported:
+        diagnostics = [
+            item.to_dict() for item in (result.diagnostics if result is not None else ())
+        ]
+        return _preview_failure(fmt, units, diagnostics, name)
+    raw_display_asset = getattr(result, "display_asset", None)
+    display_asset = register_step_asset(raw_display_asset) if raw_display_asset is not None else None
+    response = {
+        "schema_id": GEOMETRY_PREVIEW_SCHEMA_ID,
+        "supported": True,
+        "format": result.format,
+        "source_units": result.source_units,
+        "geometry": result.geometry.to_dict(),
+        "diagnostics": [item.to_dict() for item in result.diagnostics],
+        "source_name": result.source_name or name,
+    }
+    if display_asset is not None:
+        response["display_asset"] = display_asset
+    return (
+        200,
+        response,
+    )
 
 
 def _validate_analysis_envelope(payload):
@@ -517,7 +559,10 @@ def _validate_analysis_envelope(payload):
     objects = request.get("objects")
     has_objects = isinstance(objects, (list, tuple, dict)) and len(objects) > 0
     has_geometry = "geometry" in request
-    if not has_objects and not has_geometry:
+    has_geometry_asset = isinstance(request.get("geometry_asset_id"), str) and bool(
+        request.get("geometry_asset_id").strip()
+    )
+    if not has_objects and not has_geometry and not has_geometry_asset:
         return make_web_error(
             422,
             "UNSUPPORTED_ARTIFACT",
@@ -558,29 +603,16 @@ def _result_error_response(result):
 def slim_result_for_web(result):
     """Return a response copy with geometry-heavy manifest inputs replaced.
 
-    The pipeline manifest snapshots the full request for reproducibility and
-    cache verification, but the web client only consumes the manifest hashes.
-    Echoing per-object meshes (tens of MB) back in every analyze response
-    dominates the payload; the objects entry is replaced by its object count
-    and the canonical sha256 already computed by the pipeline. Everything else
-    is shared unchanged and stays byte-identical to the pipeline result.
+    W5-04 follow-up: the manifest was previously slimmed by replacing
+    ``manifest.inputs.objects`` with a count/sha256 summary while keeping the
+    original ``manifest_hash`` — the served document no longer matched its
+    recorded hash, so ``reproduce_from_manifest`` REJECTED every web-served
+    manifest (replay impossible on the web path).  The manifest is the
+    certification document: it must stay byte-identical to the pipeline
+    result.  Geometry-heavy echoes elsewhere in the result payload are
+    trimmed, never the manifest.
     """
     slim = dict(result)
-    manifest = result.get("manifest")
-    if isinstance(manifest, dict):
-        manifest_slim = dict(manifest)
-        inputs = manifest.get("inputs")
-        if isinstance(inputs, dict) and "objects" in inputs:
-            input_hashes = manifest.get("input_hashes")
-            raw = inputs["objects"]
-            count = len(raw) if isinstance(raw, (list, tuple, dict)) else 0
-            summary = {"count": count, "sha256": None}
-            if isinstance(input_hashes, dict):
-                summary["sha256"] = input_hashes.get("objects")
-            slim_inputs = dict(inputs)
-            slim_inputs["objects"] = summary
-            manifest_slim["inputs"] = slim_inputs
-        slim["manifest"] = manifest_slim
     return slim
 
 
@@ -595,6 +627,44 @@ def handle_analyze(config, cache, payload):
     request = payload["request"]
     options = payload.get("options")
     pipeline_request = dict(request)
+    asset_id = pipeline_request.get("geometry_asset_id")
+    if asset_id is not None:
+        if not isinstance(asset_id, str) or not _STEP_ASSET_ID_RE.fullmatch(asset_id):
+            return make_web_error(422, "E_INVALID_ASSET", "geometry_asset_id is not a registered STEP asset")
+        asset_objects = _load_registered_asset_objects(asset_id)
+        if asset_objects is None:
+            return make_web_error(422, "E_ASSET_NOT_FOUND", "registered STEP geometry is unavailable")
+        asset_by_id = {str(item["id"]): item for item in asset_objects}
+        requested_objects = pipeline_request.get("objects")
+        if isinstance(requested_objects, list):
+            resolved_objects = []
+            for raw_object in requested_objects:
+                if not isinstance(raw_object, dict):
+                    continue
+                object_id = str(raw_object.get("id", raw_object.get("name", ""))).strip()
+                asset_object = asset_by_id.get(object_id)
+                if asset_object is None:
+                    continue
+                resolved = dict(asset_object)
+                resolved.update(raw_object)
+                resolved["geometry"] = asset_object["geometry"]
+                resolved_objects.append(resolved)
+            pipeline_request["objects"] = resolved_objects or asset_objects
+        elif isinstance(requested_objects, dict):
+            resolved_objects = []
+            for object_id, raw_object in requested_objects.items():
+                raw = dict(raw_object) if isinstance(raw_object, dict) else {}
+                asset_object = asset_by_id.get(str(object_id))
+                if asset_object is None:
+                    continue
+                resolved = dict(asset_object)
+                resolved.update(raw)
+                resolved["id"] = str(object_id)
+                resolved["geometry"] = asset_object["geometry"]
+                resolved_objects.append(resolved)
+            pipeline_request["objects"] = resolved_objects or asset_objects
+        else:
+            pipeline_request["objects"] = asset_objects
     use_cache = True
     if options is not None:
         use_cache = bool(options.get("use_cache", True))

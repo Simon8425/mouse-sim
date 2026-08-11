@@ -15,3 +15,5 @@ reports/
 
 # User-provided CAD test assets
 G3-20260320.stp
+
+.dev-cache/

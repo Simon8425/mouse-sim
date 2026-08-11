@@ -176,17 +176,17 @@ const mockResult: PipelineResult = {
 };
 
 describe('Settings modal', () => {
-  it('renders engine health and the empty state', () => {
+  it('renders the settings dialog with its cards', () => {
     renderPanel([{ type: 'HEALTH_OK', health: mockHealth }]);
 
     expect(screen.getByRole('dialog', { name: 'Settings' })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Settings' })).toBeInTheDocument();
-    expect(screen.getByText('Engine health')).toBeInTheDocument();
-    expect(screen.getByText('json')).toBeInTheDocument();
-    expect(screen.getByText('shell_navier_v1')).toBeInTheDocument();
-    expect(screen.getByText('on')).toBeInTheDocument();
-
-    expect(screen.getAllByText('Idle').length).toBeGreaterThan(0);
+    expect(screen.getByRole('heading', { name: 'Materials' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Population analysis' })).toBeInTheDocument();
+    // Engine/API status is no longer surfaced in the settings panel.
+    expect(screen.queryByRole('heading', { name: 'Engine status' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/API/)).not.toBeInTheDocument();
+    expect(screen.queryByText('on')).not.toBeInTheDocument();
   });
 
   it('closes on Escape and on the close button', async () => {
@@ -201,69 +201,32 @@ describe('Settings modal', () => {
     expect(onClose).toHaveBeenCalledTimes(2);
   });
 
-  it('shows fidelity state, not-simulated chips, surrogate badge, and metrics from a result', () => {
+  it('no longer shows fidelity, workspace, or result metrics groups', () => {
     renderPanel([
       { type: 'HEALTH_OK', health: mockHealth },
       { type: 'LOAD_BASELINE_OK', project: mockBaselineProject, name: 'mouse_baseline' },
-      { type: 'ANALYZE_START', version: 1 },
-      { type: 'ANALYZE_OK', version: 1, result: mockResult },
+      { type: 'ANALYZE_START', version: 1, requestKey: 'k1' },
+      { type: 'ANALYZE_OK', version: 1, requestKey: 'k1', result: mockResult },
     ]);
 
-    expect(screen.getByText('Inconclusive')).toBeInTheDocument();
-    expect(screen.getByText(/confidence/)).toBeInTheDocument();
-    expect(screen.getByText('fatigue')).toBeInTheDocument();
-    expect(screen.getByText('creep')).toBeInTheDocument();
-    expect(screen.getByText('Exploration only')).toBeInTheDocument();
-    expect(screen.getByText(/screening_surrogate_v1/)).toBeInTheDocument();
-    expect(screen.getByText('69.6 g')).toBeInTheDocument();
-    expect(screen.getByText('3')).toBeInTheDocument();
-    expect(screen.getByText(/gates evaluated/)).toBeInTheDocument();
+    expect(screen.queryByText('Fidelity & Results')).not.toBeInTheDocument();
+    expect(screen.queryByText('Workspace Mode & Source')).not.toBeInTheDocument();
+    expect(screen.queryByText('Inconclusive')).not.toBeInTheDocument();
+    expect(screen.queryByText('69.6 g')).not.toBeInTheDocument();
+    expect(screen.queryByText(/gates evaluated/)).not.toBeInTheDocument();
+    // The remaining cards still render; the physical-shell-validation
+    // campaign editor is no longer part of Settings.
+    expect(screen.queryByRole('heading', { name: 'Engine status' })).not.toBeInTheDocument();
+    expect(screen.getByText('Population analysis')).toBeInTheDocument();
+    expect(screen.queryByText('Physical Shell Validation')).not.toBeInTheDocument();
   });
 
-  it('renders the Model Quality control with four options', () => {
+  it('no longer renders the Model Quality selector (quality is pinned to low)', () => {
     renderPanel();
 
-    const group = screen.getByRole('radiogroup', { name: 'Model quality' });
-    expect(group).toBeInTheDocument();
-    expect(screen.getByText('Model Quality')).toBeInTheDocument();
-
-    const options = screen.getAllByRole('radio');
-    expect(options).toHaveLength(4);
-    expect(screen.getByRole('radio', { name: 'LOW' })).toBeInTheDocument();
-    expect(screen.getByRole('radio', { name: 'MEDIUM' })).toBeInTheDocument();
-    expect(screen.getByRole('radio', { name: 'HIGH' })).toBeInTheDocument();
-    expect(screen.getByRole('radio', { name: 'ULTRA' })).toBeInTheDocument();
-
-    expect(
-      screen.getByText(/rendering only/i),
-    ).toBeInTheDocument();
-  });
-
-  it('defaults the active quality to the detected tier when qualityTier is null', () => {
-    renderPanel([], vi.fn(), (state) => {
-      expect(state.qualityTier).toBeNull();
-    });
-
-    const checked = screen.getAllByRole('radio').filter((option) =>
-      option.getAttribute('aria-checked') === 'true',
-    );
-    expect(checked).toHaveLength(1);
-  });
-
-  it('selecting ULTRA dispatches SET_QUALITY_TIER with ultra', async () => {
-    const user = userEvent.setup();
-    const qualityTiers: (string | null)[] = [];
-    renderPanel([], vi.fn(), (state) => {
-      qualityTiers.push(state.qualityTier);
-    });
-
-    await user.click(screen.getByRole('radio', { name: 'ULTRA' }));
-
-    expect(screen.getByRole('radio', { name: 'ULTRA' })).toHaveAttribute(
-      'aria-checked',
-      'true',
-    );
-    expect(qualityTiers[qualityTiers.length - 1]).toBe('ultra');
+    expect(screen.queryByRole('radiogroup', { name: 'Model quality' })).toBeNull();
+    expect(screen.queryByText('Model Quality')).toBeNull();
+    expect(screen.getByText('Materials')).toBeInTheDocument();
   });
 
   it('renders the Default Material select and dispatches SET_DEFAULT_MATERIAL on change', async () => {
@@ -313,7 +276,7 @@ describe('Settings modal', () => {
     expect(defaultKeys[defaultKeys.length - 1]).toBe('ABS');
   });
 
-  it('dispatches RUN_POPULATION from the worst-case button when geometry is loaded', async () => {
+  it('dispatches RUN_POPULATION without worst_case from the Monte Carlo button', async () => {
     const user = userEvent.setup();
     let capturedDraft: Record<string, unknown> | null | undefined;
     let runNonce = -1;
@@ -326,13 +289,13 @@ describe('Settings modal', () => {
       },
     );
 
-    expect(screen.getByText('Worst-case population analysis')).toBeInTheDocument();
+    expect(screen.getByText('Population analysis')).toBeInTheDocument();
     expect(
-      screen.getByText(/Simulates 10,000 manufactured units/i),
+      screen.getByText(/Monte Carlo simulates 10,000 manufactured units/i),
     ).toBeInTheDocument();
 
     const button = screen.getByRole('button', {
-      name: 'Run worst-case population analysis',
+      name: 'Run Monte Carlo population (10k units)',
     });
     expect(button).toBeEnabled();
     await user.click(button);
@@ -340,32 +303,72 @@ describe('Settings modal', () => {
     await waitFor(() => {
       expect(runNonce).toBe(1);
     });
-    expect(capturedDraft?.population).toEqual({
+    const population = capturedDraft?.population as Record<string, unknown>;
+    expect(population).toEqual({
       sample_count: 10000,
       profile: 'esports_fps',
       lifespan_days: 730,
     });
+    expect(population.worst_case).toBeUndefined();
   });
 
-  it('disables the worst-case population button without geometry', () => {
-    renderPanel();
-    const button = screen.getByRole('button', {
-      name: 'Run worst-case population analysis',
+  it('dispatches RUN_POPULATION with the deterministic worst_case spec from the worst-case button', async () => {
+    const user = userEvent.setup();
+    let capturedDraft: Record<string, unknown> | null | undefined;
+    let runNonce = -1;
+    renderPanel(
+      [{ type: 'LOAD_BASELINE_OK', project: mockBaselineProject, name: 'mouse_baseline' }],
+      vi.fn(),
+      (state) => {
+        capturedDraft = state.draft;
+        runNonce = state.runNonce;
+      },
+    );
+
+    const button = screen.getByRole('button', { name: 'Run deterministic worst-case' });
+    expect(button).toBeEnabled();
+    await user.click(button);
+
+    await waitFor(() => {
+      expect(runNonce).toBe(1);
     });
-    expect(button).toBeDisabled();
+    const population = capturedDraft?.population as Record<string, unknown>;
+    expect(population).toMatchObject({
+      sample_count: 10000,
+      profile: 'esports_fps',
+      lifespan_days: 730,
+    });
+    expect(population.worst_case).toEqual({
+      wall_thickness: 'min',
+      shell_modulus: 'min',
+      shell_strength: 'min',
+      shell_density: 'max',
+      com_offset: 'max',
+      drop_height: 2,
+      orientation: 'corner',
+    });
   });
 
-  it('disables the worst-case run button and shows the running label while analysis is running', () => {
+  it('disables both population buttons without geometry', () => {
+    renderPanel();
+    expect(
+      screen.getByRole('button', { name: 'Run Monte Carlo population (10k units)' }),
+    ).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Run deterministic worst-case' })).toBeDisabled();
+  });
+
+  it('disables the population buttons and shows the running label while analysis is running', () => {
     renderPanel([
       { type: 'LOAD_BASELINE_OK', project: mockBaselineProject, name: 'mouse_baseline' },
-      { type: 'ANALYZE_START', version: 1 },
+      { type: 'ANALYZE_START', version: 1, requestKey: 'k1' },
     ]);
 
-    const button = screen.getByRole('button', {
-      name: 'Run worst-case population analysis',
-    });
-    expect(button).toBeDisabled();
-    expect(screen.getByText('RUNNING — may take a few minutes')).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: 'Run Monte Carlo population (10k units)' }),
+    ).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Run deterministic worst-case' })).toBeDisabled();
+    // Both population buttons show the running label.
+    expect(screen.getAllByText('Running…')).toHaveLength(2);
   });
 
 });

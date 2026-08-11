@@ -216,8 +216,12 @@ class PhysicsTests(unittest.TestCase):
                 reference += coefficient * math.sin(m * math.pi / 2.0) * math.sin(n * math.pi / 2.0)
         order9 = shell_panel_response(a, b, t, E, nu, p, series_order=9)
         order13 = shell_panel_response(a, b, t, E, nu, p, series_order=13)
-        self.assertLessEqual(abs(order9.max_displacement_m - reference) / abs(reference), 0.02)
-        self.assertLessEqual(abs(order13.max_displacement_m - reference) / abs(reference), 0.02)
+        # The audit found the headline "0.061%" claim lived only in prose
+        # while the committed tolerance was 2% (70x the measured error of
+        # ~0.003% at order 9 vs the 300-term reference).  Tighten to a
+        # defensible bound: the series is converged to well under 0.05%.
+        self.assertLessEqual(abs(order9.max_displacement_m - reference) / abs(reference), 0.0005)
+        self.assertLessEqual(abs(order13.max_displacement_m - reference) / abs(reference), 0.0005)
         change = abs(order13.max_displacement_m - order9.max_displacement_m) / order9.max_displacement_m
         self.assertLessEqual(change, 0.05)
 

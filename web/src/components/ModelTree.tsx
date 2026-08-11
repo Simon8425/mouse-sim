@@ -8,36 +8,6 @@ import {
 } from '../state/selectors';
 import { severityTone, severityLabel } from '../lib/status';
 import { StatusBadge } from './StatusBadge';
-import { isRecord } from '../api/contracts';
-
-type ConfidenceLevel = 'high' | 'medium' | 'low' | 'unknown';
-
-function objectConfidence(
-  state: ReturnType<typeof useProjectStore>['state'],
-  id: string,
-): { label: string; level: ConfidenceLevel } {
-  const objects = state.project?.objects;
-  const raw = Array.isArray(objects)
-    ? objects.find((item) => isRecord(item) && (item.id === id || item.name === id))
-    : isRecord(objects)
-      ? objects[id]
-      : null;
-  if (!isRecord(raw) || !isRecord(raw.classification)) {
-    return { label: 'UNRATED', level: 'unknown' };
-  }
-
-  const confidence = raw.classification.confidence;
-  if (typeof confidence === 'number' && Number.isFinite(confidence)) {
-    return { label: confidence.toString(), level: 'unknown' };
-  }
-  if (typeof confidence === 'string' && confidence.trim().length > 0) {
-    const normalized = confidence.toLowerCase();
-    const level: ConfidenceLevel =
-      normalized === 'high' || normalized === 'medium' || normalized === 'low' ? normalized : 'unknown';
-    return { label: confidence.toUpperCase(), level };
-  }
-  return { label: 'UNRATED', level: 'unknown' };
-}
 
 function EyeIcon({ open }: { open: boolean }): React.ReactElement {
   return (
@@ -67,7 +37,7 @@ function EyeIcon({ open }: { open: boolean }): React.ReactElement {
   );
 }
 
-export function ModelTree(): React.ReactElement {
+export const ModelTree = React.memo(function ModelTree(): React.ReactElement {
   const { state, dispatch } = useProjectStore();
   const entries = selectObjectEntries(state);
   const severities = selectFindingSeverities(state);
@@ -103,23 +73,6 @@ export function ModelTree(): React.ReactElement {
       return true;
     });
   }, [entries, deferredSearch, filterSeverity, severities]);
-
-  const defaultCount = React.useMemo(() => {
-    const assignments = state.lastResult?.material_assignments;
-    if (Array.isArray(assignments)) {
-      return assignments.filter((a) => a.source === 'default').length;
-    }
-    return filteredEntries.filter(
-      (entry) =>
-        !state.objectMaterials[entry.id] ||
-        state.objectMaterials[entry.id] === state.defaultMaterialKey,
-    ).length;
-  }, [
-    filteredEntries,
-    state.lastResult?.material_assignments,
-    state.objectMaterials,
-    state.defaultMaterialKey,
-  ]);
 
   const listRef = React.useRef<HTMLDivElement | null>(null);
   const rowRefs = React.useRef(new Map<string, HTMLDivElement | null>());
@@ -158,17 +111,40 @@ export function ModelTree(): React.ReactElement {
     } else if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
       dispatch({ type: 'SELECT', id });
+      // Match the mouse behavior: selecting a component is an explicit
+      // request to inspect it, so open the inspector drawer alongside it.
+      dispatch({ type: 'SET_INSPECTOR_OPEN', open: true });
     }
   };
+
+  if (entries.length === 0) {
+    return (
+      <div className="model-tree model-tree--empty">
+        <div className="model-tree__header">
+          <div>
+            <h2 className="model-tree__title">Model tree</h2>
+          </div>
+        </div>
+        <div className="model-tree__empty-state">
+          {state.previewStatus === 'working' ? (
+            <div className="empty-state-loading">
+              <span>Loading assembly...</span>
+            </div>
+          ) : (
+            <span className="empty-state-text">No geometry loaded</span>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="model-tree">
       <div className="model-tree__header">
         <div>
-          <span className="panel-eyebrow">Assembly navigator</span>
           <h2 className="model-tree__title">Model tree</h2>
         </div>
-        <span className="model-tree__count">{entries.length.toString().padStart(2, '0')} ITEMS</span>
+        <span className="model-tree__count">{entries.length.toString().padStart(2, '0')} items</span>
       </div>
       <div className="model-tree__search">
         <input
@@ -180,6 +156,7 @@ export function ModelTree(): React.ReactElement {
         />
       </div>
 
+      {counts.blocker > 0 || counts.error > 0 || counts.warning > 0 ? (
       <div className="model-tree__chips" role="group" aria-label="Filter by severity">
         <button
           type="button"
@@ -216,25 +193,6 @@ export function ModelTree(): React.ReactElement {
           </button>
         )}
       </div>
-
-      {state.isolatedId ? (
-        <div className="model-tree__isolate-bar">
-          <span>Isolated: {state.isolatedId}</span>
-          <button
-            type="button"
-            className="btn btn--ghost"
-            onClick={() => dispatch({ type: 'CLEAR_ISOLATION' })}
-          >
-            Clear
-          </button>
-        </div>
-      ) : null}
-
-      {defaultCount > 0 ? (
-        <div className="model-tree__default-banner" role="status" aria-live="polite">
-          <strong>{defaultCount} component(s) using Default Material</strong>
-          <span>Assign a specific material via each row's dropdown.</span>
-        </div>
       ) : null}
 
       {filteredEntries.length === 0 ? (
@@ -242,8 +200,8 @@ export function ModelTree(): React.ReactElement {
       ) : (
         <div className="model-tree__list" role="tree" aria-label="Model Hierarchy" ref={listRef}>
           {state.preview?.display_asset?.parts &&
-          state.preview.display_asset.parts.length > 0 &&
-          state.partGeometry ? (
+            state.preview.display_asset.parts.length > 0 &&
+            state.partGeometry ? (
             <div className="model-row model-row--parent" role="treeitem">
               <div className="model-row__center">
                 <div className="model-row__title-line">
@@ -276,16 +234,11 @@ export function ModelTree(): React.ReactElement {
             const warningsCount = selectWarningsCount(state, entry.id);
             const findings = selectFindingsFor(state, entry.id);
             const findingTitle = findings.map((f) => f.message).join('\n');
-            const confidence = objectConfidence(state, entry.id);
             const displayName = entry.name ?? entry.id;
             const displayType =
               entry.className && entry.className.toLowerCase() !== displayName.toLowerCase()
                 ? entry.className
                 : entry.geometry.type;
-            const usesDefault =
-              !state.objectMaterials[entry.id] ||
-              state.objectMaterials[entry.id] === state.defaultMaterialKey;
-
             return (
               <div
                 key={entry.id}
@@ -295,7 +248,8 @@ export function ModelTree(): React.ReactElement {
                 role="treeitem"
                 tabIndex={index === focusedIndex ? 0 : -1}
                 aria-selected={isSelected}
-                className={`model-row${!isVisible ? ' model-row--hidden' : ''}${isSelected ? ' is-selected' : ''}`}
+                title={displayName}
+                className={`model-row model-row--child${!isVisible ? ' model-row--hidden' : ''}${isSelected ? ' is-selected' : ''}`}
                 onClick={() => {
                   dispatch({ type: 'SELECT', id: entry.id });
                   // Selecting a component in the tree is an explicit request to
@@ -319,15 +273,26 @@ export function ModelTree(): React.ReactElement {
                 <div className="model-row__center">
                   <div className="model-row__title-line">
                     <span className="model-row__name">{displayName}</span>
-                    {usesDefault ? (
-                      <span
-                        className="model-row__default-chip"
-                        title="Uses Default Material — assign a specific material via the dropdown"
-                      >
-                        DEFAULT
-                      </span>
-                    ) : null}
-                    {state.materials && state.materials.length > 0 ? (
+                  </div>
+                  <div className="model-row__sub-line">
+                    <span className="model-row__meta">
+                      {displayType ? <span className="model-row__type muted">{displayType}</span> : null}
+                      {state.lastResult ? <span className="model-row__confidence">No findings</span> : null}
+                      {worstSeverity ? (
+                        <StatusBadge tone={severityTone(worstSeverity)} title={findingTitle}>
+                          {severityLabel(worstSeverity)}
+                        </StatusBadge>
+                      ) : null}
+                      {warningsCount > 0 ? (
+                        <span className="model-row__warnings badge badge--warn" title={`${warningsCount} finding(s)`}>
+                          {warningsCount}
+                        </span>
+                      ) : null}
+                    </span>
+                  </div>
+                  {isSelected && state.materials && state.materials.length > 0 ? (
+                    <div className="model-row__config">
+                      <span className="model-row__config-label">Material</span>
                       <select
                         className="model-row__material"
                         aria-label={`Material for ${displayName}`}
@@ -342,37 +307,15 @@ export function ModelTree(): React.ReactElement {
                           })
                         }
                       >
-                        <option value="">material…</option>
+                        <option value="">Default material</option>
                         {state.materials.map((m) => (
                           <option key={m.key} value={m.key}>
                             {m.key}
                           </option>
                         ))}
                       </select>
-                    ) : null}
-                  </div>
-                  <div className="model-row__sub-line">
-                    {displayType ? <span className="model-row__type muted">{displayType}</span> : null}
-                    {confidence.label !== 'UNRATED' ? (
-                      <span className={`model-row__confidence model-row__confidence--${confidence.level}`}>
-                        CONF {confidence.label}
-                      </span>
-                    ) : null}
-                    {worstSeverity ? (
-                      <StatusBadge tone={severityTone(worstSeverity)} title={findingTitle}>
-                        {severityLabel(worstSeverity)}
-                      </StatusBadge>
-                    ) : (
-                      <span className="model-row__confidence">
-                        {state.lastResult ? 'NO FINDINGS' : 'UNASSESSED'}
-                      </span>
-                    )}
-                    {warningsCount > 0 ? (
-                      <span className="model-row__warnings badge badge--warn" title={`${warningsCount} finding(s)`}>
-                        {warningsCount}
-                      </span>
-                    ) : null}
-                  </div>
+                    </div>
+                  ) : null}
                 </div>
               </div>
             );
@@ -381,4 +324,4 @@ export function ModelTree(): React.ReactElement {
       )}
     </div>
   );
-}
+});

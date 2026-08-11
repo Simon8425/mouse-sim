@@ -1,6 +1,7 @@
 """Tests for the mechanical component failure models."""
 
 import json
+import math
 import unittest
 
 from mouse_sim.components_mech import (
@@ -148,13 +149,26 @@ class MountComponentTests(unittest.TestCase):
 
 class AdhesiveComponentTests(unittest.TestCase):
     def test_high_impact_fails(self):
-        # 0.02 kg * 700 g * 9.81 / 4e-4 m^2 = 0.343 MPa > 0.3 MPa acrylic foam.
+        # 0.02 kg * 1000 g * 9.81 / 4e-4 m^2 = 0.49 MPa = 1.63x the
+        # 0.3 MPa acrylic-foam allowable: beyond the screening band -> fail.
+        result = analyze(
+            {"type": "adhesive", "adhesive": "acrylic_foam"},
+            {"drop": {"peak_accel_g": 1000.0}},
+        )
+        self.assertEqual(result["status"], "fail")
+        self.assertGreaterEqual(result["metrics"]["utilization"], 1.2)
+
+    def test_high_impact_marginal_warn(self):
+        # 700 g gives 1.14x the allowable: inside the [1.0, 1.2) marginal
+        # band, which warns (within the class-constant screening uncertainty
+        # band) instead of hard-failing at exactly 1.0.
         result = analyze(
             {"type": "adhesive", "adhesive": "acrylic_foam"},
             {"drop": {"peak_accel_g": 700.0}},
         )
-        self.assertEqual(result["status"], "fail")
+        self.assertEqual(result["status"], "warn")
         self.assertGreaterEqual(result["metrics"]["utilization"], 1.0)
+        self.assertLess(result["metrics"]["utilization"], 1.2)
 
     def test_thermal_only_case(self):
         result = analyze(
@@ -183,6 +197,78 @@ class AdhesiveComponentTests(unittest.TestCase):
         )
         self.assertEqual(internal["metrics"]["aging_factor"], 1.0)
         self.assertEqual(internal["status"], "pass")
+
+
+class KnifeEdgeBoundaryTests(unittest.TestCase):
+    """Every channel must implement the unified knife-edge policy: exactly
+    1.0 -> warn (marginal), 1.19 -> warn, 1.2 -> fail, 1.21 -> fail."""
+
+    def test_screw_boundary(self):
+        # Margin (allowable/load) is the screw sign convention: usage ratios
+        # 1.0/1.19/1.2/1.21 map to margins 1/1.0, 1/1.19, 1/1.2, 1/1.21.
+        # Vibration loosening is disabled (0 g rms) so the pull-out band
+        # alone drives the status.
+        pullout = math.pi * 0.002 * 0.003 * 0.2 * 40e6
+        for ratio, expected in ((1.0, "warn"), (1.19, "warn"), (1.2, "fail"), (1.21, "fail")):
+            accel = (pullout / (1.0 / ratio)) * 4.0 / (0.05 * 9.80665)
+            result = analyze(
+                {
+                    "type": "screw",
+                    "preload_n": 0.0,
+                    "supported_mass_kg": 0.05,
+                    "transport_vibration_g_rms": 0.0,
+                },
+                {"drop": {"peak_accel_g": accel}},
+            )
+            self.assertEqual(result["status"], expected, "screw ratio {:.2f}".format(ratio))
+            self.assertAlmostEqual(result["usage_ratio"], ratio, places=5)
+            if expected == "warn":
+                self.assertTrue(any(f["code"] == "SCREW_PULLOUT_MARGINAL" for f in result["findings"]))
+
+    def test_mount_boundary(self):
+        # stress_ratio = supported*accel*g / (count*area) / (0.6*60e6).
+        for ratio, expected in ((1.0, "warn"), (1.19, "warn"), (1.2, "fail"), (1.21, "fail")):
+            area = math.pi * 0.0025 ** 2 / 4.0
+            accel = ratio * 0.6 * 60e6 * 4.0 * area / (0.02 * 9.80665)
+            result = analyze(
+                {"type": "mount"},
+                {"drop": {"peak_accel_g": accel}},
+            )
+            self.assertEqual(result["status"], expected, "mount ratio {:.2f}".format(ratio))
+            if expected == "warn":
+                self.assertTrue(any(f["code"] == "MOUNT_CRUSH_MARGINAL" for f in result["findings"]))
+
+    def test_adhesive_boundary(self):
+        # delta_t = 0 kills the thermal term, so utilization is exactly
+        # impact_shear / allowable = mass*accel*g / (area*allowable).
+        for ratio, expected in ((1.0, "warn"), (1.19, "warn"), (1.2, "fail"), (1.21, "fail")):
+            accel = ratio * 4e-4 * 0.3e6 / (0.02 * 9.80665)
+            result = analyze(
+                {"type": "adhesive", "delta_temperature_k": 0.0},
+                {"drop": {"peak_accel_g": accel}},
+            )
+            self.assertEqual(result["status"], expected, "adhesive ratio {:.2f}".format(ratio))
+            self.assertAlmostEqual(result["metrics"]["utilization"], ratio, places=5)
+
+
+class InvalidInputMechTests(unittest.TestCase):
+    def test_nan_and_inf_spec_values_rejected(self):
+        specs = (
+            {"type": "screw", "preload_n": float("nan")},
+            {"type": "mount", "column_diameter_m": float("inf")},
+            {"type": "adhesive", "area_m2": float("-inf")},
+        )
+        for spec in specs:
+            result = analyze(spec, {"drop": {"peak_accel_g": 400.0}})
+            self.assertEqual(result["status"], "not_evaluated", spec)
+            self.assertTrue(any(f["code"] == "NOT_EVALUATED" for f in result["findings"]))
+
+    def test_huge_finite_spec_value_rejected(self):
+        result = analyze(
+            {"type": "adhesive", "area_m2": 1e13},
+            {"drop": {"peak_accel_g": 400.0}},
+        )
+        self.assertEqual(result["status"], "not_evaluated")
 
 
 if __name__ == "__main__":

@@ -213,5 +213,184 @@ endsolid triangle
         self.assertIsNot(first._world_vertices(), second._world_vertices())
 
 
+class SelfIntersectionIntegrityTests(unittest.TestCase):
+    """Adversarial geometry-integrity matrix: invalid geometry must never
+    receive a trustworthy mass/structural result."""
+
+    @staticmethod
+    def _shift(vertices, triangles, offset, base):
+        vertices = list(vertices)
+        triangles = list(triangles)
+        base = list(base)
+        shifted = [(x + offset[0], y + offset[1], z + offset[2]) for x, y, z in vertices]
+        return base + shifted, triangles + [
+            (i + len(base), j + len(base), k + len(base)) for i, j, k in triangles
+        ]
+
+    def _prism(self, sides=8, twist_deg=0.0):
+        vertices = []
+        for k in range(sides):
+            angle = 2.0 * math.pi * k / sides
+            vertices.append((math.cos(angle), math.sin(angle), -1.0))
+        for k in range(sides):
+            angle = 2.0 * math.pi * k / sides + math.radians(twist_deg) * k / (sides - 1)
+            vertices.append((math.cos(angle), math.sin(angle), 1.0))
+        vertices.append((0.0, 0.0, -1.0))
+        vertices.append((0.0, 0.0, 1.0))
+        triangles = []
+        for k in range(sides):
+            triangles.append((2 * sides, (k + 1) % sides, k))
+            triangles.append((k + sides, (k + 1) % sides + sides, 2 * sides + 1))
+        for k in range(sides):
+            a, b = k, (k + 1) % sides
+            triangles.append((a, b, b + sides))
+            triangles.append((a, b + sides, a + sides))
+        return vertices, triangles
+
+    def test_valid_manifold_is_clean(self):
+        mesh = cube_mesh()
+        self.assertEqual(mesh.diagnostics().issues, ())
+        self.assertTrue(mesh.diagnostics().safe_for_mass_properties)
+
+    def test_normal_shared_edges_are_clean(self):
+        mesh = cube_mesh()
+        self.assertFalse(mesh.diagnostics().closed is False)
+        self.assertEqual(mesh.diagnostics().issues, ())
+
+    def test_fan_sharing_a_center_vertex_is_clean(self):
+        vertices = [
+            (0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (1.0, 1.7, 0.0),
+            (0.0, 2.0, 0.0), (-1.0, 1.7, 0.0), (-2.0, 0.0, 0.0),
+        ]
+        triangles = [(0, 1, 2), (0, 2, 3), (0, 3, 4), (0, 4, 5)]
+        mesh = TriangleMesh(vertices, triangles)
+        self.assertNotIn("self_intersecting", mesh.diagnostics().issues)
+
+    def test_crossing_triangles_sharing_a_vertex_are_flagged(self):
+        vertices = [
+            (0.0, 0.0, 0.0), (4.0, 0.0, 0.0), (0.0, 4.0, 0.0),
+            (3.0, 1.0, 1.0), (-1.0, 1.0, -1.0),
+        ]
+        triangles = [(0, 1, 2), (0, 3, 4)]
+        mesh = TriangleMesh(vertices, triangles)
+        self.assertIn("self_intersecting", mesh.diagnostics().issues)
+
+    def test_crossing_triangles_sharing_an_edge_fold_is_flagged(self):
+        # Two triangles sharing edge AB where edge AD pierces the other's
+        # interior away from the shared edge (a genuine fold).
+        vertices = [
+            (0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (1.0, 1.0, 1.0),
+            (1.0, -1.0, -1.0), (-1.0, 1.0, 1.0),
+        ]
+        triangles = [(0, 1, 2), (3, 4, 1)]
+        mesh = TriangleMesh(vertices, triangles)
+        self.assertIn("self_intersecting", mesh.diagnostics().issues)
+
+    def test_flat_square_adjacent_pair_is_not_flagged(self):
+        vertices = [(0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (0.0, 2.0, 0.0), (2.0, 2.0, 0.0)]
+        triangles = [(0, 1, 3), (0, 3, 2)]
+        mesh = TriangleMesh(vertices, triangles)
+        self.assertNotIn("self_intersecting", mesh.diagnostics().issues)
+
+    def test_twisted_prism_is_flagged_and_mass_is_blocked(self):
+        straight_vertices, straight_triangles = self._prism(8, 0.0)
+        twisted_vertices, twisted_triangles = self._prism(8, 90.0)
+        straight = TriangleMesh(straight_vertices, straight_triangles)
+        twisted = TriangleMesh(twisted_vertices, twisted_triangles)
+        self.assertEqual(straight.diagnostics().issues, ())
+        self.assertTrue(straight.diagnostics().safe_for_mass_properties)
+        self.assertIn("self_intersecting", twisted.diagnostics().issues)
+        self.assertFalse(twisted.diagnostics().safe_for_mass_properties)
+        # The twisted (invalid) shell must never certify mass.
+        with self.assertRaises(ValueError):
+            twisted.inertia_tensor(1000.0)
+
+    def test_interpenetrating_face_aligned_boxes_are_flagged(self):
+        # Face-aligned overlap: every contact line coincides with an edge and
+        # no vertex lands strictly inside the other solid — the historical
+        # blind spot for the pair sweep and vertex containment.
+        base_vertices, base_triangles = cube_mesh().vertices, cube_mesh().triangles
+        vertices, triangles = self._shift(base_vertices, base_triangles, (0.5, 0.0, 0.0), list(base_vertices))
+        mesh = TriangleMesh(vertices, triangles)
+        self.assertIn("self_intersecting", mesh.diagnostics().issues)
+        self.assertFalse(mesh.diagnostics().safe_for_mass_properties)
+
+    def test_touching_unions_are_not_flagged(self):
+        base_vertices, base_triangles = cube_mesh().vertices, cube_mesh().triangles
+        base_vertices = list(base_vertices)
+        base_triangles = list(base_triangles)
+        for offset, label in (
+            ((2.0, 0.0, 0.0), "face-face"),
+            ((2.0, 2.0, 0.0), "edge-edge"),
+            ((2.0, 2.0, 2.0), "corner-corner"),
+        ):
+            vertices, triangles = self._shift(base_vertices, base_triangles, offset, base_vertices)
+            mesh = TriangleMesh(vertices, triangles)
+            issues = mesh.diagnostics().issues
+            self.assertNotIn("self_intersecting", issues, label)
+            self.assertTrue(mesh.diagnostics().safe_for_mass_properties, label)
+
+    def test_duplicate_faces_are_flagged(self):
+        for duplicate in (cube_mesh().triangles[0], tuple(reversed(cube_mesh().triangles[0]))):
+            mesh = TriangleMesh(cube_mesh().vertices, list(cube_mesh().triangles) + [duplicate])
+            self.assertIn("duplicate_faces", mesh.diagnostics().issues)
+            self.assertFalse(mesh.diagnostics().safe_for_mass_properties)
+
+    def test_nested_geometry_is_not_safe(self):
+        base_vertices, base_triangles = cube_mesh().vertices, cube_mesh().triangles
+        inner_vertices = [(0.5 * x, 0.5 * y, 0.5 * z) for x, y, z in base_vertices]
+        vertices = list(base_vertices) + inner_vertices
+        triangles = list(base_triangles) + [(i + 8, j + 8, k + 8) for i, j, k in base_triangles]
+        mesh = TriangleMesh(vertices, triangles)
+        issues = mesh.diagnostics().issues
+        self.assertIn("nested_shells", issues)
+        self.assertFalse(mesh.diagnostics().safe_for_mass_properties)
+
+    def test_coplanar_x_overlap_is_flagged(self):
+        vertices = [
+            (0.0, 0.0, 0.0), (2.0, 1.0, 0.0), (1.0, 2.0, 0.0),
+            (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (2.0, 2.0, 0.0),
+        ]
+        triangles = [(0, 1, 2), (3, 4, 5)]
+        mesh = TriangleMesh(vertices, triangles)
+        self.assertIn("self_intersecting", mesh.diagnostics().issues)
+
+    def test_coplanar_corner_touching_is_not_flagged(self):
+        vertices = [
+            (0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0),
+            (1.0, 1.0, 0.0), (2.0, 1.0, 0.0), (1.0, 2.0, 0.0),
+        ]
+        triangles = [(0, 1, 2), (3, 4, 5)]
+        mesh = TriangleMesh(vertices, triangles)
+        self.assertNotIn("self_intersecting", mesh.diagnostics().issues)
+
+    def test_coplanar_containment_is_winding_independent(self):
+        # A triangle strictly contained in a larger coplanar triangle is a
+        # genuine overlap regardless of the larger triangle's winding.
+        contained = [(4, 1, 0), (6, 1, 0), (5, 2, 0)]
+        for big in ([(0, 0, 0), (10, 0, 0), (0, 10, 0)],
+                    [(0, 0, 0), (0, 10, 0), (10, 0, 0)]):
+            mesh = TriangleMesh(big + contained, [(0, 1, 2), (3, 4, 5)])
+            self.assertIn("self_intersecting", mesh.diagnostics().issues)
+
+    def test_near_touching_unions_are_not_flagged(self):
+        # Epsilon-gap unions and PARTIAL face-to-face contact (an edge of one
+        # box lying on the other's face diagonal) are valid touching
+        # geometry — the far-diagonal acceptance must not fire on them.
+        base_vertices, base_triangles = cube_mesh().vertices, cube_mesh().triangles
+        base_vertices = list(base_vertices)
+        base_triangles = list(base_triangles)
+        for gap in (1e-10, 1e-12, 1e-8):
+            vertices, triangles = self._shift(base_vertices, base_triangles, (2.0 + gap, 0.0, 0.0), base_vertices)
+            mesh = TriangleMesh(vertices, triangles)
+            self.assertNotIn("self_intersecting", mesh.diagnostics().issues, "gap {}".format(gap))
+        for offset in ((2.0, 0.0, 1.0), (2.0, 0.0, 0.5), (2.0, 0.5, 0.5)):
+            vertices, triangles = self._shift(base_vertices, base_triangles, offset, base_vertices)
+            mesh = TriangleMesh(vertices, triangles)
+            issues = mesh.diagnostics().issues
+            self.assertNotIn("self_intersecting", issues, str(offset))
+            self.assertTrue(mesh.diagnostics().safe_for_mass_properties, str(offset))
+
+
 if __name__ == "__main__":
     unittest.main()

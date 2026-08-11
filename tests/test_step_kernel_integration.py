@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from mouse_sim.geometry import TriangleMesh
 from mouse_sim.importers import load_geometry
@@ -12,6 +13,23 @@ from mouse_sim.step_kernel import freecadcmd_path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_STEP = REPO_ROOT / "G3-20260320.stp"
 RUN_INTEGRATION = os.environ.get("MOUSE_SIM_RUN_SLOW_STEP_INTEGRATION") == "1"
+
+
+class StdlibFacetedStepImportTests(unittest.TestCase):
+    def test_faceted_step_imports_via_stdlib(self):
+        """A faceted STEP file must import through the standard-library parser
+        on every platform, never requiring the FreeCAD kernel."""
+        fixture = Path(__file__).parent / "fixtures" / "faceted_cube.step"
+        with mock.patch(
+            "mouse_sim.step_kernel.tessellate_step",
+            side_effect=AssertionError("kernel must not run"),
+        ):
+            result = load_geometry(fixture, fmt="step")
+        self.assertTrue(result.is_supported)
+        self.assertIsInstance(result.geometry, TriangleMesh)
+        self.assertEqual(result.source_units, "mm")
+        self.assertEqual(len(result.geometry.triangles), 12)
+        self.assertIsNone(result.display_asset)
 
 
 @unittest.skipUnless(

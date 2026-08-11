@@ -45,6 +45,17 @@
   --shadow-inset: none;
   --focus-ring: 0 0 0 1px #ffffff;
 
-  --font-family: 'Inter Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-family: 'Inter Variable';
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+
+  /* Typography */
+  --font-weight-body: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+  --font-tracking: -0.011em;
+  --font-tracking-tight: -0.02em;
+  --line-height-body: 1.5;
+  --line-height-heading: 1.2;
+  --font-feature-settings: 'kern' 1, 'liga' 1;
 }

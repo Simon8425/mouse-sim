@@ -107,8 +107,37 @@ def check_geometry_health(geometry, object_id, repair_records=None, display_tess
             findings.append(_finding("GEOMETRY_DEGENERATE_TRIANGLES", "warning", "geometry_health", "mesh has {} degenerate triangle(s)".format(diagnostics.degenerate_triangles), object_id))
         if diagnostics.inconsistent_winding:
             findings.append(_finding("GEOMETRY_INCONSISTENT_WINDING", severity, "geometry_health", "mesh has inconsistent triangle winding{}".format(approximate), object_id, evidence_blocking=not display_tessellation))
-        if abs(diagnostics.signed_volume_m3) <= _ZERO_VOLUME_TOLERANCE:
+        if "zero_signed_volume" in diagnostics.issues:
             findings.append(_finding("GEOMETRY_ZERO_VOLUME", "error", "geometry_health", "mesh has zero signed volume", object_id, evidence_blocking=True))
+        elif abs(diagnostics.signed_volume_m3) <= _ZERO_VOLUME_TOLERANCE:
+            # Valid-in-relative-terms but absolutely microscopic geometry: the
+            # mass/inertia integrals cannot be certified.  This is a SUPPORTED
+            # PHYSICAL DOMAIN boundary, not invalid geometry — label it as
+            # such instead of pretending the mesh is simply broken.
+            findings.append(_finding(
+                "OUTSIDE_SUPPORTED_PHYSICAL_SCALE",
+                "error",
+                "geometry_health",
+                "mesh volume {:.3e} m3 is below the supported physical scale "
+                "(absolute floor {} m3, ~10 um cube); mass/inertia cannot be certified".format(
+                    abs(diagnostics.signed_volume_m3), _ZERO_VOLUME_TOLERANCE
+                ),
+                object_id,
+                evidence_blocking=True,
+            ))
+        if "self_intersection_unverified" in diagnostics.issues:
+            # The mesh is larger than the exact pair-sweep limit: the geometry
+            # integrity check is INCOMPLETE, not clean.  Mass is still computed
+            # but the overall validation must reflect the uncertainty so the
+            # shell result can never claim PASS / high confidence on it.
+            findings.append(_finding(
+                "SELF_INTERSECTION_UNVERIFIED",
+                "warning",
+                "geometry_health",
+                "mesh exceeds the self-intersection sweep limit; geometry "
+                "integrity is unverified and mass may be affected",
+                object_id,
+            ))
     if repair_records:
         unreviewed = [record for record in repair_records if not _repair_reviewed(record)]
         if unreviewed:

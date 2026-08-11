@@ -182,6 +182,13 @@ class StepKernelProcessTests(unittest.TestCase):
         def fake_run(command, **kwargs):
             self.assertEqual(command[1], "-c")
             self.assertNotIn("shell", kwargs)
+            if os.name == "nt":
+                # preexec_fn is POSIX-only; Windows uses the default process
+                # group (start_new_session=False) instead.
+                self.assertNotIn("preexec_fn", kwargs)
+                self.assertIs(kwargs.get("start_new_session"), False)
+            else:
+                self.assertIn("preexec_fn", kwargs)
             self.assertIn("MOUSE_SIM_STEP_PARTS_OUTPUT", kwargs["env"])
             mesh_path = Path(kwargs["env"]["MOUSE_SIM_STEP_MESH_OUTPUT"])
             glb_path = Path(kwargs["env"]["MOUSE_SIM_STEP_GLB_OUTPUT"])
@@ -387,10 +394,46 @@ class StepKernelPartsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = _asset_dir(directory)
             self.assertTrue(root.is_dir())
-            self.assertEqual(root.stat().st_mode & 0o777, 0o700)
-            with mock.patch("mouse_sim.step_kernel.os.geteuid", return_value=os.geteuid() + 1):
-                with self.assertRaises(StepKernelFailure):
-                    _asset_dir(directory)
+            # chmod 0o700 is a real mode change on POSIX; Windows only
+            # honors the read-only attribute, so the mode bits are not
+            # asserted there.
+            if os.name == "posix":
+                self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+            # Ownership is verified against the effective uid only on POSIX;
+            # Windows has no geteuid and relies on the per-user temp dir.
+            if hasattr(os, "geteuid"):
+                with mock.patch(
+                    "mouse_sim.step_kernel.os.geteuid", return_value=os.geteuid() + 1
+                ):
+                    with self.assertRaises(StepKernelFailure):
+                        _asset_dir(directory)
+
+    def test_asset_dir_uses_platform_neutral_user_tag(self):
+        from mouse_sim.step_kernel import _PROCESS_ASSET_DIR, _user_tag
+
+        tag = _user_tag()
+        self.assertIsInstance(tag, str)
+        self.assertTrue(tag)
+        self.assertEqual(
+            _PROCESS_ASSET_DIR,
+            Path(tempfile.gettempdir()) / ("mouse-sim-step-assets-" + tag),
+        )
+
+    def test_kernel_probe_never_raises(self):
+        from mouse_sim.step_kernel import FREECADCMD_ENV, freecadcmd_path, kernel_available
+
+        # A configured path that cannot even be resolved (unknown user home,
+        # broken mount) must be reported as absent, never raised.  The rest of
+        # the detection chain is mocked so the outcome does not depend on
+        # whether FreeCAD happens to be installed on the test machine.
+        with mock.patch.dict(os.environ, {FREECADCMD_ENV: "~no_such_user/freecadcmd"}):
+            with mock.patch(
+                "mouse_sim.step_kernel._windows_freecadcmd_candidates", return_value=[]
+            ):
+                with mock.patch("mouse_sim.step_kernel.shutil.which", return_value=None):
+                    with mock.patch("mouse_sim.step_kernel.sys.platform", "win32"):
+                        self.assertIsNone(freecadcmd_path())
+                        self.assertFalse(kernel_available())
 
 
 class GlbPartsEdgeTests(unittest.TestCase):

@@ -631,11 +631,19 @@ def _correlation_error_gate(method, correlation_records):
         )
     records = _correlation_records(correlation_records)
     if not records:
-        return _gate("CORRELATION_ERROR", True, True, True, "no correlation records supplied")
+        return _gate(
+            "CORRELATION_ERROR", False, True, True,
+            "correlation required by the method policy but no correlation records were supplied",
+        )
     violations = []
+    comparison_count = 0
     for record in records:
         record_type = str(_get(record, "record_type", default="") or "")
-        for comparison in _get(record, "comparisons", default=()) or ():
+        comparisons = _get(record, "comparisons", default=()) or ()
+        if not comparisons:
+            violations.append("{}: record carries no comparisons; nothing verified".format(record_type))
+        for comparison in comparisons:
+            comparison_count += 1
             fraction, reason = _comparison_error_fraction(comparison)
             if fraction is not None and fraction <= maximum:
                 continue
@@ -650,6 +658,8 @@ def _correlation_error_gate(method, correlation_records):
                         record_type, metric, fraction, maximum
                     )
                 )
+    if not violations and comparison_count == 0:
+        violations.append("no correlation comparisons supplied")
     if violations:
         return _gate(
             "CORRELATION_ERROR", False, True, True,
@@ -827,37 +837,32 @@ def _convergence_evidence_gate(convergence_evidence, force_balance, structural_r
     )
 
 
-def _metric_relative_error(metric):
-    """Relative error of one measured-drop metric, or None when missing.
-
-    Prefers the measured/predicted pair (fail-closed: a missing or
-    non-numeric pair yields None, never a pass); falls back to the
-    relative_error field reported by the pipeline agent.
-    """
-    raw_measured = _get(metric, "measured")
-    raw_predicted = _get(metric, "predicted")
-    if raw_measured is not None and raw_predicted is not None:
-        measured = _numeric(raw_measured)
-        predicted = _numeric(raw_predicted)
-        if measured is not None and predicted is not None and predicted != 0.0:
-            return abs(measured - predicted) / abs(predicted)
-        return None
-    return _numeric(_get(metric, "relative_error"))
-
-
 def _correlation_measured_gate(pipeline_result):
     """CORRELATION_MEASURED: predicted vs measured drop response within
-    acceptance.
+    acceptance.  FAIL-CLOSED.
 
     Reads ``result["correlation"]`` (emitted by the pipeline agent) with
-    shape {conditions: [{drop_id, metrics: [{metric_key, measured,
-    predicted, relative_error, pass}]}], r_squared, bias, verdict,
-    explanation}.  The gate passes when at least ``MIN_DROP_CONDITIONS``
-    conditions were evaluated, every per-metric relative error is within
-    ``MAX_RELATIVE_ERROR``, r_squared >= ``MIN_R_SQUARED`` and
-    |bias| <= ``MAX_ABS_BIAS``.  An absent correlation section is
-    tolerated: non-evaluable and non-blocking, so runs without a
-    measured-drop campaign are not penalized.
+    shape {conditions: [{drop_id, height_m, surface, orientation, metrics:
+    [{metric_key, measured, predicted}]}], ...}.  Every statistic (relative
+    error, bias, R^2) is RECOMPUTED here from the measured/predicted pairs;
+    any user-supplied summary values (``r_squared``, ``bias``,
+    ``relative_error``) are ignored entirely — fabricated metadata can never
+    override the data.  The gate passes only when:
+
+    - at least ``MIN_DROP_CONDITIONS`` DISTINCT drop conditions each carry
+      at least one metric with finite measured AND predicted values;
+    - no two conditions are duplicates (same drop_id, height, surface and
+      orientation);
+    - the metric set contains at least two distinct measured values (a
+      degenerate or duplicated dataset cannot define a meaningful R^2);
+    - every per-metric relative error (against the measured value) is
+      within ``MAX_RELATIVE_ERROR``;
+    - the computed R^2 lies in [0, 1] and is >= ``MIN_R_SQUARED``;
+    - |computed bias| <= ``MAX_ABS_BIAS``.
+
+    An absent correlation section is tolerated: non-evaluable and
+    non-blocking, so runs without a measured-drop campaign are not
+    penalized.
     """
     correlation = pipeline_result.get("correlation") if pipeline_result is not None else None
     if correlation is None:
@@ -866,28 +871,94 @@ def _correlation_measured_gate(pipeline_result):
             "no measured-drop correlation supplied",
         )
     conditions = _get(correlation, "conditions", default=()) or ()
-    r_squared = _numeric(_get(correlation, "r_squared"))
-    bias = _numeric(_get(correlation, "bias"))
     failures = []
-    if len(conditions) < MIN_DROP_CONDITIONS:
-        failures.append(
-            "only {} drop condition(s) evaluated; minimum {} required".format(
-                len(conditions), MIN_DROP_CONDITIONS
-            )
-        )
-    max_relative = 0.0
+    evaluated = []
+    excluded_count = 0
+    seen_identities = set()
     for condition in conditions:
         drop_id = str(_get(condition, "drop_id", default="") or "") or "drop"
+        # W10-01/SENIOR-01 follow-up: the pipeline EXCLUDES non-equivalent
+        # and identity-mismatched conditions from the verdict (they are
+        # disclosed in the comparison table, they do not contribute to it
+        # and they must not VETO it).  The qualification gate recomputed
+        # every statistic over ALL conditions, so a payload could claim
+        # verdict pass / correlated while this gate hard-blocked on the
+        # excluded rows — a contradiction.  The gate now mirrors the
+        # pipeline's evaluated set exactly.
+        if not condition.get("equivalent", True) or not condition.get("identity_ok", True):
+            excluded_count += 1
+            continue
+        if not condition.get("metrics"):
+            continue
+        # Condition independence is judged on the PHYSICS TRIPLE
+        # (height, surface, orientation) — drop_id is a label, not an
+        # independent condition.  Two entries at the same triple are one
+        # measurement repeated, not two independent conditions.
+        identity = (
+            _numeric(_get(condition, "height_m")),
+            str(_get(condition, "surface", default="") or "").strip().lower(),
+            str(_get(condition, "orientation", default="") or "").strip().lower(),
+        )
+        if identity in seen_identities:
+            failures.append(
+                "duplicate drop condition (height={!r}, surface={!r}, orientation={!r})".format(
+                    *identity
+                )
+            )
+        seen_identities.add(identity)
+        pairs = []
         for metric in _get(condition, "metrics", default=()) or ():
             metric_key = str(_get(metric, "metric_key", default="") or "") or "metric"
-            relative = _metric_relative_error(metric)
-            if relative is None:
+            raw_measured = _get(metric, "measured")
+            raw_predicted = _get(metric, "predicted")
+            if raw_measured is None or raw_predicted is None:
                 failures.append(
                     "{}[{}]: comparison lacks numeric measured/predicted values".format(
                         drop_id, metric_key
                     )
                 )
                 continue
+            measured = _numeric(raw_measured)
+            predicted = _numeric(raw_predicted)
+            if measured is None or predicted is None:
+                failures.append(
+                    "{}[{}]: comparison lacks numeric measured/predicted values".format(
+                        drop_id, metric_key
+                    )
+                )
+                continue
+            if abs(measured) < 1e-12 or abs(predicted) < 1e-12:
+                failures.append(
+                    "{}[{}]: comparison value is zero; relative error undefined".format(
+                        drop_id, metric_key
+                    )
+                )
+                continue
+            if measured < 0.0 or predicted < 0.0:
+                failures.append(
+                    "{}[{}]: comparison value is negative".format(drop_id, metric_key)
+                )
+                continue
+            pairs.append((metric_key, measured, predicted))
+        if pairs:
+            evaluated.append((drop_id, pairs))
+    if len(evaluated) < MIN_DROP_CONDITIONS:
+        failures.append(
+            "only {} distinct drop condition(s) with valid comparisons; minimum {} required".format(
+                len(evaluated), MIN_DROP_CONDITIONS
+            )
+        )
+    measured_points = [measured for _, pairs in evaluated for _, measured, _ in pairs]
+    distinct_measured = len(set(round(value, 9) for value in measured_points))
+    if distinct_measured < MIN_DROP_CONDITIONS:
+        failures.append(
+            "measured values are degenerate ({} distinct value(s) across {} comparison(s)); "
+            "R^2 is not meaningful".format(distinct_measured, len(measured_points))
+        )
+    max_relative = 0.0
+    for drop_id, pairs in evaluated:
+        for metric_key, measured, predicted in pairs:
+            relative = abs(measured - predicted) / abs(measured)
             max_relative = max(max_relative, relative)
             if relative > MAX_RELATIVE_ERROR:
                 failures.append(
@@ -895,21 +966,61 @@ def _correlation_measured_gate(pipeline_result):
                         drop_id, metric_key, relative, MAX_RELATIVE_ERROR
                     )
                 )
-    if r_squared is None:
-        failures.append("r_squared is not numeric or missing")
-    elif r_squared < MIN_R_SQUARED:
-        failures.append("r_squared {:.3f} below minimum {:.3f}".format(r_squared, MIN_R_SQUARED))
-    if bias is None:
-        failures.append("bias is not numeric or missing")
-    elif abs(bias) > MAX_ABS_BIAS:
-        failures.append("|bias| {:.3f} exceeds maximum {:.3f}".format(abs(bias), MAX_ABS_BIAS))
+    r_squared = None
+    bias = None
+    if evaluated:
+        all_measured = [measured for _, pairs in evaluated for _, measured, _ in pairs]
+        all_predicted = [predicted for _, pairs in evaluated for _, _, predicted in pairs]
+        mean_m = sum(all_measured) / len(all_measured)
+        mean_p = sum(all_predicted) / len(all_predicted)
+        numerator = sum(
+            (m - mean_m) * (p - mean_p)
+            for m, p in zip(all_measured, all_predicted)
+        )
+        denom_m = math.sqrt(sum((m - mean_m) ** 2 for m in all_measured))
+        denom_p = math.sqrt(sum((p - mean_p) ** 2 for p in all_predicted))
+        if denom_m <= 1e-12 or denom_p <= 1e-12:
+            failures.append("measured or predicted values have zero variance; R^2 is undefined")
+        else:
+            r_squared = (numerator / (denom_m * denom_p)) ** 2
+            if r_squared > 1.0 + 1e-9:
+                failures.append(
+                    "computed R^2 {:.6f} exceeds the [0, 1] bound; the dataset is not a valid correlation".format(
+                        r_squared
+                    )
+                )
+                r_squared = min(1.0, r_squared)
+        signed = [
+            (m - p) / abs(m)
+            for m, p in zip(all_measured, all_predicted)
+            if abs(m) > 1e-12
+        ]
+        if signed:
+            bias = sum(signed) / len(signed)
+    if r_squared is None or r_squared < MIN_R_SQUARED:
+        failures.append(
+            "computed R^2 {:.3f} below minimum {:.3f}".format(
+                r_squared if r_squared is not None else float("nan"), MIN_R_SQUARED
+            )
+        )
+    if bias is None or abs(bias) > MAX_ABS_BIAS:
+        failures.append(
+            "|computed bias| {:.3f} exceeds maximum {:.3f}".format(
+                abs(bias) if bias is not None else float("nan"), MAX_ABS_BIAS
+            )
+        )
     if failures:
         return _gate("CORRELATION_MEASURED", False, True, True, "; ".join(failures))
+    disclosure = ""
+    if excluded_count:
+        disclosure = " ({} condition(s) excluded from the verdict as non-equivalent / identity-mismatched, disclosed in the comparison table)".format(
+            excluded_count
+        )
     return _gate(
         "CORRELATION_MEASURED", True, True, True,
         "predicted vs measured drop response within acceptance "
-        "(r_squared {:.3f}, max relative error {:.3f}, bias {:.3f})".format(
-            r_squared, max_relative, bias
+        "(computed r_squared {:.3f}, max relative error {:.3f}, bias {:.3f}){}".format(
+            r_squared, max_relative, bias, disclosure
         ),
     )
 

@@ -37,13 +37,19 @@ describe('accessibility (a11y) component interaction', () => {
   it('renders polite aria-live status region in RunStatus', () => {
     render(
       <ProjectProvider>
-        <DispatchHelper action={{ type: 'ANALYZE_START', version: 1 }} />
+        <DispatchHelper action={{ type: 'ANALYZE_START', version: 1, requestKey: 'k1' }} />
         <RunStatus />
       </ProjectProvider>,
     );
 
-    const liveRegion = screen.getByText('Running analysis…').closest('.run-status');
+    const liveRegion = screen.getByText('Running…').closest('.run-status');
     expect(liveRegion).toHaveAttribute('aria-live', 'polite');
     expect(liveRegion).toHaveAttribute('aria-atomic', 'true');
+    expect(screen.getByText('Analysis')).toBeInTheDocument();
+    expect(screen.getByRole('progressbar', { name: 'Run progress' })).toHaveAttribute(
+      'aria-valuetext',
+      'Running…',
+    );
+    expect(screen.getByRole('button', { name: 'Cancel running analysis' })).toBeInTheDocument();
   });
 });

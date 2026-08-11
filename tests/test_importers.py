@@ -14,10 +14,167 @@ from mouse_sim import (
     UnitError,
     geometry_from_dict,
     load_geometry,
+    mass_properties,
 )
 from mouse_sim.importers import GeometryLoadResult
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
+
+PLATE_WITH_HOLE_FACES = (
+    # 10 x 10 x 2 mm plate with a 4 x 4 mm through hole.  Each face is a
+    # tuple of loops: the first loop is the outer bound, the remaining loops
+    # are inner bounds (holes).
+    (
+        ((0.0, 0.0, 2.0), (10.0, 0.0, 2.0), (10.0, 10.0, 2.0), (0.0, 10.0, 2.0)),
+        ((3.0, 3.0, 2.0), (7.0, 3.0, 2.0), (7.0, 7.0, 2.0), (3.0, 7.0, 2.0)),
+    ),
+    (
+        ((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 10.0, 0.0), (0.0, 10.0, 0.0)),
+        ((3.0, 3.0, 0.0), (7.0, 3.0, 0.0), (7.0, 7.0, 0.0), (3.0, 7.0, 0.0)),
+    ),
+    (((0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (10.0, 0.0, 2.0), (0.0, 0.0, 2.0)),),
+    (((10.0, 0.0, 0.0), (10.0, 10.0, 0.0), (10.0, 10.0, 2.0), (10.0, 0.0, 2.0)),),
+    (((10.0, 10.0, 0.0), (0.0, 10.0, 0.0), (0.0, 10.0, 2.0), (10.0, 10.0, 2.0)),),
+    (((0.0, 10.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, 2.0), (0.0, 10.0, 2.0)),),
+    (((3.0, 3.0, 0.0), (7.0, 3.0, 0.0), (7.0, 3.0, 2.0), (3.0, 3.0, 2.0)),),
+    (((7.0, 3.0, 0.0), (7.0, 7.0, 0.0), (7.0, 7.0, 2.0), (7.0, 3.0, 2.0)),),
+    (((7.0, 7.0, 0.0), (3.0, 7.0, 0.0), (3.0, 7.0, 2.0), (7.0, 7.0, 2.0)),),
+    (((3.0, 7.0, 0.0), (3.0, 3.0, 0.0), (3.0, 3.0, 2.0), (3.0, 7.0, 2.0)),),
+)
+
+
+def _box_faces(size, z0=0.0):
+    """Six quad faces of a box of side ``size`` starting at height ``z0``."""
+    z1 = z0 + size
+    return (
+        (((0.0, 0.0, z1), (size, 0.0, z1), (size, size, z1), (0.0, size, z1)),),
+        (((0.0, 0.0, z0), (size, 0.0, z0), (size, size, z0), (0.0, size, z0)),),
+        (((0.0, 0.0, z0), (size, 0.0, z0), (size, 0.0, z1), (0.0, 0.0, z1)),),
+        (((size, 0.0, z0), (size, size, z0), (size, size, z1), (size, 0.0, z1)),),
+        (((size, size, z0), (0.0, size, z0), (0.0, size, z1), (size, size, z1)),),
+        (((0.0, size, z0), (0.0, 0.0, z0), (0.0, 0.0, z1), (0.0, size, z1)),),
+    )
+
+
+def _faceted_step_text(shell_faces, void_shells=()):
+    """Build a minimal faceted STEP file from face loop descriptions.
+
+    ``shell_faces`` is a sequence of faces; each face is a sequence of loops;
+    each loop is a sequence of ``(x, y, z)`` points.  A face's first loop is
+    its outer bound; the remaining loops are inner bounds (holes).
+    ``void_shells`` is a sequence of extra closed shells subtracted via
+    BREP_WITH_VOIDS.  The body is a MANIFOLD_SOLID_BREP (or BREP_WITH_VOIDS
+    when void shells are given) with millimetre units, matching the style of
+    the fixtures in ``tests/fixtures``.
+    """
+    lines = [
+        "ISO-10303-21;",
+        "HEADER;",
+        "FILE_DESCRIPTION(('generated faceted solid'),'2;1');",
+        "FILE_NAME('inline_faceted.step','2026-01-01T00:00:00',('Author'),(''),'','','');",
+        "FILE_SCHEMA(('CONFIG_CONTROL_DESIGN'));",
+        "ENDSEC;",
+        "DATA;",
+    ]
+    state = {"next": 1}
+    point_ids = {}
+    vertex_ids = {}
+    edge_ids = {}
+
+    def point_id(point):
+        if point not in point_ids:
+            current = state["next"]
+            state["next"] += 1
+            point_ids[point] = current
+            lines.append("#{}=CARTESIAN_POINT('P{}',({},{},{}));".format(current, current, *point))
+        return point_ids[point]
+
+    def vertex_id(point):
+        if point not in vertex_ids:
+            current = state["next"]
+            state["next"] += 1
+            vertex_ids[point] = current
+            lines.append("#{}=VERTEX_POINT('V{}',#{});".format(current, current, point_id(point)))
+        return vertex_ids[point]
+
+    def edge_id(edge):
+        if edge not in edge_ids:
+            current = state["next"]
+            state["next"] += 1
+            edge_ids[edge] = current
+            lines.append(
+                "#{}=EDGE_CURVE('E{}',#{},#{},$,.T.);".format(
+                    current, current, vertex_id(edge[0]), vertex_id(edge[1])
+                )
+            )
+        return edge_ids[edge]
+
+    def loop_id(points):
+        current = state["next"]
+        state["next"] += 1
+        refs = []
+        for index, point in enumerate(points):
+            oriented = state["next"]
+            state["next"] += 1
+            lines.append(
+                "#{}=ORIENTED_EDGE('O{}',*,*,#{},.T.);".format(
+                    oriented, oriented, edge_id((point, points[(index + 1) % len(points)]))
+                )
+            )
+            refs.append("#{}".format(oriented))
+        lines.append("#{}=EDGE_LOOP('L{}',({}));".format(current, current, ",".join(refs)))
+        return current
+
+    def face_id(loops):
+        bounds = []
+        for index, loop_points in enumerate(loops):
+            bound = state["next"]
+            state["next"] += 1
+            loop = loop_id(loop_points)
+            if index == 0:
+                lines.append("#{}=FACE_OUTER_BOUND('B{}',#{});".format(bound, bound, loop))
+            else:
+                lines.append("#{}=FACE_BOUND('B{}',#{},.T.);".format(bound, bound, loop))
+            bounds.append("#{}".format(bound))
+        current = state["next"]
+        state["next"] += 1
+        lines.append("#{}=ADVANCED_FACE('F{}',({}),$,.T.);".format(current, current, ",".join(bounds)))
+        return current
+
+    def shell_id(faces):
+        current = state["next"]
+        state["next"] += 1
+        face_refs = ["#{}".format(face_id(loops)) for loops in faces]
+        lines.append("#{}=CLOSED_SHELL('S{}',({}));".format(current, current, ",".join(face_refs)))
+        return current
+
+    outer = shell_id(shell_faces)
+    if void_shells:
+        void_refs = ["#{}".format(shell_id(faces)) for faces in void_shells]
+        current = state["next"]
+        state["next"] += 1
+        lines.append("#{}=BREP_WITH_VOIDS('WithVoids',#{},({}));".format(current, outer, ",".join(void_refs)))
+    else:
+        current = state["next"]
+        state["next"] += 1
+        lines.append("#{}=MANIFOLD_SOLID_BREP('Solid',#{});".format(current, outer))
+    base = state["next"]
+    lines.append("#{}=(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.));".format(base))
+    lines.append("#{}=(NAMED_UNIT(*)PLANE_ANGLE_UNIT()SI_UNIT($,.RADIAN.));".format(base + 1))
+    lines.append("#{}=(NAMED_UNIT(*)SI_UNIT($,.STERADIAN.)SOLID_ANGLE_UNIT());".format(base + 2))
+    lines.append(
+        "#{}=UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-06),#{},'distance_accuracy_value','confusion accuracy');".format(
+            base + 3, base
+        )
+    )
+    lines.append(
+        "#{}=GEOMETRIC_REPRESENTATION_CONTEXT(3)GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#{}))GLOBAL_UNIT_ASSIGNED_CONTEXT((#{},#{},#{}));".format(
+            base + 4, base + 3, base, base + 1, base + 2
+        )
+    )
+    lines.append("ENDSEC;")
+    lines.append("END-ISO-10303-21;")
+    return "\n".join(lines)
 
 
 class GeometryFromDictRoundTripTests(unittest.TestCase):
@@ -243,18 +400,85 @@ class SampleFileImportTests(unittest.TestCase):
         self.assertAlmostEqual(sum(abs(sign) for sign in signs) / 2.0, 75.0e-6)
         self.assertEqual(result.errors, ())
 
-    def test_faceted_step_inner_bounds_skipped(self):
+    def test_faceted_step_inner_bounds_block_mass_certification(self):
         path = os.path.join(FIXTURES, "square_with_hole.step")
-        result = load_geometry(path)
-        self.assertFalse(result.unsupported)
-        self.assertEqual(len(result.geometry.triangles), 2)
-        warning = next(
-            (item for item in result.diagnostics if item.code == "step_inner_bounds_skipped"),
-            None,
+        result = load_geometry(path, step_backend="stdlib")
+        self.assertTrue(result.unsupported)
+        self.assertIsNone(result.geometry)
+        self.assertIsNotNone(result.diagnostic)
+        self.assertEqual(result.diagnostic.code, "step_topology_unsupported")
+        self.assertEqual(result.diagnostic.severity, "blocker")
+        self.assertIn("inner bounds (holes)", result.diagnostic.message)
+        self.assertIn("imported volume may be overestimated", result.diagnostic.message)
+        self.assertIn("mass is not certified", result.diagnostic.message)
+        details = dict(result.diagnostic.details)
+        self.assertEqual(details.get("kind"), "holes")
+        self.assertEqual(result.errors, (result.diagnostic,))
+        mass = mass_properties({"plate": result}, {"plate": 1000})
+        self.assertEqual(mass.mass_status, "unknown")
+        self.assertIsNone(mass.mass_kg)
+        self.assertIsNone(mass.objects[0].volume_m3)
+        self.assertTrue(
+            any(
+                "import_diagnostic:step_topology_unsupported" in item
+                for item in mass.objects[0].diagnostics
+            )
         )
-        self.assertIsNotNone(warning)
-        self.assertEqual(warning.severity, "warning")
-        self.assertEqual(result.errors, ())
+
+    def test_faceted_step_plate_with_hole_blocks_mass_certification(self):
+        text = _faceted_step_text(PLATE_WITH_HOLE_FACES)
+        result = load_geometry(text.encode("utf-8"), step_backend="stdlib")
+        self.assertIsInstance(result, GeometryLoadResult)
+        self.assertEqual(result.format, "step")
+        self.assertTrue(result.unsupported)
+        self.assertIsNone(result.geometry)
+        self.assertIsNotNone(result.diagnostic)
+        self.assertEqual(result.diagnostic.code, "step_topology_unsupported")
+        self.assertEqual(result.diagnostic.severity, "blocker")
+        self.assertIn("inner bounds (holes)", result.diagnostic.message)
+        self.assertIn("imported volume may be overestimated", result.diagnostic.message)
+        self.assertIn("mass is not certified", result.diagnostic.message)
+        details = dict(result.diagnostic.details)
+        self.assertEqual(details.get("kind"), "holes")
+        self.assertEqual(result.errors, (result.diagnostic,))
+        mass = mass_properties({"plate": result}, {"plate": 1000})
+        self.assertEqual(mass.mass_status, "unknown")
+        self.assertIsNone(mass.mass_kg)
+        self.assertIsNone(mass.objects[0].volume_m3)
+        self.assertEqual(mass.completeness, 0.0)
+        self.assertTrue(
+            any(
+                "import_diagnostic:step_topology_unsupported" in item
+                for item in mass.objects[0].diagnostics
+            )
+        )
+
+    def test_faceted_step_brep_with_voids_blocks_mass_certification(self):
+        text = _faceted_step_text(_box_faces(10.0), void_shells=(_box_faces(4.0, z0=3.0),))
+        result = load_geometry(text.encode("utf-8"), step_backend="stdlib")
+        self.assertIsInstance(result, GeometryLoadResult)
+        self.assertEqual(result.format, "step")
+        self.assertTrue(result.unsupported)
+        self.assertIsNone(result.geometry)
+        self.assertIsNotNone(result.diagnostic)
+        self.assertEqual(result.diagnostic.code, "step_topology_unsupported")
+        self.assertEqual(result.diagnostic.severity, "blocker")
+        self.assertIn("void shells", result.diagnostic.message)
+        self.assertIn("imported volume may be overestimated", result.diagnostic.message)
+        self.assertIn("mass is not certified", result.diagnostic.message)
+        details = dict(result.diagnostic.details)
+        self.assertEqual(details.get("kind"), "voids")
+        self.assertEqual(result.errors, (result.diagnostic,))
+        mass = mass_properties({"solid": result}, {"solid": 1000})
+        self.assertEqual(mass.mass_status, "unknown")
+        self.assertIsNone(mass.mass_kg)
+        self.assertIsNone(mass.objects[0].volume_m3)
+        self.assertTrue(
+            any(
+                "import_diagnostic:step_topology_unsupported" in item
+                for item in mass.objects[0].diagnostics
+            )
+        )
 
     def test_step_units_fallback_warns(self):
         path = os.path.join(FIXTURES, "faceted_cube_no_units.step")

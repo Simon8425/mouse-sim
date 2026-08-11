@@ -50,7 +50,15 @@ def approved_inputs(**overrides):
         "load_case": {"reviewed": True, "acceptance_requirement_refs": ({"id": "req-1"},)},
         "fixtures": ({"reviewed": True},),
         "tolerance_profile": {"name": "default", "process_profile": "molding"},
-        "correlation_records": ({"record_type": "static_correlation", "review_state": "approved"},),
+        "correlation_records": (
+            {
+                "record_type": "static_correlation",
+                "review_state": "approved",
+                "comparisons": (
+                    {"metric_key": "deflection", "measured": 1.0, "predicted": 1.05},
+                ),
+            },
+        ),
         "requirement": {"status": "active", "acceptance": {"metric_key": "deflection"}},
         "validation_report": {"findings": ()},
         "solver": {"capability_keys": ("static", "nonlinear", "modal")},
@@ -395,37 +403,62 @@ class CorrelationErrorTests(unittest.TestCase):
 
 
 class CorrelationMeasuredGateTests(unittest.TestCase):
-    """CORRELATION_MEASURED: predicted vs measured drop response."""
+    """CORRELATION_MEASURED: predicted vs measured drop response.
 
-    def _correlation(self, conditions=None, r_squared=0.90, bias=0.05):
+    The gate is fail-closed: every statistic is recomputed from the
+    measured/predicted pairs; user-supplied r_squared/bias/relative_error
+    are ignored.  The adversarial tests below intentionally try to make bad
+    data pass.
+    """
+
+    def _condition(self, index, measured, predicted, extra=None):
+        condition = {
+            "drop_id": "drop-{}".format(index),
+            "height_m": 0.5 + 0.25 * index,
+            "surface": "concrete",
+            "orientation": "flat",
+            "metrics": [
+                {"metric_key": "peak_force_n", "measured": measured,
+                 "predicted": predicted},
+                {"metric_key": "peak_accel_g", "measured": 10.0 * measured,
+                 "predicted": 10.0 * predicted},
+            ],
+        }
+        if extra:
+            condition.update(extra)
+        return condition
+
+    def _correlation(self, conditions=None, r_squared=0.99, bias=0.05):
         if conditions is None:
+            # Six near-perfect pairs with distinct measured values:
+            # r^2 ~ 1.0, relative error 5% each, bias ~ 5%.
             conditions = [
-                {
-                    "drop_id": "drop-{}".format(index),
-                    "metrics": [
-                        {"metric_key": "peak_force_n", "measured": 10.0,
-                         "predicted": 10.5, "pass": True},
-                        {"metric_key": "peak_acceleration_m_s2", "measured": 100.0,
-                         "predicted": 98.0, "pass": True},
-                    ],
-                }
-                for index in range(3)
+                self._condition(0, 10.0, 10.5),
+                self._condition(1, 20.0, 20.5),
+                self._condition(2, 30.0, 30.5),
             ]
         return {
             "conditions": conditions,
+            # Reported summary values must be IGNORED by the gate.
             "r_squared": r_squared,
             "bias": bias,
             "verdict": "pass",
             "explanation": "measured-drop campaign",
         }
 
-    def test_measured_correlation_within_acceptance_passes(self):
-        result = evaluate_qualification(
+    def _evaluate(self, correlation):
+        return evaluate_qualification(
             "qualification",
-            **approved_inputs(pipeline_result={"correlation": self._correlation()}),
+            **approved_inputs(pipeline_result={"correlation": correlation}),
         )
+
+    def _gate(self, result):
+        return {item.key: item for item in result.integrity_gates}["CORRELATION_MEASURED"]
+
+    def test_measured_correlation_within_acceptance_passes(self):
+        result = self._evaluate(self._correlation())
         self.assertEqual(result.evidence_disposition, "qualification_pending_review")
-        gate = {item.key: item for item in result.integrity_gates}["CORRELATION_MEASURED"]
+        gate = self._gate(result)
         self.assertTrue(gate.passed)
         self.assertTrue(gate.evaluable)
         self.assertNotIn("CORRELATION_MEASURED", result.blocking_keys)
@@ -433,65 +466,201 @@ class CorrelationMeasuredGateTests(unittest.TestCase):
 
     def test_measured_correlation_too_few_conditions_blocks(self):
         correlation = self._correlation(conditions=self._correlation()["conditions"][:2])
-        result = evaluate_qualification(
-            "qualification", **approved_inputs(pipeline_result={"correlation": correlation})
-        )
+        result = self._evaluate(correlation)
         self.assertEqual(result.evidence_disposition, "qualification_blocked")
         self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
-        gate = {item.key: item for item in result.integrity_gates}["CORRELATION_MEASURED"]
-        self.assertIn("minimum 3 required", gate.explanation)
+        self.assertIn("minimum 3 required", self._gate(result).explanation)
 
     def test_measured_correlation_excess_relative_error_blocks(self):
         conditions = self._correlation()["conditions"]
-        conditions[1]["metrics"][0]["measured"] = 20.0  # rel error 0.9 vs 10.5
-        result = evaluate_qualification(
-            "qualification",
-            **approved_inputs(pipeline_result={"correlation": self._correlation(conditions=conditions)}),
-        )
+        conditions[1]["metrics"][0]["measured"] = 60.0  # rel error ~1.9 vs 20.5
+        result = self._evaluate(self._correlation(conditions=conditions))
         self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
-        gate = {item.key: item for item in result.integrity_gates}["CORRELATION_MEASURED"]
-        self.assertIn("exceeds maximum 0.25", gate.explanation)
+        self.assertIn("exceeds maximum 0.25", self._gate(result).explanation)
 
     def test_measured_correlation_low_r_squared_blocks(self):
-        result = evaluate_qualification(
-            "qualification",
-            **approved_inputs(pipeline_result={"correlation": self._correlation(r_squared=0.70)}),
-        )
+        # Reported r_squared=0.99 is IGNORED; the pairs are anti-correlated
+        # noise so the computed R^2 is far below the minimum.
+        conditions = [
+            self._condition(0, 10.0, 55.0),
+            self._condition(1, 20.0, 5.0),
+            self._condition(2, 30.0, 25.0),
+        ]
+        result = self._evaluate(self._correlation(conditions=conditions))
         self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
-        gate = {item.key: item for item in result.integrity_gates}["CORRELATION_MEASURED"]
-        self.assertIn("r_squared 0.700 below minimum 0.80", gate.explanation)
+        self.assertIn("below minimum", self._gate(result).explanation)
 
     def test_measured_correlation_high_bias_blocks(self):
-        result = evaluate_qualification(
-            "qualification",
-            **approved_inputs(pipeline_result={"correlation": self._correlation(bias=0.25)}),
-        )
+        conditions = [
+            self._condition(0, 10.0, 15.0),
+            self._condition(1, 20.0, 30.0),
+            self._condition(2, 30.0, 45.0),
+        ]
+        result = self._evaluate(self._correlation(conditions=conditions))
         self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
-        gate = {item.key: item for item in result.integrity_gates}["CORRELATION_MEASURED"]
-        self.assertIn("|bias|", gate.explanation)
+        self.assertIn("|computed bias|", self._gate(result).explanation)
 
     def test_measured_correlation_missing_metric_pair_blocks(self):
         conditions = self._correlation()["conditions"]
         conditions[0]["metrics"] = [{"metric_key": "peak_force_n", "pass": True}]
-        result = evaluate_qualification(
-            "qualification",
-            **approved_inputs(pipeline_result={"correlation": self._correlation(conditions=conditions)}),
-        )
+        result = self._evaluate(self._correlation(conditions=conditions))
         self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
-        gate = {item.key: item for item in result.integrity_gates}["CORRELATION_MEASURED"]
-        self.assertIn("lacks numeric measured/predicted values", gate.explanation)
+        self.assertIn("lacks numeric measured/predicted values", self._gate(result).explanation)
 
     def test_measured_correlation_absent_is_non_blocking(self):
         # No measured-drop campaign: the gate is reported as not evaluated
         # and must not block an otherwise clean qualification.
         result = evaluate_qualification("qualification", **approved_inputs())
         self.assertEqual(result.evidence_disposition, "qualification_pending_review")
-        gate = {item.key: item for item in result.integrity_gates}["CORRELATION_MEASURED"]
+        gate = self._gate(result)
         self.assertFalse(gate.passed)
         self.assertFalse(gate.evaluable)
         self.assertFalse(gate.blocker)
         self.assertIn("no measured-drop correlation supplied", gate.explanation)
         self.assertNotIn("CORRELATION_MEASURED", result.blocking_keys)
+
+    # --- Adversarial: bad data must never pass the gate ---
+
+    def test_reported_r_squared_five_is_ignored_and_does_not_pass(self):
+        # r^2 = 5 (physically impossible) reported by the client: the gate
+        # must recompute from the pairs and NOT trust the summary.
+        result = self._evaluate(self._correlation(r_squared=5.0))
+        gate = self._gate(result)
+        self.assertTrue(gate.passed)  # the pairs themselves are genuine
+        self.assertNotIn("CORRELATION_MEASURED", result.blocking_keys)
+        # ...but with garbage pairs the same reported r^2 must NOT rescue it.
+        conditions = [self._condition(i, 10.0 + i, 5.0 + 30.0 * i) for i in range(3)]
+        blocked = self._evaluate(self._correlation(conditions=conditions, r_squared=5.0))
+        self.assertIn("CORRELATION_MEASURED", blocked.blocking_keys)
+
+    def test_reported_r_squared_negative_and_nan_do_not_pass(self):
+        for bogus in (-5.0, float("nan"), float("inf")):
+            result = self._evaluate(self._correlation(r_squared=bogus))
+            self.assertNotIn("CORRELATION_MEASURED", result.blocking_keys, repr(bogus))
+
+    def test_reported_bias_ignored(self):
+        # Reported bias 0.25 (over limit) with genuine pairs: recomputed
+        # bias ~0.05 passes; reported bias is not consulted.
+        result = self._evaluate(self._correlation(bias=0.25))
+        self.assertNotIn("CORRELATION_MEASURED", result.blocking_keys)
+
+    def test_reported_relative_error_ignored(self):
+        conditions = self._correlation()["conditions"]
+        conditions[0]["metrics"][0]["relative_error"] = 0.001  # lie
+        conditions[0]["metrics"][0]["measured"] = 10.0
+        conditions[0]["metrics"][0]["predicted"] = 100.0  # true error ~9x
+        result = self._evaluate(self._correlation(conditions=conditions))
+        self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
+        self.assertIn("exceeds maximum 0.25", self._gate(result).explanation)
+
+    def test_three_identical_conditions_block(self):
+        condition = self._condition(0, 10.0, 10.5)
+        result = self._evaluate(self._correlation(conditions=[condition, condition, condition]))
+        self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
+        self.assertIn("duplicate", self._gate(result).explanation)
+
+    def test_identical_conditions_with_different_ids_block(self):
+        # Same height/surface/orientation under different drop_ids is one
+        # condition repeated, not three independent conditions — even with
+        # DISTINCT measured values (drop_id is a label, not independence).
+        conditions = [
+            self._condition(0, 10.0, 10.5),
+            self._condition(1, 11.0, 11.5),
+            self._condition(2, 12.0, 12.5),
+        ]
+        for index, condition in enumerate(conditions):
+            condition["height_m"] = 1.0
+            condition["surface"] = "concrete"
+            condition["orientation"] = "flat"
+            condition["drop_id"] = "D{}".format(index)
+        result = self._evaluate(self._correlation(conditions=conditions))
+        self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
+        self.assertIn("duplicate", self._gate(result).explanation)
+
+    def test_negative_measured_value_blocks(self):
+        conditions = [
+            self._condition(0, 10.0, 10.5),
+            self._condition(1, 20.0, 20.5),
+            self._condition(2, 30.0, 30.5),
+        ]
+        conditions[0]["metrics"][0]["measured"] = -10.0
+        conditions[0]["metrics"][0]["predicted"] = -10.0
+        result = self._evaluate(self._correlation(conditions=conditions))
+        self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
+        self.assertIn("negative", self._gate(result).explanation)
+
+    def test_two_points_with_perfect_correlation_block(self):
+        conditions = [self._condition(0, 10.0, 10.0), self._condition(1, 20.0, 20.0)]
+        result = self._evaluate(self._correlation(conditions=conditions))
+        self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
+        self.assertIn("minimum 3 required", self._gate(result).explanation)
+
+    def test_three_conditions_with_zero_measurements_block(self):
+        conditions = [
+            {"drop_id": "d{}".format(i), "height_m": 1.0, "surface": "concrete",
+             "orientation": "flat", "metrics": []}
+            for i in range(3)
+        ]
+        result = self._evaluate(self._correlation(conditions=conditions))
+        self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
+        self.assertIn("minimum 3 required", self._gate(result).explanation)
+
+    def test_empty_dataset_blocks(self):
+        result = self._evaluate(self._correlation(conditions=[]))
+        self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
+
+    def test_one_valid_two_invalid_conditions_block(self):
+        valid = self._condition(0, 10.0, 10.5)
+        invalid_one = {"drop_id": "d1", "metrics": []}
+        invalid_two = {"drop_id": "d2", "metrics": []}
+        result = self._evaluate(self._correlation(conditions=[valid, invalid_one, invalid_two]))
+        self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
+        self.assertIn("minimum 3 required", self._gate(result).explanation)
+
+    def test_huge_outlier_blocks(self):
+        conditions = [
+            self._condition(0, 10.0, 10.5),
+            self._condition(1, 20.0, 20.5),
+            self._condition(2, 30.0, 5000.0),
+        ]
+        result = self._evaluate(self._correlation(conditions=conditions))
+        self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
+        self.assertIn("exceeds maximum 0.25", self._gate(result).explanation)
+
+    def test_duplicate_measurement_blocks(self):
+        # Duplicated measured values across conditions: only two distinct
+        # values for three conditions — R^2 is not meaningful.
+        conditions = [
+            {"drop_id": "d0", "height_m": 1.0, "surface": "concrete",
+             "orientation": "flat",
+             "metrics": [{"metric_key": "peak_force_n", "measured": 10.0,
+                          "predicted": 10.5}]},
+            {"drop_id": "d1", "height_m": 1.0, "surface": "concrete",
+             "orientation": "flat",
+             "metrics": [{"metric_key": "peak_force_n", "measured": 10.0,
+                          "predicted": 11.0}]},
+            {"drop_id": "d2", "height_m": 1.0, "surface": "concrete",
+             "orientation": "flat",
+             "metrics": [{"metric_key": "peak_force_n", "measured": 20.0,
+                          "predicted": 20.5}]},
+        ]
+        result = self._evaluate(self._correlation(conditions=conditions))
+        self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
+        self.assertIn("degenerate", self._gate(result).explanation)
+
+    def test_nan_measured_value_blocks(self):
+        conditions = self._correlation()["conditions"]
+        conditions[0]["metrics"][0]["measured"] = float("nan")
+        result = self._evaluate(self._correlation(conditions=conditions))
+        self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
+
+    def test_zero_measured_value_blocks(self):
+        conditions = self._correlation()["conditions"]
+        conditions[0]["metrics"][0]["measured"] = 0.0
+        conditions[0]["metrics"][0]["predicted"] = 0.5
+        result = self._evaluate(self._correlation(conditions=conditions))
+        self.assertIn("CORRELATION_MEASURED", result.blocking_keys)
+        self.assertIn("zero", self._gate(result).explanation)
 
 
 class RequirementEvaluationTests(unittest.TestCase):

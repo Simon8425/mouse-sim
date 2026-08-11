@@ -93,7 +93,7 @@ def _mesh_uncertified(geometry):
     if not isinstance(geometry, TriangleMesh):
         return False, ()
     diagnostics = geometry.diagnostics()
-    if diagnostics.closed and diagnostics.nonmanifold_edges == 0:
+    if diagnostics.closed and diagnostics.nonmanifold_edges == 0 and diagnostics.safe_for_mass_properties:
         return False, ()
     return True, diagnostics.issues
 

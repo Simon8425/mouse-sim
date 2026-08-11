@@ -1,22 +1,44 @@
 import { useProjectStore } from '../state/projectStore';
-import { selectHasStaleResult, selectRunStatusLabel } from '../state/selectors';
+import { selectRunStatusLabel } from '../state/selectors';
 
 export function RunStatus() {
-  const { state } = useProjectStore();
+  const { state, dispatch } = useProjectStore();
   const label = selectRunStatusLabel(state);
-  const hasStaleResult = selectHasStaleResult(state);
-  const isRunning = state.runStatus === 'running';
+  const isBusy = state.runStatus === 'loading' || state.runStatus === 'running';
+  const modeText =
+    state.mode === 'qualification'
+      ? 'Qualification'
+      : state.mode === 'validation'
+        ? 'Validation'
+        : 'Analysis';
 
   return (
-    <div className="run-status" aria-live="polite" aria-atomic="true">
-      <span className="run-status__label">Run</span>
-      <span className="run-status__value">{label.text}</span>
-      {hasStaleResult && !isRunning && state.lastResult !== null ? (
-        <span className="stale-marker" title="A newer analysis run is pending">STALE RESULT</span>
+    <div className="top-bar__status run-status" aria-live="polite" aria-atomic="true">
+      <span className="top-bar__status-label">{modeText}</span>
+      <span className="top-bar__status-value">{label.text}</span>
+      {isBusy ? (
+        <>
+          <div
+            className="run-status__progress"
+            role="progressbar"
+            aria-label="Run progress"
+            aria-valuetext={label.text}
+          >
+            <span aria-hidden="true" />
+          </div>
+          <button
+            type="button"
+            className="btn btn--ghost btn--sm run-status__cancel"
+            aria-label="Cancel running analysis"
+            onClick={() => dispatch({ type: 'CANCEL_RUN' })}
+          >
+            Cancel
+          </button>
+        </>
       ) : null}
-      {state.runStatus === 'error' ? (
-        <span className="badge badge--error" role="status" title={state.runError ?? 'Run failed'}>
-          {state.runError?.slice(0, 100) ?? 'Run failed'}
+      {state.runError ? (
+        <span className="run-status__error" role="status">
+          {state.runError}
         </span>
       ) : null}
     </div>

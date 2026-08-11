@@ -631,7 +631,10 @@ class EnergyPartitionTests(unittest.TestCase):
         self.assertEqual(result.validity, "failed")
         self.assertIn(INVALID_CONTACT_OFFSET, result.flags)
 
-    def test_singular_inertia_skips_partition_with_note(self):
+    def test_singular_inertia_fails_closed(self):
+        # W2-05D: a zero (singular) inertia tensor is not physically
+        # possible; it is rejected as INVALID_INERTIA_TENSOR instead of
+        # silently producing a valid-looking result.
         result = estimate_impact(
             mass_kg=0.1,
             velocity_m_s=4.0,
@@ -639,9 +642,9 @@ class EnergyPartitionTests(unittest.TestCase):
             inertia_tensor_kg_m2=[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
             contact_location_m=(0.01, 0.0, 0.0),
         )
-        self.assertEqual(result.validity, "valid")
+        self.assertEqual(result.validity, "failed")
+        self.assertIn(INVALID_INERTIA_TENSOR, result.flags)
         self.assertIsNone(result.energy_partition)
-        self.assertTrue(any("not invertible" in item for item in result.assumptions))
 
     def test_partition_does_not_claim_solver_capability(self):
         result = estimate_impact(

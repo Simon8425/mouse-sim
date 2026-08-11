@@ -87,7 +87,7 @@ export function createOverlayLayer(
         ctx.fill();
 
         ctx.fillStyle = '#f2f0ea';
-        ctx.font = '600 26px Inter, system-ui, sans-serif';
+        ctx.font = '600 26px Inter Variable';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillText(text, 128, 32);

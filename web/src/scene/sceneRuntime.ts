@@ -33,12 +33,55 @@ export interface RenderStats {
 
 export interface SceneRuntimeOptions {
   canvas: HTMLCanvasElement;
+  /** Pre-created, validated WebGL2 context to hand to THREE. */
+  context?: WebGL2RenderingContext | null;
+  precision?: ShaderPrecision;
   theme: 'light' | 'dark';
   quality: QualityTier;
   onPick: (id: string | null) => void;
   onDoublePick?: (id: string | null) => void;
   onStats?: (stats: RenderStats) => void;
   onDropEnded?: () => void;
+}
+
+export type ShaderPrecision = 'highp' | 'mediump' | 'lowp';
+
+/**
+ * Vertical correction that lifts a rendered model whose bounds have sunk
+ * below the display floor (used by drop playback alignment). Returns the
+ * amount to raise the model, or 0 when it already sits above the floor or
+ * the inputs are not finite.
+ */
+export function floorCorrectionForModel(minZ: number, floorZ: number): number {
+  if (!Number.isFinite(minZ) || !Number.isFinite(floorZ)) return 0;
+  return minZ < floorZ ? floorZ - minZ : 0;
+}
+
+/**
+ * Lowest z of the model's AABB corners after applying the given orientation.
+ * The rotated AABB of the original AABB contains the rotated model, so this
+ * is a conservative lower bound of the model's true lowest point — it never
+ * under-estimates how low the model can reach, which is what the drop
+ * playback floor clamp requires. Falls back to the unrotated minimum z when
+ * the quaternion or bounds are not finite.
+ */
+export function rotatedBoundsMinZ(
+  min: Vec3,
+  max: Vec3,
+  quaternion: THREE.Quaternion,
+): number {
+  const scratch = new THREE.Vector3();
+  let lowest = Infinity;
+  for (let corner = 0; corner < 8; corner += 1) {
+    scratch.set(
+      (corner & 1) === 0 ? min[0] : max[0],
+      (corner & 2) === 0 ? min[1] : max[1],
+      (corner & 4) === 0 ? min[2] : max[2],
+    );
+    scratch.applyQuaternion(quaternion);
+    if (scratch.z < lowest) lowest = scratch.z;
+  }
+  return Number.isFinite(lowest) ? lowest : min[2];
 }
 
 export interface SceneRuntime {
@@ -185,6 +228,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
 
   const renderer = new THREE.WebGLRenderer({
     canvas,
+    context: opts.context ?? undefined,
     antialias: quality !== 'low',
     powerPreference: 'high-performance',
   });
@@ -255,15 +299,18 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       groundMesh = null;
     }
 
-    const size = Math.max(maxDimension * 10, 2.5);
+    const size = Math.max(maxDimension * 4, 0.3);
     floorSize = size;
     const gridColor = theme === 'dark' ? 0x2e2c25 : 0xd8d5cc;
-    gridHelper = new THREE.GridHelper(size, 24, gridColor, gridColor);
+    // 64 divisions at the 4x floor scale keep the squares fine-grained.
+    gridHelper = new THREE.GridHelper(size, 64, gridColor, gridColor);
     gridHelper.rotation.x = Math.PI / 2;
     gridHelper.position.set(
       (boundsUnion.min[0] + boundsUnion.max[0]) / 2,
       (boundsUnion.min[1] + boundsUnion.max[1]) / 2,
-      boundsUnion.min[2] - 0.001,
+      // The floor sits at the physics-world ground plane (z = 0); the 1 mm gap
+      // keeps the grid from z-fighting with the model's lowest contact face.
+      -0.001,
     );
     gridHelper.userData.owned = true;
     scene.add(gridHelper);
@@ -277,7 +324,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       groundMesh.position.set(
         (boundsUnion.min[0] + boundsUnion.max[0]) / 2,
         (boundsUnion.min[1] + boundsUnion.max[1]) / 2,
-        boundsUnion.min[2] - 0.002,
+        -0.002,
       );
       groundMesh.userData.owned = true;
       scene.add(groundMesh);
@@ -292,16 +339,19 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     const cx = (boundsUnion.min[0] + boundsUnion.max[0]) / 2;
     const cy = (boundsUnion.min[1] + boundsUnion.max[1]) / 2;
     const half = floorSize / 2 + floorSize * 0.2;
+    // The model is displayed with its bottom at z=0 (physics floor convention).
+    // Model height in the shifted frame: max[2] - min[2].
+    const modelHeight = boundsUnion.max[2] - boundsUnion.min[2];
     return {
       min: [
         Math.min(boundsUnion.min[0], cx - half),
         Math.min(boundsUnion.min[1], cy - half),
-        boundsUnion.min[2],
+        -0.001,
       ],
       max: [
         Math.max(boundsUnion.max[0], cx + half),
         Math.max(boundsUnion.max[1], cy + half),
-        boundsUnion.max[2],
+        Math.max(modelHeight, 0.001),
       ],
     };
   };
@@ -364,7 +414,11 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
 
   const applyDropTransform = (): void => {
     if (!currentDropSimulation || currentDropSimulation.trajectory.length === 0) {
-      objectsGroup.position.set(0, 0, 0);
+      // No simulation: position the model so its analytical bottom sits exactly
+      // at the physics-world floor (z = 0). The objectsGroup origin is at the
+      // model's mesh-frame origin, which is boundsUnion.min[2] below z = 0, so
+      // lifting by -boundsUnion.min[2] brings the bottom flush with the floor.
+      objectsGroup.position.set(0, 0, -boundsUnion.min[2]);
       objectsGroup.quaternion.identity();
       return;
     }
@@ -374,16 +428,27 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     const resolved = resolveDropSample(t, samples);
     if (!resolved) return;
     const { a, b, alpha } = resolved;
-    objectsGroup.position.set(
-      a[1] + (b[1] - a[1]) * alpha,
-      a[2] + (b[2] - a[2]) * alpha,
-      a[3] + (b[3] - a[3]) * alpha,
-    );
-    objectsGroup.quaternion.slerpQuaternions(
+    const posX = a[1] + (b[1] - a[1]) * alpha;
+    const posY = a[2] + (b[2] - a[2]) * alpha;
+    const posZ = a[3] + (b[3] - a[3]) * alpha;
+    const quaternion = new THREE.Quaternion().slerpQuaternions(
       new THREE.Quaternion(a[4], a[5], a[6], a[7]),
       new THREE.Quaternion(b[4], b[5], b[6], b[7]),
       alpha,
     );
+    // The drop simulation permits spring-contact penetration, so the model's
+    // lowest point can dip below the display floor at the moment of impact
+    // (for G3-20260320.stp, ~2 mm at the peak of a 0.75 m drop; deeper for
+    // rotated poses and higher drops). The lift is pose-aware: it is computed
+    // from the model bounds rotated by the CURRENT playback orientation, so
+    // a corner/edge/tumble pose that dips below the floor at impact is
+    // clamped just like the flat pose. The correction is zero whenever the
+    // model already sits above the floor.
+    // The physics world has its floor at z = 0; the visual floor is at -0.001.
+    const poseLowest = rotatedBoundsMinZ(boundsUnion.min, boundsUnion.max, quaternion);
+    const lift = floorCorrectionForModel(posZ + poseLowest, -0.001);
+    objectsGroup.position.set(posX, posY, posZ + lift);
+    objectsGroup.quaternion.copy(quaternion);
   };
 
   const dropTrajectoryBounds = (simulation: DropSimulationResult): { min: Vec3; max: Vec3 } => {
@@ -436,8 +501,13 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
         // The OCCT glTF converter preserves the STEP Z-up frame. The source
         // assembly is authored from its underside, while this scene presents
         // the engineering top view by default; flip the complete asset once,
-        // without mutating individual assembly placements.
+        // without mutating individual assembly placements. The analysis-mesh
+        // bounds bake this flip into the vertices (x, -y, -z), so the display
+        // transform must be pivot-correct: when the GLB root carries its own
+        // translation, the baked and displayed frames still agree only if the
+        // translation is flipped along the same axes.
         gltf.scene.rotation.x = Math.PI;
+        gltf.scene.position.set(gltf.scene.position.x, -gltf.scene.position.y, -gltf.scene.position.z);
         target.add(gltf.scene);
         const meshes: THREE.Mesh[] = [];
         gltf.scene.traverse((object) => {
@@ -707,7 +777,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       theme = newTheme;
       palette.dispose();
       palette = new MaterialPalette(theme);
-scene.background = new THREE.Color(theme === 'dark' ? 0x141310 : 0xf7f7f4);
+      scene.background = new THREE.Color(theme === 'dark' ? 0x141310 : 0xf7f7f4);
       rebuildObjects();
     },
 
@@ -791,10 +861,12 @@ scene.background = new THREE.Color(theme === 'dark' ? 0x141310 : 0xf7f7f4);
 
     preset(name: CameraPreset) {
       if (disposed) return;
+      // Model is displayed with bottom at z=0; centroid is at half the model height.
+      const modelHeight = boundsUnion.max[2] - boundsUnion.min[2];
       const center = [
         (boundsUnion.min[0] + boundsUnion.max[0]) / 2,
         (boundsUnion.min[1] + boundsUnion.max[1]) / 2,
-        (boundsUnion.min[2] + boundsUnion.max[2]) / 2,
+        modelHeight / 2,
       ] as Vec3;
       const radius = Math.max(maxDimension / 2, 0.05);
       applyCameraPreset(camera, controls, name, center, radius);
@@ -828,7 +900,10 @@ scene.background = new THREE.Color(theme === 'dark' ? 0x141310 : 0xf7f7f4);
       }
       disposeSceneResources(scene);
       renderer.dispose();
-      if (typeof renderer.forceContextLoss === 'function') renderer.forceContextLoss();
+      // Note: do NOT force context loss here. The context is created and
+      // validated by SceneViewport and reused on remounts (React StrictMode
+      // double-mounts in dev); losing it makes the second mount's
+      // getContext('webgl2') fail and the viewport shows "unavailable".
     },
   };
 }

@@ -266,6 +266,23 @@ def _validate_inertia_tensor(value):
         if not all(math.isfinite(item) for item in items):
             raise ValueError("inertia_tensor_kg_m2 components must be finite")
         rows.append(items)
+    # Audit finding (W2-05D): a negative-diagonal tensor passed validation
+    # and was silently clamped inside _energy_partition, producing a
+    # valid-looking result.  A physical inertia tensor is symmetric
+    # positive-definite (Sylvester criterion).
+    if any(
+        abs(rows[i][j] - rows[j][i]) > 1e-9 for i in range(3) for j in range(3)
+    ):
+        raise ValueError("inertia_tensor_kg_m2 must be symmetric")
+    det1 = rows[0][0]
+    det2 = rows[0][0] * rows[1][1] - rows[0][1] * rows[1][0]
+    det3 = (
+        rows[0][0] * (rows[1][1] * rows[2][2] - rows[1][2] * rows[2][1])
+        - rows[0][1] * (rows[1][0] * rows[2][2] - rows[1][2] * rows[2][0])
+        + rows[0][2] * (rows[1][0] * rows[2][1] - rows[1][1] * rows[2][0])
+    )
+    if not (det1 > 0.0 and det2 > 0.0 and det3 > 0.0):
+        raise ValueError("inertia_tensor_kg_m2 must be positive-definite")
     return tuple(rows)
 
 

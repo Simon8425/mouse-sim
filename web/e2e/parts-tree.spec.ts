@@ -88,7 +88,7 @@ test.describe('kernel STEP part tree', () => {
     });
 
     await page.goto('/');
-    await page.getByRole('button', { name: 'Choose geometry file' }).click();
+    await page.getByRole('button', { name: /Drop geometry file/i }).click();
     await page
       .locator('input[type="file"]')
       .setInputFiles(fixturePath('faceted-cube.step'));
@@ -102,7 +102,6 @@ test.describe('kernel STEP part tree', () => {
     await expect(partRows).toHaveCount(2);
     await expect(partRows.nth(0)).toContainText('Shell Top');
     await expect(partRows.nth(1)).toContainText('Wheel');
-    await expect(page.locator('.model-row__material')).toHaveCount(2);
 
     // Eye toggle hides exactly one part.
     await page.locator('.model-row__eye').nth(1).click();
@@ -111,10 +110,13 @@ test.describe('kernel STEP part tree', () => {
     await page.locator('.model-row__eye').nth(1).click();
     await expect(page.locator('.model-row--hidden')).toHaveCount(0);
 
-    // Selecting a part opens the inspector with its name.
+    // Selecting a part opens the inspector with its name and surfaces the
+    // per-part material selector for that row.
     await partRows.nth(1).click();
     await page.locator('.drawer--inspector.is-open').waitFor({ state: 'attached', timeout: 5000 });
     await expect(page.locator('.inspector-panel__object')).toHaveText('Wheel');
+    await expect(page.locator('.model-row__material')).toHaveCount(1);
+    await expect(partRows.nth(1).locator('.model-row__material')).toHaveValue('');
 
     // Per-part material assignment.
     await partRows.nth(1).locator('.model-row__material').selectOption('ABS');

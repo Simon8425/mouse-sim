@@ -1,6 +1,6 @@
 import * as React from 'react';
 
-import { useProjectStore } from './state/projectStore';
+import { useProjectStore, createAnalysisRequestKey } from './state/projectStore';
 import {
   selectObjectEntries,
   selectAnalysisRequest,
@@ -14,17 +14,17 @@ import { ModelTree } from './components/ModelTree';
 import { InspectorPanel } from './components/InspectorPanel';
 import { ResultsRail } from './components/ResultsRail';
 import { FileDropzone } from './components/FileDropzone';
-import { GeometryGuideCard } from './components/GeometryGuideCard';
 import { ViewportToolbar } from './components/ViewportToolbar';
 import { WebGLFallback } from './components/WebGLFallback';
 import { MissionControl } from './components/MissionControl';
+import { RunControls } from './components/RunControls';
 import {
   SceneViewport,
-  useDetectedQuality,
   type SceneViewportHandle,
 } from './scene/SceneViewport';
 import { worldBounds, boundsCenter } from './lib/geometryBounds';
 import type { OverlaySpec } from './scene/overlays';
+import type { QualityTier } from './scene/materialPalette';
 import type { RenderStats } from './scene/sceneRuntime';
 
 /**
@@ -37,12 +37,24 @@ export function App(): React.ReactElement {
   const clientRef = React.useRef(createClient());
   const viewportRef = React.useRef<SceneViewportHandle | null>(null);
 
-  const detectedTier = useDetectedQuality();
-  const quality = state.qualityTier ?? detectedTier;
+  // Render quality is pinned to the low tier (no shadow maps or post
+  // processing); only the render resolution is raised (see sceneRuntime).
+  const quality: QualityTier = 'low';
 
   const [stats, setStats] = React.useState<RenderStats | null>(null);
   const [uploadOpen, setUploadOpen] = React.useState(false);
   const [resultsOpen, setResultsOpen] = React.useState(false);
+
+  // Results open automatically once a run finishes — the user never has to
+  // hunt for the panel after clicking Run. On narrow viewports the panel
+  // would crush the scene, so there it stays collapsed (toggle available).
+  React.useEffect(() => {
+    if (state.runStatus === 'success' || state.runStatus === 'error') {
+      if (window.innerWidth >= 900) {
+        setResultsOpen(true);
+      }
+    }
+  }, [state.runStatus]);
 
   // Theme is locked to neutral dark (#141414).
   React.useEffect(() => {
@@ -112,12 +124,12 @@ export function App(): React.ReactElement {
     };
   }, [needsPartGeometry, partsAssetId, dispatch]);
 
-  // Debounced analysis runner. requestKey covers draft/project/preview
-  // changes; state.mode covers mode switches. The token guard prevents
-  // stale responses from overwriting newer drafts.
+  // Analysis is explicit. Model loading and draft edits prepare the request;
+  // only an incremented runNonce (from a Run button) may start the pipeline.
+  // The token guard prevents stale responses from overwriting newer runs.
   const tokenRef = React.useRef(0);
   const abortRef = React.useRef<AbortController | null>(null);
-  const debounceRef = React.useRef<number | null>(null);
+  const lastStartedKeyRef = React.useRef<string | null>(null);
   // The analysis request is memoized on the state fields the selector reads:
   // createAnalysisRequest builds fresh objects each call, and stringifying the
   // per-part geometry on every dispatch would stall the main thread.
@@ -137,38 +149,67 @@ export function App(): React.ReactElement {
   );
   const analysisRequestRef = React.useRef(analysisRequest);
   analysisRequestRef.current = analysisRequest;
-  const requestKey = React.useMemo(() => JSON.stringify(analysisRequest ?? null), [analysisRequest]);
+
+  // Loading a new source invalidates any pending or in-flight analysis for the
+  // previous source. This is cancellation only; it must never start analysis
+  // for the newly loaded geometry.
+  React.useEffect(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+  }, [state.previewRequestVersion]);
+
+  // Explicit user cancellation (CANCEL_RUN): invalidate the token so any late
+  // response is dropped, then abort the in-flight fetch.
+  React.useEffect(() => {
+    if (state.cancelNonce === 0) return;
+    tokenRef.current += 1;
+    abortRef.current?.abort();
+    abortRef.current = null;
+  }, [state.cancelNonce]);
 
   React.useEffect(() => {
     const request = analysisRequestRef.current;
     if (!request) return;
-    if (debounceRef.current !== null) window.clearTimeout(debounceRef.current);
-    debounceRef.current = window.setTimeout(() => {
-      const token = ++tokenRef.current;
-      abortRef.current?.abort();
-      const controller = new AbortController();
-      abortRef.current = controller;
-      dispatch({ type: 'ANALYZE_START', version: token });
-      clientRef.current
-        .analyze(
-          {
-            schema_id: 'gms.web-analysis-request/1',
-            request,
-            options: { strict: false, use_cache: true },
-          },
-          controller.signal,
-        )
-        .then((res) => dispatch({ type: 'ANALYZE_OK', version: token, result: res.result }))
-        .catch((err: unknown) => {
-          if (isAbortError(err)) return;
-          dispatch({ type: 'ANALYZE_ERROR', version: token, message: errorMessage(err) });
-        });
-    }, 400);
+    const key = createAnalysisRequestKey(request);
+    // Duplicate launch of the request already in flight (double-click on the
+    // same Run button): keep the live fetch, repair the transient 'loading'
+    // state the second launch wrote, and do NOT start a second request.
+    // abortRef is non-null exactly while a fetch is live (nulled on
+    // completion, error, abort, cancel, and source change).
+    if (abortRef.current !== null && lastStartedKeyRef.current === key) {
+      dispatch({ type: 'ANALYZE_START', version: tokenRef.current, requestKey: key });
+      return;
+    }
+    const token = ++tokenRef.current;
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    lastStartedKeyRef.current = key;
+    dispatch({ type: 'ANALYZE_START', version: token, requestKey: key });
+    clientRef.current
+      .analyze(
+        {
+          schema_id: 'gms.web-analysis-request/1',
+          request,
+          options: { strict: false, use_cache: true },
+        },
+        controller.signal,
+      )
+      .then((res) => {
+        if (abortRef.current === controller) abortRef.current = null;
+        dispatch({ type: 'ANALYZE_OK', version: token, requestKey: key, result: res.result });
+      })
+      .catch((err: unknown) => {
+        if (abortRef.current === controller) abortRef.current = null;
+        if (isAbortError(err)) return;
+        dispatch({ type: 'ANALYZE_ERROR', version: token, requestKey: key, message: errorMessage(err) });
+      });
     return () => {
-      if (debounceRef.current !== null) window.clearTimeout(debounceRef.current);
-      abortRef.current?.abort();
+      if (abortRef.current === controller) {
+        abortRef.current?.abort();
+      }
     };
-  }, [requestKey, state.mode, state.runNonce, dispatch]);
+  }, [state.runNonce, dispatch]);
 
   const entries = React.useMemo(
     () => selectObjectEntries(state),
@@ -176,7 +217,7 @@ export function App(): React.ReactElement {
     // geometry for kernel-backed STEP previews (state.partGeometry). Avoid
     // rebuilding scene entries when render stats or unrelated UI state changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [state.project, state.preview, state.tempPreview, state.draft, state.partGeometry],
+    [state.project, state.preview, state.tempPreview, state.partGeometry],
   );
 
   // Nothing loaded yet: show the geometry guide card instead of an empty scene.
@@ -191,6 +232,11 @@ export function App(): React.ReactElement {
         : entries,
     [entries, state.isolatedId],
   );
+  // The scene renders what the tree lists. When a kernel-backed STEP preview
+  // carries per-part geometry, each part is its own selectable object, so
+  // clicking a component picks exactly that part. The native GLB remains the
+  // display representation only for previews without parts (single entry).
+  const sceneEntries = shownEntries;
   const lastResult = state.lastResult;
   const findingSeveritiesRef = React.useRef(selectFindingSeverities(state));
   findingSeveritiesRef.current = selectFindingSeverities(state);
@@ -278,7 +324,6 @@ export function App(): React.ReactElement {
         onOpenNav={() => dispatch({ type: 'SET_NAV_OPEN', open: !state.navOpen })}
         onOpenInspector={() => dispatch({ type: 'SET_INSPECTOR_OPEN', open: !state.inspectorOpen })}
         onOpenControl={() => dispatch({ type: 'SET_CONTROL_OPEN', open: !state.controlOpen })}
-        onFit={() => viewportRef.current?.fit()}
       />
       <div className="workspace">
         <aside
@@ -287,36 +332,58 @@ export function App(): React.ReactElement {
         >
           <ModelTree />
         </aside>
-        <main className="viewport-column">
-          <ViewportToolbar viewport={viewportRef} stats={stats} />
+        <main
+          className="viewport-column"
+          onDragOver={(e) => {
+            e.preventDefault();
+            // The empty-state flat dropzone is already the active uploader;
+            // do not open a second modal over it while dragging a file.
+            if (!showGuideCard && e.dataTransfer.types.includes('Files')) {
+              setUploadOpen(true);
+            }
+          }}
+        >
+          {!showGuideCard && !state.webglError ? (
+            <ViewportToolbar viewport={viewportRef} stats={stats} />
+          ) : null}
           {showGuideCard ? null : (
             <div className="viewport-column__header">
+              <RunControls />
               <button
                 type="button"
-                className="btn"
+                className="btn viewport-column__replace"
                 onClick={() => setUploadOpen(!uploadOpen)}
                 aria-expanded={uploadOpen}
+                title="Replace the loaded model with another file"
               >
-                Upload geometry
+                Replace model
               </button>
             </div>
           )}
-          {uploadOpen ? <FileDropzone onClose={() => setUploadOpen(false)} /> : null}
+          {uploadOpen ? (
+            <FileDropzone onClose={() => setUploadOpen(false)} />
+          ) : null}
           {state.webglError ? (
             <WebGLFallback reason={state.webglError} />
-          ) : showGuideCard ? (
-            <GeometryGuideCard onUpload={() => setUploadOpen(true)} />
+          ) : showGuideCard && !uploadOpen ? (
+            <FileDropzone variant="flat" />
           ) : (
             <SceneViewport
               ref={viewportRef}
-              entries={shownEntries}
+               entries={sceneEntries}
               visibility={state.visibility}
               selectedId={state.selectedId}
               explode={state.explode}
               theme={state.theme}
               quality={quality}
               overlays={overlays}
-              dropSimulation={state.lastResult?.drop_simulation ?? null}
+              dropSimulation={
+                // A stale result's trajectory belongs to the previous
+                // model/inputs; replaying it against the current model can
+                // render the model displaced (floating or under the floor).
+                // Only playback trajectories that match the current inputs.
+                state.stale ? null : (state.lastResult?.drop_simulation ?? null)
+              }
               onDropEnded={() => viewportRef.current?.setDropPlayback?.(false)}
               onPick={(id) => {
                 dispatch({ type: 'SELECT', id });

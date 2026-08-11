@@ -18,8 +18,8 @@ Built bottom-up so each layer rests on verified foundations:
 3. **Materials** — `materials.py`: builtin catalog (ABS, PC/ABS, FR4, LiPo, POM, PTFE, steel),
   tolerant JSON catalog loading, assignment resolution, approval/provenance helpers.
 4. **Collision / validation / qualification** — `collision.py` (AABB clearance, tolerances, pair
-  rules), `validation.py` (DFM-lite findings), `qualification.py` (17-gate readiness model — 12
-  readiness gates plus 5 analysis-integrity gates — with hard exploration/qualification
+  rules), `validation.py` (DFM-lite findings), `qualification.py` (18-gate readiness model — 12
+  readiness gates plus 6 analysis-integrity gates — with hard exploration/qualification
   separation).
 5. **Physics & impact** — `physics.py` (Navier shell, Euler-Bernoulli beam, load templates,
   preflight, solver capabilities), `impact.py` (energy-based estimate, Miner fatigue screening,
@@ -70,9 +70,9 @@ artifacts.
 - `validation.py` — `run_validation`, `ValidationReport`, `ValidationFinding`,
   `check_wall_thickness`, `check_geometry_health`, `check_material`, `check_classification`,
   `check_pcb_clearance`
-- `qualification.py` — `evaluate_qualification`, `GATE_SPECS` (17 gates: 12 readiness + 5
-  integrity `ANALYSIS_VALIDITY`/`IMPACT_VALIDITY`/`CORRELATION_ERROR`/`REQUIREMENT_EVALUATION`/
-  `CONVERGENCE_EVIDENCE`), `QualificationResult`, `QualificationGate`, `impact_qualification_status`,
+- `qualification.py` — `evaluate_qualification`, `GATE_SPECS` (18 gates: 12 readiness + 6
+  integrity `ANALYSIS_VALIDITY`/`IMPACT_VALIDITY`/`CORRELATION_ERROR`/`CORRELATION_MEASURED`/
+  `REQUIREMENT_EVALUATION`/`CONVERGENCE_EVIDENCE`), `QualificationResult`, `QualificationGate`, `impact_qualification_status`,
   `method_supports`
 - `physics.py` — `solve_load_case`, `shell_panel_response`, `beam_response`,
   `preflight_structural_case`, `MOUSE_LOAD_TEMPLATES`, `SOLVER_CAPABILITIES`, `StructuralResponse`

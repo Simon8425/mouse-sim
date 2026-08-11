@@ -8,8 +8,28 @@ bad input.
 
 Screening status vocabulary: ``validity`` is always ``"approximate"`` (the
 constants are class-level engineering data, not calibration measurements);
-``status`` uses marginal bands so knife-edge margins report ``warn`` with a
-``..._MARGINAL`` finding instead of a hard ``fail``.
+``status`` uses a unified knife-edge policy over ``usage_ratio = load /
+allowable`` for every channel:
+
+* ``usage_ratio < 1.0`` -> ``pass``
+* ``1.0 <= usage_ratio < 1.2`` -> ``warn`` (marginal, ``..._MARGINAL``
+  finding; the margin lies within the class-constant screening
+  uncertainty band)
+* ``usage_ratio >= 1.2`` -> ``fail``
+
+Channels expressed as ``margin = allowable / load`` convert equivalently
+(margin <= 1/1.2 ~ 0.8333 -> fail; 1/1.2 < margin <= 1.0 -> warn;
+margin > 1.0 -> pass).  Exactly 1.0 is a marginal ``warn``, never a hard
+``fail``.  Boundary comparisons carry a documented float-noise guard
+(``_WARN_RATIO``/``_FAIL_RATIO``) so ratios constructed by closed-form
+round-off classify by band, not by noise.
+
+Invalid input handling: a spec containing a non-finite (NaN/Inf) value or a
+value beyond the documented screening magnitude range (|value| <= 1e12,
+SI units) is reported ``not_evaluated`` with a finding — such values are
+rejected explicitly and can never silently become a valid default (and
+therefore never pass).  Missing optional fields take the documented
+defaults; missing required context data yields ``not_evaluated``.
 
 Context contract (all keys optional):
     mass_kg, inertia_kg_m2, support, materials,
@@ -28,6 +48,40 @@ COMPONENT_TYPES = ("screw", "clip", "mount", "adhesive")
 _ABS_YIELD_PA = 40e6
 _ABS_COMPRESSIVE_PA = 60e6
 _ABS_MODULUS_PA = 2.0e9
+
+# Unified knife-edge policy (see the module docstring): pass below 1.0, warn
+# (marginal) in [1.0, 1.2), fail at >= 1.2.  The float-noise guard absorbs
+# closed-form round-off so a ratio constructed to land exactly on a boundary
+# is classified by band, not by noise.
+_WARN_RATIO = 1.0 - 1e-9
+_FAIL_RATIO = 1.2 - 1e-9
+
+# Margin (allowable/load) equivalents of the knife-edge boundaries: fail at
+# margin <= 1/1.2, warn at 1/1.2 < margin <= 1.0, pass above; guard included.
+_MARGIN_FAIL = 1.0 / 1.2 + 1e-9
+_MARGIN_WARN = 1.0 + 1e-9
+
+# Documented screening magnitude range (SI): gaming-mouse inputs (forces ~N,
+# stresses ~MPa, accelerations ~k g, ages ~days) never approach 1e12; values
+# beyond it are rejected as implausible instead of being allowed to saturate
+# a ratio into a false pass/fail.
+_MAX_MAGNITUDE = 1e12
+
+
+def _invalid_numeric_fields(spec):
+    """Keys of ``spec`` whose value is non-finite (NaN/Inf) or beyond the
+    documented screening magnitude range.  Such values are rejected by
+    ``analyze`` before any min/max/defaulting can turn them into a valid
+    number, so a bad input can never silently pass."""
+    bad = []
+    for key, value in spec.items():
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(number) or abs(number) > _MAX_MAGNITUDE:
+            bad.append(key)
+    return bad
 
 
 def defaults(component_type):
@@ -168,15 +222,15 @@ def _analyze_screw(spec, context):
         )
     else:
         margin = pullout / total_load
-        if margin < 1.0:
+        if margin <= _MARGIN_FAIL:
             status = "fail"
             findings.append(
-                {"code": "SCREW_PULLOUT_RISK", "severity": "error", "message": "applied load exceeds the boss pull-out force (margin {:.2f})".format(margin)}
+                {"code": "SCREW_PULLOUT_RISK", "severity": "error", "message": "applied load exceeds the boss pull-out force (margin {:.2f}); beyond the class-constant screening uncertainty band".format(margin)}
             )
-        elif margin < 1.2:
+        elif margin <= _MARGIN_WARN:
             status = "warn"
             findings.append(
-                {"code": "SCREW_PULLOUT_MARGINAL", "severity": "warning", "message": "pull-out margin {:.2f} within 20% of the screening threshold".format(margin)}
+                {"code": "SCREW_PULLOUT_MARGINAL", "severity": "warning", "message": "pull-out margin {:.2f} at the screening boundary; within the class-constant screening uncertainty band".format(margin)}
             )
     preload_fraction = preload / pullout if pullout > 0.0 else 1.0
     # Junker-class self-loosening screening: transverse vibration load above
@@ -318,10 +372,15 @@ def _analyze_mount(spec, context):
     findings = []
     status = "pass"
     stress_ratio = stress / eccentric_allowable if eccentric_allowable > 0.0 else 0.0
-    if stress_ratio >= 1.0:
+    if stress_ratio >= _FAIL_RATIO:
         status = "fail"
         findings.append(
-            {"code": "MOUNT_CRUSH", "severity": "error", "message": "drop compression stress {:.1f} MPa exceeds the eccentric-compression allowable {:.1f} MPa".format(stress / 1e6, eccentric_allowable / 1e6)}
+            {"code": "MOUNT_CRUSH", "severity": "error", "message": "drop compression stress {:.1f} MPa exceeds the eccentric-compression allowable {:.1f} MPa beyond the class-constant screening uncertainty band".format(stress / 1e6, eccentric_allowable / 1e6)}
+        )
+    elif stress_ratio >= _WARN_RATIO:
+        status = "warn"
+        findings.append(
+            {"code": "MOUNT_CRUSH_MARGINAL", "severity": "warning", "message": "compression utilization {:.0%} at the screening boundary; within the class-constant screening uncertainty band".format(stress_ratio)}
         )
     elif stress_ratio > 0.8:
         status = "warn"
@@ -401,10 +460,15 @@ def _analyze_adhesive(spec, context):
     utilization = math.sqrt(thermal_shear ** 2 + impact_shear ** 2) / effective_allowable if effective_allowable > 0.0 else 0.0
     findings = []
     status = "pass"
-    if utilization >= 1.0:
+    if utilization >= _FAIL_RATIO:
         status = "fail"
         findings.append(
-            {"code": "ADHESIVE_OVER_UTILIZATION", "severity": "error", "message": "combined joint utilization {:.2f} exceeds the (aged) allowable".format(utilization)}
+            {"code": "ADHESIVE_OVER_UTILIZATION", "severity": "error", "message": "combined joint utilization {:.2f} exceeds the (aged) allowable beyond the class-constant screening uncertainty band".format(utilization)}
+        )
+    elif utilization >= _WARN_RATIO:
+        status = "warn"
+        findings.append(
+            {"code": "ADHESIVE_UTILIZATION_HIGH", "severity": "warning", "message": "combined joint utilization {:.2f} at the screening boundary; within the class-constant screening uncertainty band".format(utilization)}
         )
     elif utilization > 0.7:
         status = "warn"
@@ -445,6 +509,12 @@ def analyze(spec, context):
         return _not_evaluated(component_id, "unknown component type {!r}".format(ctype))
     merged = dict(defaults(ctype))
     merged.update({key: value for key, value in spec.items() if key not in ("type", "component_id")})
+    invalid = _invalid_numeric_fields(merged)
+    if invalid:
+        return _not_evaluated(
+            component_id,
+            "invalid spec fields {}: values must be finite and within the documented screening magnitude range (|value| <= 1e12, SI)".format(", ".join(sorted(invalid))),
+        )
     try:
         result = analyzer(merged, context if isinstance(context, dict) else {})
         result["component_id"] = str(component_id)

@@ -9,9 +9,27 @@ raise on bad input.
 
 Screening status vocabulary: ``validity`` is always ``"approximate"`` for
 these models (their constants are class-level engineering data, not
-calibration measurements); ``status`` uses marginal bands so a knife-edge
-rating (e.g. exactly at the rated cycle count) reports ``warn`` with a
-``..._MARGINAL`` finding instead of a hard ``fail``.
+calibration measurements).  ``status`` uses a unified knife-edge policy
+over ``usage_ratio = load / allowable`` for every channel:
+
+* ``usage_ratio < 1.0`` -> ``pass``
+* ``1.0 <= usage_ratio < 1.2`` -> ``warn`` (marginal, ``..._MARGINAL``
+  finding; the margin lies within the class-constant screening
+  uncertainty band)
+* ``usage_ratio >= 1.2`` -> ``fail``
+
+Exactly 1.0 is a marginal ``warn``, never a hard ``fail``: the constants
+are class-level data, so a knife-edge rating is not distinguishable from
+rating scatter.  Boundary comparisons carry a documented float-noise guard
+(``_WARN_RATIO = 1.0 - 1e-9``, ``_FAIL_RATIO = 1.2 - 1e-9``) so ratios
+constructed by closed-form round-off classify by band, not by noise.
+
+Invalid input handling: a spec containing a non-finite (NaN/Inf) value or a
+value beyond the documented screening magnitude range (|value| <= 1e12,
+SI units) is reported ``not_evaluated`` with a finding — such values are
+rejected explicitly and can never silently become a valid default (and
+therefore never pass).  Missing optional fields take the documented
+defaults; missing required context data yields ``not_evaluated``.
 
 Context contract (all keys optional):
     mass_kg, inertia_kg_m2, support, materials (dict key -> MaterialDefinition),
@@ -33,6 +51,35 @@ COMPONENT_TYPES = ("pcb", "battery", "switch", "encoder")
 # lifetime ratings are quoted in revolutions, so usage in wheel steps must be
 # converted before comparison.
 DETENTS_PER_REVOLUTION = 24
+
+# Unified knife-edge policy (see the module docstring): pass below 1.0, warn
+# (marginal) in [1.0, 1.2), fail at >= 1.2.  The float-noise guard absorbs
+# closed-form round-off so a ratio constructed to land exactly on a boundary
+# is classified by band, not by noise.
+_WARN_RATIO = 1.0 - 1e-9
+_FAIL_RATIO = 1.2 - 1e-9
+
+# Documented screening magnitude range (SI): gaming-mouse inputs (forces ~N,
+# stresses ~MPa, accelerations ~k g, ages ~days) never approach 1e12; values
+# beyond it are rejected as implausible instead of being allowed to saturate
+# a ratio into a false pass/fail.
+_MAX_MAGNITUDE = 1e12
+
+
+def _invalid_numeric_fields(spec):
+    """Keys of ``spec`` whose value is non-finite (NaN/Inf) or beyond the
+    documented screening magnitude range.  Such values are rejected by
+    ``analyze`` before any min/max/defaulting can turn them into a valid
+    number, so a bad input can never silently pass."""
+    bad = []
+    for key, value in spec.items():
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(number) or abs(number) > _MAX_MAGNITUDE:
+            bad.append(key)
+    return bad
 
 
 def defaults(component_type):
@@ -233,35 +280,52 @@ def _analyze_pcb(spec, context):
     thermal_damage = thermal_cycles / cycles_to_failure if cycles_to_failure > 0.0 else 0.0
     findings = []
     status = "pass"
-    if (stress_ratio >= 1.0) or (shock_ratio >= 1.0) or (thermal_damage >= 1.2):
+    flex_fail = stress_ratio >= _FAIL_RATIO
+    shock_fail = shock_ratio >= _FAIL_RATIO
+    thermal_fail = thermal_damage >= _FAIL_RATIO
+    flex_marginal = _WARN_RATIO <= stress_ratio < _FAIL_RATIO
+    shock_marginal = _WARN_RATIO <= shock_ratio < _FAIL_RATIO
+    thermal_marginal = _WARN_RATIO <= thermal_damage < _FAIL_RATIO
+    flex_low = stress_ratio > 0.7
+    thermal_low = thermal_damage > 0.3
+    if flex_fail or shock_fail or thermal_fail:
         status = "fail"
-        if stress_ratio >= 1.0:
+        if flex_fail:
             findings.append(
-                {"code": "PCB_FLEX_OVER_STRESS", "severity": "error", "message": "board flex stress exceeds the FR-4 flexural allowable"}
+                {"code": "PCB_FLEX_OVER_STRESS", "severity": "error", "message": "board flex stress exceeds the FR-4 flexural allowable beyond the class-constant screening uncertainty band"}
             )
-        if shock_ratio >= 1.0:
+        if shock_fail:
             findings.append(
-                {"code": "PCB_SOLDER_SHOCK_FAILURE", "severity": "error", "message": "solder-joint shock shear exceeds the joint allowable"}
+                {"code": "PCB_SOLDER_SHOCK_FAILURE", "severity": "error", "message": "solder-joint shock shear exceeds the joint allowable beyond the class-constant screening uncertainty band"}
             )
-        if thermal_damage >= 1.2:
+        if thermal_fail:
             findings.append(
-                {"code": "PCB_SOLDER_THERMAL_FATIGUE", "severity": "error", "message": "thermal fatigue damage of the solder joints exceeds the screening life"}
+                {"code": "PCB_SOLDER_THERMAL_FATIGUE", "severity": "error", "message": "thermal fatigue damage of the solder joints exceeds the screening life beyond the class-constant screening uncertainty band"}
             )
-    elif (stress_ratio > 0.7) or (shock_ratio > 0.7) or (thermal_damage > 0.3):
+    elif flex_marginal or shock_marginal or thermal_marginal or flex_low or thermal_low:
         status = "warn"
-        if thermal_damage > 0.3:
+        # The [1.0, 1.2) marginal band is checked before the margin-low
+        # bands so the thermal marginal branch is reachable.
+        if thermal_marginal:
+            findings.append(
+                {"code": "PCB_SOLDER_THERMAL_MARGINAL", "severity": "warning", "message": "thermal fatigue damage {:.2f} at the screening-life boundary; within the class-constant screening uncertainty band".format(thermal_damage)}
+            )
+        elif thermal_low:
             findings.append(
                 {"code": "PCB_SOLDER_THERMAL_WEAR", "severity": "warning", "message": "solder-joint thermal fatigue damage {:.2f} approaching the screening life".format(thermal_damage)}
             )
-        if stress_ratio > 0.7:
+        if flex_marginal:
+            findings.append(
+                {"code": "PCB_FLEX_MARGINAL", "severity": "warning", "message": "board flex stress {:.0%} of the allowable at the screening boundary; within the class-constant screening uncertainty band".format(stress_ratio)}
+            )
+        elif flex_low:
             findings.append(
                 {"code": "PCB_FLEX_MARGIN_LOW", "severity": "warning", "message": "board flex stress {:.0%} of the allowable".format(stress_ratio)}
             )
-    elif thermal_damage >= 1.0:
-        status = "warn"
-        findings.append(
-            {"code": "PCB_SOLDER_THERMAL_MARGINAL", "severity": "warning", "message": "thermal fatigue damage {:.2f} at the screening life boundary; within rating scatter".format(thermal_damage)}
-        )
+        if shock_marginal:
+            findings.append(
+                {"code": "PCB_SOLDER_SHOCK_MARGINAL", "severity": "warning", "message": "solder-joint shock shear {:.0%} of the allowable at the screening boundary; within the class-constant screening uncertainty band".format(shock_ratio)}
+            )
     usage_ratio = max(stress_ratio, shock_ratio, thermal_damage)
     metrics = {
         "max_deflection_m": round(deflection, 9) if deflection is not None else None,
@@ -299,16 +363,21 @@ def _analyze_battery(spec, context):
     shock_margin = accel_g / shock_limit if shock_limit > 0.0 else 1.0
     findings = []
     status = "pass"
-    if crush_margin >= 1.0 or shock_margin >= 1.0:
+    if crush_margin >= _FAIL_RATIO or shock_margin >= _FAIL_RATIO:
         status = "fail"
-        if crush_margin >= 1.0:
+        if crush_margin >= _FAIL_RATIO:
             findings.append(
-                {"code": "BATTERY_CRUSH_RISK", "severity": "error", "message": "transmitted drop force {:.1f} N exceeds the cell crush threshold {:.1f} N".format(transmitted, crush)}
+                {"code": "BATTERY_CRUSH_RISK", "severity": "error", "message": "transmitted drop force {:.1f} N exceeds the cell crush threshold {:.1f} N beyond the class-constant screening uncertainty band".format(transmitted, crush)}
             )
-        if shock_margin >= 1.0:
+        if shock_margin >= _FAIL_RATIO:
             findings.append(
-                {"code": "BATTERY_SHOCK_EXCEEDED", "severity": "error", "message": "peak drop acceleration {:.0f} g exceeds the cell shock limit {:.0f} g".format(accel_g, shock_limit)}
+                {"code": "BATTERY_SHOCK_EXCEEDED", "severity": "error", "message": "peak drop acceleration {:.0f} g exceeds the cell shock limit {:.0f} g beyond the class-constant screening uncertainty band".format(accel_g, shock_limit)}
             )
+    elif crush_margin >= _WARN_RATIO or shock_margin >= _WARN_RATIO:
+        status = "warn"
+        findings.append(
+            {"code": "BATTERY_SHOCK_MARGINAL", "severity": "warning", "message": "drop shock utilization {:.0%} of the screening limit at the boundary; within the class-constant screening uncertainty band".format(max(crush_margin, shock_margin))}
+        )
     elif crush_margin > 0.8 or shock_margin > 0.8:
         status = "warn"
         findings.append(
@@ -379,20 +448,20 @@ def _analyze_switch(spec, context):
     findings = []
     status = "pass"
     worst = max(usage_damage, stalk_damage)
-    if worst >= 1.2:
+    if worst >= _FAIL_RATIO:
         status = "fail"
-        if usage_damage >= 1.2:
+        if usage_damage >= _FAIL_RATIO:
             findings.append(
-                {"code": "SWITCH_RATED_LIFE_EXCEEDED", "severity": "error", "message": "actuation cycles exceed the switch class rating by more than rating scatter"}
+                {"code": "SWITCH_RATED_LIFE_EXCEEDED", "severity": "error", "message": "actuation cycles exceed the switch class rating beyond the class-constant screening uncertainty band"}
             )
-        if stalk_damage >= 1.2:
+        if stalk_damage >= _FAIL_RATIO:
             findings.append(
-                {"code": "SWITCH_STALK_FATIGUE", "severity": "error", "message": "button-stalk fatigue damage exceeds the screening life"}
+                {"code": "SWITCH_STALK_FATIGUE", "severity": "error", "message": "button-stalk fatigue damage exceeds the screening life beyond the class-constant screening uncertainty band"}
             )
-    elif worst >= 1.0:
+    elif worst >= _WARN_RATIO:
         status = "warn"
         findings.append(
-            {"code": "SWITCH_RATED_LIFE_MARGINAL", "severity": "warning", "message": "life consumption {:.0%} at the rating boundary; within rating scatter".format(worst)}
+            {"code": "SWITCH_RATED_LIFE_MARGINAL", "severity": "warning", "message": "life consumption {:.0%} at the rating boundary; within the class-constant screening uncertainty band".format(worst)}
         )
     elif worst > 0.7:
         status = "warn"
@@ -435,15 +504,15 @@ def _analyze_encoder(spec, context):
     damage = rotations / rated if rated > 0.0 else 0.0
     findings = []
     status = "pass"
-    if damage >= 1.2:
+    if damage >= _FAIL_RATIO:
         status = "fail"
         findings.append(
-            {"code": "ENCODER_RATED_LIFE_EXCEEDED", "severity": "error", "message": "scroll usage exceeds the encoder class rotation rating by more than rating scatter"}
+            {"code": "ENCODER_RATED_LIFE_EXCEEDED", "severity": "error", "message": "scroll usage exceeds the encoder class rotation rating beyond the class-constant screening uncertainty band"}
         )
-    elif damage >= 1.0:
+    elif damage >= _WARN_RATIO:
         status = "warn"
         findings.append(
-            {"code": "ENCODER_RATED_LIFE_MARGINAL", "severity": "warning", "message": "encoder life consumption {:.0%} at the rating boundary; within rating scatter".format(damage)}
+            {"code": "ENCODER_RATED_LIFE_MARGINAL", "severity": "warning", "message": "encoder life consumption {:.0%} at the rating boundary; within the class-constant screening uncertainty band".format(damage)}
         )
     elif damage > 0.7:
         status = "warn"
@@ -483,6 +552,12 @@ def analyze(spec, context):
         return _not_evaluated(component_id, "unknown component type {!r}".format(ctype))
     merged = dict(defaults(ctype))
     merged.update({key: value for key, value in spec.items() if key not in ("type", "component_id")})
+    invalid = _invalid_numeric_fields(merged)
+    if invalid:
+        return _not_evaluated(
+            component_id,
+            "invalid spec fields {}: values must be finite and within the documented screening magnitude range (|value| <= 1e12, SI)".format(", ".join(sorted(invalid))),
+        )
     try:
         result = analyzer(merged, context if isinstance(context, dict) else {})
         result["component_id"] = str(component_id)

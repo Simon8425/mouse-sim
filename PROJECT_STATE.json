@@ -2,12 +2,32 @@
   "project": "gaming-mouse shell engineering validation platform",
   "engine": {
     "version": "0.1.0",
-    "hash": "e8a010a408f4e17c",
+    "hash": "729783dcfb7805f2026ffdf519b2a6fdd2b2a9f2c4e26c7f1fedafee84ed56e4",
     "engine_hash_modules": [
-      "pipeline", "physics", "drop_sim", "impact", "geometry", "mass",
-      "materials", "validation", "qualification", "units", "collision",
-      "classification", "lifecycle", "components_elec", "components_mech",
-      "profiles", "population"
+      "pipeline",
+      "physics",
+      "drop_sim",
+      "impact",
+      "geometry",
+      "mass",
+      "materials",
+      "validation",
+      "qualification",
+      "units",
+      "collision",
+      "classification",
+      "lifecycle",
+      "components_elec",
+      "components_mech",
+      "profiles",
+      "population",
+      "importers",
+      "canonical",
+      "model",
+      "schema",
+      "step_kernel",
+      "freecad_step_worker",
+      "shell_validation"
     ],
     "schema": {
       "web_analysis_request": "gms.web-analysis-request/1",
@@ -19,38 +39,40 @@
   },
   "git": {
     "branch": "main",
-    "commit_before_session": "ff57855",
-    "commit_after_session": "pending commit of 60 changed paths"
+    "commit_before_session": "5f4066f",
+    "commit_after_session": "pending commit of overnight re-verification phase"
   },
   "working_tree": {
-    "modified_files": 44,
-    "untracked_files": 16,
-    "deleted_files": 0,
-    "notes": "all changes intended; see HANDOFF.md section 3"
+    "modified_files": 52,
+    "untracked_files": 10,
+    "deleted_files": 1,
+    "notes": "overnight re-verification phase: test-run lifecycle hardening (CANCEL_RUN, dedup, mid-run stale fix, launch guards), 3D floor/impact fixes, AI-slop + typography cleanup; baseline deliberately re-frozen at engine hash 729783dc...; see HANDOFF.md section 16"
   },
   "tests": {
-    "backend_total": 713,
-    "backend_passed": 711,
+    "backend_total": 974,
+    "backend_passed": "972 (2 FreeCAD-gated skips) after deliberate baseline re-freeze; see HANDOFF.md section 16",
     "backend_skipped": 2,
     "backend_skipped_reason": "FreeCAD-gated STEP integration (MOUSE_SIM_RUN_SLOW_STEP_INTEGRATION=1)",
-    "frontend_total": 112,
-    "frontend_files": 17,
+    "frontend_total": 202,
+    "frontend_files": 19,
     "typecheck": "clean",
     "lint": "clean",
     "build": "clean",
-    "e2e": {"passed": 72, "failed": 0, "projects": 4},
-    "step_integration": "OK"
+    "e2e": {
+      "passed": "not run on this machine (no backend server / Playwright browsers); specs updated for renamed UI strings"
+    },
+    "step_integration": "not run (FreeCAD absent); stdlib faceted STEP path verified"
   },
   "server": {
-    "command": "python3 -S -m mouse_sim serve --project-root . --web-dist web/dist --port 8898",
+    "command": "python -S -m mouse_sim serve --project-root . --web-dist web/dist --port 8898",
     "port": 8898,
     "url": "http://127.0.0.1:8898/",
-    "status": "running"
+    "status": "not running this session"
   },
   "environment": {
-    "python": "3.9.6",
-    "node": "v22.20.0",
-    "npm": "10.9.3",
+    "python": "3.12.10",
+    "node": "v24.11.1",
+    "npm": "11.x",
     "stdlib_only": true
   },
   "capabilities": {
@@ -62,21 +84,57 @@
     "manufacturing_variation": true,
     "monte_carlo_population": "10,000 units default",
     "deterministic_worst_case": true,
-    "component_screening": ["pcb", "battery", "switch", "encoder", "screw", "clip", "mount", "adhesive"],
-    "usage_profiles": ["esports_fps", "esports_moba", "productivity", "general"],
+    "component_screening": [
+      "pcb",
+      "battery",
+      "switch",
+      "encoder",
+      "screw",
+      "clip",
+      "mount",
+      "adhesive"
+    ],
+    "usage_profiles": [
+      "esports_fps",
+      "esports_moba",
+      "productivity",
+      "general"
+    ],
     "confidence_system": "physical-model vs statistical, split",
-    "classification": ["safe", "marginal", "failed", "unsupported", "invalid_input", "insufficient_evidence"],
+    "classification": [
+      "safe",
+      "marginal",
+      "failed",
+      "unsupported",
+      "invalid_input",
+      "insufficient_evidence"
+    ],
     "measured_drop_correlation": true,
-    "step_import": "FreeCAD worker; stdlib parser for small faceted fixtures only"
+    "step_import": "FreeCAD worker; stdlib parser for small faceted fixtures only",
+    "validation_mode": "shell validation preparation: pinned config, k sweep, sensitivity, measured comparison, trace, model status",
+    "physical_validation_ui": "Physical Shell Validation card: prototype measured values, drop/contact config, measured tests with sensor/surface definitions, atomic commit to validation mode",
+    "validation_tracks": "drop dynamics vs structural (separate; drop force does not feed the structural SF)",
+    "model_status": "unvalidated | partially_validated | correlated | outside_validated_domain",
+    "validation_equivalence_gate": "non-equivalent conditions (corner/edge/top, off-CoM/axis sensors, missing sensor definitions) are EXCLUDED from the correlation verdict in ALL modes; correlated requires >= 3 equivalent identity-consistent conditions with a peak-accel comparison; confidence high requires correlated",
+    "validation_identity": "duplicate conditions keyed on the resolved quaternion (sign-canonicalized); prototype identity (cad_revision/material/prototype_id) cross-checked; comparison rows paired by test_id"
   },
   "known_limitations": [
-    "contact stiffness k=1e5 N/m screening convention (uncalibrated; measured 2e5-1e6)",
-    "self-intersection unverified above 5000 triangles (disclosed)",
-    "float NaN in any request field aborts the run (PIPELINE_INTERNAL)",
+    "contact stiffness k=1e5 N/m screening convention (uncalibrated; measured 2e5-1e6; k sweep shows ~3x force spread)",
+    "self-intersection unverified above 5000 triangles (disclosed; blocks safe/high confidence)",
+    "float NaN in any request field aborts the run (PIPELINE_INTERNAL; fail-closed)",
     "first-impact speed under-reported by ~g*dt/2 (semi-implicit Euler, conservative)",
-    "corner-orientation settle non-monotonic in restitution (chaotic, energetically clean)",
+    "corner-orientation settle non-monotonic in restitution (chaotic, energetically clean; may not settle within 8 s)",
     "battery crush loads cell by own inertia with 0.5 transmission (disclosed)",
     "multi-point contact manifolds not implemented",
-    "crack propagation / detailed solder / battery chemistry not implemented"
+    "crack propagation / detailed solder / battery chemistry not implemented",
+    "lifecycle aggregate (count, energy) path is the documented uniform-event approximation",
+    "thin-penetration blind zone of ~mesh diagonal x 1e-9 in geometry interpenetration screening",
+    "model_status becomes correlated only with a passed >=3-condition measured correlation; the UI cannot yet EDIT a validation section (baseline documents can carry one; mode passthrough added)",
+    "gravity conventions: integrator 9.81 vs g-unit conversions 9.80665 (0.03%, disclosed)",
+    "2.0 m flat drops on 10 mm shells trigger the documented excessive-penetration warning at k=1e5",
+    "simulated peak acceleration is CoM-frame quasi-static linear-spring; surface-mounted sensor readings include rotational terms for corner/edge impacts (per-row equivalence flag; factor ~2-3)",
+    "NaN/Inf outside validation-mode fields still abort with PIPELINE_INTERNAL (documented fail-closed)",
+    "explicit quaternions (incl. identity [1,0,0,0]) are treated as non-equivalent even when physically flat \u2014 fail-closed, never inflates the verdict",
+    "bias pool mixes dimensionless relative errors across quantities (g/s); opposite-sign systematic errors can cancel \u2014 the binding gate is the per-metric 25% bound"
   ]
 }

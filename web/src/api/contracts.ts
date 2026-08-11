@@ -205,6 +205,104 @@ export type DropTestKind = 'drop' | 'impact' | 'tumble';
 export type DropSurface = 'concrete' | 'wood' | 'foam' | 'steel';
 export type DropOrientation = 'flat' | 'edge' | 'corner' | 'random';
 
+/** Orientation mode string, or an explicit unit quaternion object [w, x, y, z]. */
+export type ValidationOrientation = DropOrientation | { quaternion_wxyz: [number, number, number, number] };
+
+/** Surface table key, or an explicit {type, definition} override for a measured test. */
+export interface ValidationMeasuredSurface {
+  type: string;
+  definition?: {
+    thickness_m?: number;
+    hardness?: number | string;
+    mounting?: string;
+    notes?: string;
+  };
+}
+
+/** Sensor definition of a measured test (exact measurement definition). */
+export interface ValidationSensor {
+  model?: string;
+  location_body_m?: Vec3;
+  sampling_rate_hz?: number;
+  filter?: string;
+  sync?: string;
+  quantity?: 'resultant_peak_g' | 'axis_peak_g';
+  axis?: 'x' | 'y' | 'z' | '-x' | '-y' | '-z';
+  notes?: string;
+}
+
+/** One physical instrumented drop test recorded for comparison. */
+export interface ValidationMeasuredTest {
+  test_id: string;
+  cad_revision?: string;
+  material?: string;
+  prototype_id?: string;
+  height_m: number;
+  surface: string | ValidationMeasuredSurface;
+  orientation: ValidationOrientation;
+  environment?: Record<string, unknown>;
+  sensor?: ValidationSensor;
+  measured_peak_accel_g?: number;
+  measured_impact_duration_s?: number;
+  measured_settle_s?: number;
+  measured_peak_accel_g_uncertainty?: number;
+  measured_impact_duration_s_uncertainty?: number;
+  measured_settle_s_uncertainty?: number;
+}
+
+/** Measured prototype pin: absolute overrides for mass/CoM/inertia. */
+export interface ValidationPrototype {
+  mass_kg?: number;
+  com_m?: Vec3;
+  inertia_kg_m2?: Mat3Rows;
+  thickness_m?: number;
+  material?: string;
+  cad_revision?: string;
+}
+
+/**
+ * The pinned validation section (request key "validation"). Makes the shell
+ * chain SELF-CONTAINED: geometry, material, drop, contact and structural
+ * configuration are pinned explicitly; nothing is silently inherited.
+ * Mirrors mouse_sim/shell_validation.py exactly.
+ */
+export interface ValidationSection {
+  geometry: {
+    revision: string;
+    units?: string;
+    quality?: string;
+  };
+  material: string;
+  prototype?: ValidationPrototype;
+  drop: {
+    height_m: number;
+    surface: DropSurface;
+    orientation: ValidationOrientation;
+    gravity_m_s2?: number;
+    mass_scale?: number;
+    inertia_scale?: number;
+    com_override_m?: Vec3;
+  };
+  contact: {
+    stiffness_n_per_m: number;
+    restitution?: number;
+    friction?: number;
+    timestep_s?: number;
+    substeps?: number;
+  };
+  structural: {
+    model: string;
+    boundary_assumptions?: string;
+    supported_validity?: string;
+  };
+  contact_stiffness_sweep_n_per_m?: number[];
+  sensitivity?: {
+    perturbation_fraction?: number;
+    parameters?: string[];
+  };
+  measured_tests?: ValidationMeasuredTest[];
+}
+
 export interface DropSimulationConfig {
   test: DropTestKind;
   height_m: number;
@@ -226,6 +324,11 @@ export interface DropSimulationDrop {
   peak_kinetic_energy_j: number;
   peak_raw_kinetic_energy_j?: number;
   orientation: DropOrientation;
+  orientation_quaternion_wxyz?: number[];
+  gravity_vector_body?: number[];
+  initial_angular_velocity_rad_s?: number[];
+  initial_velocity_m_s?: number[];
+  starting_pose_m?: number[];
   energy?: {
     release_j: number | null;
     first_impact_j: number | null;
@@ -268,6 +371,19 @@ export type DropTrajectorySample = [
   number,
 ];
 
+/**
+ * Inputs used by the drop-derived linear-spring quasi-static peak force
+ * estimate attached to the drop simulation result.
+ */
+export interface DropPeakForceEstimate {
+  mass_kg?: number;
+  restitution?: number;
+  energy_j?: number;
+  impact_speed_m_s?: number;
+  contact_stiffness_n_per_m?: number;
+  model?: string;
+}
+
 export interface DropSimulationResult {
   config: DropSimulationConfig;
   model: {
@@ -282,6 +398,11 @@ export interface DropSimulationResult {
     restitution?: number;
     friction?: number;
     com_offset_m?: number[];
+    orientation_quaternion_wxyz?: number[];
+    gravity_vector_body?: number[];
+    initial_angular_velocity_rad_s?: number[];
+    initial_velocity_m_s?: number[];
+    starting_pose_m?: number[];
     variation?: {
       unit_seed: number | null;
       mass_scale: number;
@@ -296,6 +417,8 @@ export interface DropSimulationResult {
   checks?: DropSimulationCheck[];
   peak: DropSimulationImpact | null;
   peak_force_estimate_n: number | null;
+  peak_force_estimate?: DropPeakForceEstimate | null;
+  contact_stiffness_n_per_m?: number | null;
   trajectory: DropTrajectorySample[];
 }
 
@@ -304,6 +427,8 @@ export interface PipelineRequest {
   mode?: string;
   units?: string;
   objects?: ProjectObject[] | Record<string, unknown>;
+  /** Server-side reference for a normalized STEP asset; avoids resending its mesh. */
+  geometry_asset_id?: string;
   materials?: unknown;
   default_material?: string;
   load_case?: Record<string, unknown> | null;
@@ -314,6 +439,7 @@ export interface PipelineRequest {
   tolerance_profile?: Record<string, unknown> | null;
   components?: unknown[];
   population?: Record<string, unknown> | null;
+  validation?: ValidationSection | null;
   options?: Record<string, unknown>;
   [key: string]: unknown;
 }
@@ -442,6 +568,17 @@ export interface StructuralResponse {
   validity: string;
 }
 
+/**
+ * The material definition actually used by the structural solve, or null
+ * when no material could be resolved.
+ */
+export interface ResolvedMaterial {
+  name?: string;
+  properties?: Record<string, unknown>;
+  provenance?: Record<string, unknown> | null;
+  approval_state?: string;
+}
+
 export interface StructuralSection {
   load_case: Record<string, unknown>;
   structure: Record<string, unknown>;
@@ -449,6 +586,7 @@ export interface StructuralSection {
   fixtures: unknown;
   preflight: PreflightFinding[];
   response: StructuralResponse;
+  resolved_material?: ResolvedMaterial | null;
 }
 
 export interface ImpactEstimate {
@@ -472,12 +610,24 @@ export interface ImpactEstimate {
   peak_force_estimate_n?: number | null;
 }
 
+/**
+ * Cross-reference emitted when BOTH a user-supplied impact section and a drop
+ * simulation ran: the drop-derived integrator estimate vs the standalone
+ * quasi-static impact model.
+ */
+export interface ImpactCrossReference {
+  drop_derived_peak_force_estimate_n?: number | null;
+  drop_derived_energy_j?: number | null;
+  note?: string;
+}
+
 export interface ImpactSection {
   source?: string;
   mass_kg: number | null;
   result: ImpactEstimate | null;
   reason: string | null;
   unsupported_failure_modes: string[];
+  cross_reference?: ImpactCrossReference | null;
 }
 
 export interface QualificationGate {
@@ -572,6 +722,262 @@ export interface ShellStatisticalConfidence {
 }
 
 /**
+ * Physical-validation model status — four states (freeze-phase item 12):
+ * unvalidated, partially_validated, correlated, outside_validated_domain.
+ */
+export type ShellModelStatus =
+  | 'unvalidated'
+  | 'partially_validated'
+  | 'correlated'
+  | 'outside_validated_domain'
+  | string;
+
+/** Physical-validation state accompanying the model status. */
+export interface ShellPhysicalValidation {
+  status?:
+    | 'no_measured_tests'
+    | 'compared_not_accepted'
+    | 'insufficient_conditions'
+    | 'validated'
+    | 'outside_validated_domain'
+    | string;
+  independent_conditions?: number;
+  compared_conditions?: number;
+  validated_domain?: {
+    conditions?: [number, string, string][];
+    note?: string;
+  };
+  identity_checked?: boolean;
+  note?: string;
+}
+
+/** One "what would invalidate this result?" entry. */
+export interface ShellInvalidatingAssumption {
+  assumption: string;
+  status: string;
+  impact: string;
+}
+
+/**
+ * One authoritative record of every quantity used by the shell result.
+ * Deep shapes are all optional so consumers can guard every read.
+ */
+export interface ShellInputsTrace {
+  geometry?: {
+    objects?: string[];
+    geometry_digest?: string;
+  };
+  material?: {
+    label?: string | null;
+    properties?: Record<string, unknown>;
+  };
+  mass?: {
+    mass_kg?: number | null;
+    mass_status?: string;
+    density_kg_m3?: number | null;
+  };
+  inertia?: {
+    center_of_mass_m?: Vec3 | null;
+    inertia_tensor_kg_m2?: number[][] | null;
+  };
+  drop?: {
+    height_m?: number | null;
+    gravity_m_s2?: number | null;
+    orientation?: string | null;
+    orientation_quaternion_wxyz?: number[] | null;
+    initial_velocity_m_s?: number[] | null;
+    initial_angular_velocity_rad_s?: number[] | null;
+    surface?: string | null;
+    restitution?: number | null;
+    friction?: number | null;
+    timestep_s?: number | null;
+    integrator?: string | null;
+  };
+  contact?: {
+    contact_stiffness_n_per_m?: number | null;
+    peak_force_estimate?: Record<string, unknown> | null;
+  };
+  structural?: {
+    model?: string | null;
+    load_case?: Record<string, unknown> | null;
+    boundary_assumptions?: string;
+    safety_factor_derivation?: string;
+    safety_factor?: number | null;
+  };
+  engine?: {
+    version?: string;
+    engine_hash?: string;
+  };
+  seed?: number;
+}
+
+/** One row of the contact-stiffness sweep. */
+export interface ShellContactStiffnessSweepRow {
+  contact_stiffness_n_per_m?: number | null;
+  peak_force_n?: number | null;
+  peak_acceleration_m_s2?: number | null;
+  impulse_n_s?: number | null;
+  contact_duration_s?: number | null;
+  contact_compression_m?: number | null;
+  load_path_stress_pa?: number | null;
+  safety_factor?: number | null;
+}
+
+export interface ShellContactStiffnessSweep {
+  rows?: ShellContactStiffnessSweepRow[];
+  note?: string;
+}
+
+/** Low/high/nominal of one quantity across the swept stiffness values. */
+export interface ShellUncertaintyBand {
+  low?: number | null;
+  high?: number | null;
+  nominal?: number | null;
+}
+
+/** Spread of each quantity across the k sweep — NOT a confidence interval. */
+export interface ShellUncertaintyBands {
+  basis?: 'contact_stiffness_sweep' | 'not_computed' | string;
+  band?: Partial<{
+    peak_force_n: ShellUncertaintyBand;
+    peak_acceleration_m_s2: ShellUncertaintyBand;
+    contact_duration_s: ShellUncertaintyBand;
+    contact_compression_m: ShellUncertaintyBand;
+    load_path_stress_pa: ShellUncertaintyBand;
+    safety_factor: ShellUncertaintyBand;
+  }>;
+  note?: string;
+}
+
+/** One per-output sensitivity of one parameter. */
+export interface ShellSensitivityOutput {
+  output?: string;
+  sensitivity_up?: number | null;
+  sensitivity_down?: number | null;
+}
+
+export interface ShellSensitivityRow {
+  parameter?: string;
+  perturbation_fraction?: number;
+  mean_relative_response?: number;
+  outputs?: ShellSensitivityOutput[];
+}
+
+export interface ShellSensitivity {
+  rows?: ShellSensitivityRow[];
+  top_parameters?: string[];
+  note?: string;
+}
+
+/** One measured-vs-simulated comparison row. */
+export interface ShellMeasuredComparisonRow {
+  test_id?: string;
+  cad_revision?: string;
+  material?: string;
+  prototype_id?: string;
+  height_m?: number;
+  surface?: string;
+  orientation?: unknown;
+  environment?: Record<string, unknown>;
+  sensor?: Record<string, unknown>;
+  measured?: Partial<{
+    measured_peak_accel_g: number | null;
+    measured_impact_duration_s: number | null;
+    measured_settle_s: number | null;
+  }>;
+  uncertainty?: Partial<{
+    measured_peak_accel_g_uncertainty: number | null;
+    measured_impact_duration_s_uncertainty: number | null;
+    measured_settle_s_uncertainty: number | null;
+  }>;
+  simulated?: {
+    peak_acceleration_g?: number | null;
+    measured_g?: number | null;
+  } | null;
+  absolute_error_g?: number;
+  relative_error?: number;
+  measured_minus_uncertainty_g?: number;
+  measured_plus_uncertainty_g?: number;
+  /** The compared quantity is CoM-frame equivalent only for flat impacts with a sensor at/near the CoM reading the resultant peak. */
+  equivalent?: boolean;
+  equivalence_note?: string;
+  simulated_quantity?: string;
+  settle_criterion?: string;
+  surface_definition?: Record<string, unknown>;
+  surface_table_parameters?: Record<string, unknown>;
+  revision_mismatch?: boolean;
+  revision_mismatch_note?: string;
+  uncertainty_missing?: boolean;
+  uncertainty_missing_metrics?: string[];
+  identity_mismatch?: boolean;
+  identity_mismatch_note?: string;
+  missing_simulation?: boolean;
+  identity_ok?: boolean;
+}
+
+export interface ShellMeasuredComparisonAggregate {
+  count?: number;
+  bias_g?: number;
+  rmse_g?: number;
+  max_abs_error_g?: number;
+}
+
+export interface ShellMeasuredComparison {
+  rows?: ShellMeasuredComparisonRow[];
+  aggregate?: ShellMeasuredComparisonAggregate;
+  note?: string;
+}
+
+/** Bias/RMSE of the measured comparison per swept stiffness value. */
+export interface ShellMeasuredKSensitivity {
+  rows?: Array<{
+    contact_stiffness_n_per_m?: number;
+    bias_g?: number;
+    rmse_g?: number;
+  }>;
+  note?: string;
+}
+
+/**
+ * Validation-mode preparation artifacts attached to the shell result.
+ * Emitted only in validation mode; nothing here modifies the physics.
+ */
+export interface ShellValidationPreparation {
+  config?: Record<string, unknown>;
+  note?: string;
+  contact_stiffness_sweep?: ShellContactStiffnessSweep | null;
+  uncertainty_bands?: ShellUncertaintyBands | null;
+  sensitivity?: ShellSensitivity | null;
+  measured_comparison?: ShellMeasuredComparison | null;
+  measured_k_sensitivity?: ShellMeasuredKSensitivity | null;
+  /** Shell-only explicitness: which objects are the engineering target. */
+  physically_represented?: string[];
+  /** Internal components that exist only as physical context. */
+  context_only?: string[];
+  context_note?: string;
+  /** The two SEPARATE validation tracks (drop-dynamics vs structural). */
+  tracks?: {
+    drop_dynamics?: {
+      validated_quantities?: string[];
+      validates?: string[];
+      note?: string;
+    };
+    structural?: {
+      validated_quantities?: string[];
+      requires?: string;
+      note?: string;
+    };
+  };
+  /** Measured prototype mass vs the geometry-derived mass, when pinned. */
+  prototype_mass_disclosure?: {
+    measured_kg?: number | null;
+    model_kg?: number | null;
+    delta_pct?: number | null;
+    note?: string;
+  };
+}
+
+/**
  * Authoritative shell FEA result. Every field is optional — the backend may
  * omit any of them, so consumers must guard every read.
  */
@@ -590,6 +996,11 @@ export interface ShellResult {
   assumptions?: string[];
   limitations?: string[];
   loading?: ShellDropLoading | null;
+  model_status?: ShellModelStatus | null;
+  physical_validation?: ShellPhysicalValidation | null;
+  invalidating_assumptions?: ShellInvalidatingAssumption[];
+  inputs_trace?: ShellInputsTrace | null;
+  validation?: ShellValidationPreparation | null;
 }
 
 /** One component in the secondary screening list. */

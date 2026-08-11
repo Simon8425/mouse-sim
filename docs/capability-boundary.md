@@ -27,7 +27,7 @@ claims.
 | Structural screening | Navier simply-supported thin plate (`shell_navier_v1`); Euler-Bernoulli beam (`beam_closed_form_v1`) | Linear elastic, small deflection, SI values, closed-form series |
 | Impact screening | Energy/momentum-balance (`energy_quasi_static_v1`) | Peak force, peak acceleration, contact duration, optional load-path stress, translation/rotation energy partition when inertia is supplied |
 | DFM-lite validation | Wall thickness, geometry health, material approval/provenance, classification, tolerance-aware PCB clearance | Structured findings with `evidence_blocking` severity |
-| Qualification readiness | 17-gate model: 12 readiness gates + 6 integrity gates | Hard exploration/qualification separation; promotion to accepted evidence never performed |
+| Qualification readiness | 18-gate model: 12 readiness gates + 6 integrity gates | Hard exploration/qualification separation; promotion to accepted evidence never performed |
 
 Every result records its assumptions and an explicit unsupported-failure-mode list;
 results carry validity states (`valid | approximate | inconclusive | failed`, impact

@@ -32,16 +32,30 @@ export async function modelLoaded(page: Page): Promise<void> {
   await page.goto('/');
   // The project heading is intentionally hidden by the compact mobile layout;
   // presence confirms the app booted without requiring a desktop-only element.
-  await expect(page.getByRole('heading', { name: /mouse_sim/ })).toHaveCount(1, { timeout: 15_000 });
+  await expect(page.getByRole('heading', { name: /mouse\s*sim/i })).toHaveCount(1, { timeout: 15_000 });
   await expect(page.locator('.model-row')).toHaveCount(0, { timeout: 15_000 });
-  await page.getByRole('button', { name: 'Choose geometry file' }).click();
+  await page.getByRole('button', { name: /Drop geometry file/i }).click();
   await page.locator('input[type="file"]').setInputFiles(fixturePath('analytic.json'));
   await expect(page.locator('.model-row')).toHaveCount(1, { timeout: 15_000 });
 }
 
-/** Waits until the analysis run reports 'Complete' in the Settings panel. */
+/** Launches the standard drop test from the viewport run bar. */
+export async function runStandardTest(page: Page): Promise<void> {
+  if (await page.locator('.drawer--nav.is-open').count()) {
+    await page.getByRole('button', { name: 'Toggle model navigator' }).click();
+  }
+  await page.getByRole('button', { name: 'Run test' }).click();
+}
+
+/** Waits until the top-bar run status reports 'Complete'. */
 export async function expectRunComplete(page: Page): Promise<void> {
-  await page.getByRole('button', { name: 'Control panel' }).click();
-  await expect(page.locator('.mission-control')).toContainText('Complete', { timeout: 15_000 });
-  await page.getByRole('button', { name: 'Close settings panel' }).click();
+  await expect(page.locator('.run-status')).toContainText('Complete', { timeout: 15_000 });
+}
+
+/** Expands the results rail if it is still collapsed. */
+export async function openResultsRail(page: Page): Promise<void> {
+  if (await page.locator('.results-rail--collapsed').count()) {
+    await page.getByRole('button', { name: 'Show results rail' }).click();
+  }
+  await expect(page.locator('.results-rail')).toBeVisible({ timeout: 5_000 });
 }

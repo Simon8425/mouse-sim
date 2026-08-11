@@ -8,14 +8,17 @@ import type { GeometryPreview, ImportDiagnostic, MeshGeometryJson } from '../api
 
 export interface FileDropzoneProps {
   onClose?: () => void;
+  variant?: 'flat' | 'modal';
 }
 
-export function FileDropzone({ onClose }: FileDropzoneProps): React.ReactElement {
+export function FileDropzone({ onClose, variant = 'modal' }: FileDropzoneProps): React.ReactElement {
   const { state, dispatch } = useProjectStore();
   const clientRef = React.useRef(createClient());
   const inputRef = React.useRef<HTMLInputElement | null>(null);
   const uploadVersionRef = React.useRef(0);
   const abortRef = React.useRef<AbortController | null>(null);
+  const onCloseRef = React.useRef(onClose);
+  onCloseRef.current = onClose;
 
   const [selectedFile, setSelectedFile] = React.useState<File | null>(null);
   const [selectedUnits, setSelectedUnits] = React.useState<LengthUnit>('mm');
@@ -24,10 +27,22 @@ export function FileDropzone({ onClose }: FileDropzoneProps): React.ReactElement
   const processingNameRef = React.useRef<string | null>(null);
 
   React.useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onCloseRef.current?.();
+      }
+    };
+    document.addEventListener('keydown', handleKeyDown);
     return () => {
       uploadVersionRef.current += 1;
       abortRef.current?.abort();
+      document.removeEventListener('keydown', handleKeyDown);
     };
+    // Mounted once per dialog lifetime: the cleanup aborts the in-flight
+    // upload on unmount only. Depending on `onClose` here would re-run the
+    // cleanup on every store dispatch (App re-renders pass a fresh callback),
+    // silently aborting the very request the dialog just started.
   }, []);
 
   const invalidateUpload = (): number => {
@@ -62,6 +77,7 @@ export function FileDropzone({ onClose }: FileDropzoneProps): React.ReactElement
       const preview = await clientRef.current.normalizeGeometry(
         {
           format,
+          units: selectedUnits,
           name: file.name,
           body: buf,
         },
@@ -217,8 +233,11 @@ export function FileDropzone({ onClose }: FileDropzoneProps): React.ReactElement
     }
   };
 
-  return (
-    <div className="file-dropzone-modal">
+  const isFlat = variant === 'flat';
+  const processingName = processingNameRef.current ?? 'geometry file';
+
+  const innerContent = (
+    <>
       <input
         ref={inputRef}
         type="file"
@@ -232,8 +251,18 @@ export function FileDropzone({ onClose }: FileDropzoneProps): React.ReactElement
       />
 
       {isParsing && !selectedFile ? (
-        <div className="dropzone-processing">
-          <p>Processing <strong>{processingNameRef.current ?? 'geometry file'}</strong>… this can take a while for large STEP models.</p>
+        <div className="dropzone-processing" role="status" aria-live="polite">
+          <div className="import-progress-minimal">
+            <div className="import-progress-minimal__text">
+              <span>Importing <code>{processingName}</code></span>
+            </div>
+            <div className="import-progress-minimal__track" aria-hidden="true">
+              <span />
+            </div>
+            <div className="import-progress-minimal__status">
+              <span>Preparing preview...</span>
+            </div>
+          </div>
         </div>
       ) : !selectedFile ? (
         <div
@@ -255,7 +284,19 @@ export function FileDropzone({ onClose }: FileDropzoneProps): React.ReactElement
             }
           }}
         >
+          <div className="dropzone-icon-container">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 16.5V9.75m0 0l-3 3m3-3l3 3M6.75 19.5a4.5 4.5 0 01-1.41-8.775 5.25 5.25 0 0110.233-2.33 3 3 0 013.758 3.848A3.752 3.752 0 0118 19.5H6.75z" />
+            </svg>
+          </div>
           <p>Drop geometry file (.json, .obj, .stl, .step/.stp) or click to browse</p>
+          <div className="dropzone-format-tags">
+            <span className="format-tag">JSON</span>
+            <span className="format-tag">OBJ</span>
+            <span className="format-tag">STL</span>
+            <span className="format-tag">STEP</span>
+            <span className="format-tag">STP</span>
+          </div>
         </div>
       ) : (
         <div className="dropzone-unit-selector">
@@ -286,6 +327,9 @@ export function FileDropzone({ onClose }: FileDropzoneProps): React.ReactElement
                 invalidateUpload();
                 setIsParsing(false);
                 setSelectedFile(null);
+                if (!isFlat) {
+                  onClose?.();
+                }
               }}
             >
               Cancel
@@ -297,6 +341,33 @@ export function FileDropzone({ onClose }: FileDropzoneProps): React.ReactElement
       {state.previewError ? (
         <p className="dropzone-error badge badge--error">{state.previewError}</p>
       ) : null}
+    </>
+  );
+
+  if (isFlat) {
+    return (
+      <div className="file-dropzone-container">
+        {innerContent}
+      </div>
+    );
+  }
+
+  return (
+    <div className="file-dropzone-modal" onClick={onClose}>
+      <div className="file-dropzone-panel" role="dialog" aria-modal="true" aria-label="Upload geometry dialog" onClick={(e) => e.stopPropagation()}>
+        <header className="file-dropzone-header">
+          <h2 className="file-dropzone-title">Upload Geometry</h2>
+          <button
+            type="button"
+            className="btn btn--close-modal"
+            onClick={onClose}
+            aria-label="Close upload dialog"
+          >
+            ✕
+          </button>
+        </header>
+        {innerContent}
+      </div>
     </div>
   );
 }

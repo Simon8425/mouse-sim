@@ -99,6 +99,8 @@ export function modeLabel(mode: string): string {
       return 'Exploration';
     case 'qualification':
       return 'Qualification';
+    case 'validation':
+      return 'Validation';
     default:
       return mode;
   }

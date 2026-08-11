@@ -15,6 +15,7 @@ export interface ViewportToolbarProps {
  */
 export function ViewportToolbar({ viewport, stats }: ViewportToolbarProps) {
   const { state, dispatch } = useProjectStore();
+  const [openDropdown, setOpenDropdown] = React.useState<'legend' | 'stats' | null>(null);
 
   const presetButtons: Array<{ label: string; preset: CameraPreset | 'fit' }> = [
     { label: 'Fit', preset: 'fit' },
@@ -59,20 +60,24 @@ export function ViewportToolbar({ viewport, stats }: ViewportToolbarProps) {
         >
           Exploded
         </button>
-        <span
-          className="display-only-label"
-          title="Display-only offsets; never included in analysis"
-        >
+        <span className="display-only-label muted" title="Display-only offsets; never included in analysis">
           Display only
         </span>
       </div>
 
-      <details className="viewport-toolbar__legend">
-        <summary>Overlay legend</summary>
+      <details className="viewport-toolbar__legend" open={openDropdown === 'legend'}>
+        <summary
+          onClick={(e) => {
+            e.preventDefault();
+            setOpenDropdown(openDropdown === 'legend' ? null : 'legend');
+          }}
+        >
+          Overlay legend
+        </summary>
         <ul>
           <li>
             <span className="legend-swatch legend-swatch--selection" aria-hidden="true" />
-             Selection / load vector
+            Selection / load vector
           </li>
           <li>
             <span className="legend-swatch legend-swatch--warn" aria-hidden="true" />
@@ -93,12 +98,15 @@ export function ViewportToolbar({ viewport, stats }: ViewportToolbarProps) {
         </ul>
       </details>
 
-      <span className="quality-tier">
-        Quality: {state.qualityTier ?? 'auto'}
-      </span>
-
-      <details className="viewport-toolbar__stats">
-        <summary>Telemetry</summary>
+      <details className="viewport-toolbar__stats" open={openDropdown === 'stats'}>
+        <summary
+          onClick={(e) => {
+            e.preventDefault();
+            setOpenDropdown(openDropdown === 'stats' ? null : 'stats');
+          }}
+        >
+          Telemetry
+        </summary>
         <dl>
           <dt>Draw calls</dt>
           <dd>{stats?.drawCalls ?? '—'}</dd>
@@ -108,8 +116,6 @@ export function ViewportToolbar({ viewport, stats }: ViewportToolbarProps) {
           <dd>{stats?.geometries ?? '—'}</dd>
           <dt>Textures</dt>
           <dd>{stats?.textures ?? '—'}</dd>
-          <dt>Render tier</dt>
-          <dd>{stats?.tier ?? state.qualityTier ?? 'auto'}</dd>
         </dl>
       </details>
     </div>

@@ -1,6 +1,7 @@
 """Tests for the electronics component failure models."""
 
 import json
+import math
 import unittest
 
 from mouse_sim.components_elec import (
@@ -171,7 +172,7 @@ class SwitchComponentTests(unittest.TestCase):
 class EncoderComponentTests(unittest.TestCase):
     def test_detent_conversion_mechanical_fail(self):
         # 720,000 wheel steps / 24 = 30,000 revolutions = 1.2x the rating
-        # (the marginal band is 1.0-1.2; fail starts above 1.2).
+        # (the marginal band is 1.0-1.2; fail starts at 1.2).
         result = analyze(
             {"component_id": "e", "type": "encoder", "encoder_type": "mechanical"},
             {"lifecycle": {"scroll_encoder_rotations": 720_000}},
@@ -200,6 +201,129 @@ class EncoderComponentTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "pass")
         self.assertEqual(DETENTS_PER_REVOLUTION, 24)
+
+
+class KnifeEdgeBoundaryTests(unittest.TestCase):
+    """Every channel must implement the unified knife-edge policy: exactly
+    1.0 -> warn (marginal), 1.19 -> warn, 1.2 -> fail, 1.21 -> fail."""
+
+    def test_battery_shock_boundary(self):
+        # shock_margin = accel_g / shock_limit; crush channel stays ~0.45.
+        for ratio, expected in ((1.0, "warn"), (1.19, "warn"), (1.2, "fail"), (1.21, "fail")):
+            result = analyze(
+                {"component_id": "b", "type": "battery", "shock_limit_g": 500.0},
+                {"drop": {"peak_accel_g": 500.0 * ratio}},
+            )
+            self.assertEqual(result["status"], expected, "shock ratio {:.2f}".format(ratio))
+            self.assertAlmostEqual(result["metrics"]["shock_margin"], ratio, places=6)
+            if expected == "warn":
+                self.assertTrue(any(f["code"] == "BATTERY_SHOCK_MARGINAL" for f in result["findings"]))
+
+    def test_switch_boundary(self):
+        # usage_damage = actuation_cycles / 20M (mechanical class rating).
+        for ratio, expected in ((1.0, "warn"), (1.19, "warn"), (1.2, "fail"), (1.21, "fail")):
+            result = analyze(
+                {"component_id": "s", "type": "switch", "switch_type": "mechanical"},
+                {"lifecycle": {"actuation_cycles": 20_000_000 * ratio}},
+            )
+            self.assertEqual(result["status"], expected, "switch ratio {:.2f}".format(ratio))
+            if expected == "warn":
+                self.assertTrue(any(f["code"] == "SWITCH_RATED_LIFE_MARGINAL" for f in result["findings"]))
+
+    def test_encoder_boundary(self):
+        # 24 detents/revolution: 600,000 steps * ratio / 24 = 25,000 * ratio
+        # rotations against the 25,000 rotation rating.
+        for ratio, expected in ((1.0, "warn"), (1.19, "warn"), (1.2, "fail"), (1.21, "fail")):
+            result = analyze(
+                {"component_id": "e", "type": "encoder", "encoder_type": "mechanical"},
+                {"lifecycle": {"scroll_encoder_rotations": 600_000 * ratio}},
+            )
+            self.assertEqual(result["status"], expected, "encoder ratio {:.2f}".format(ratio))
+            if expected == "warn":
+                self.assertTrue(any(f["code"] == "ENCODER_RATED_LIFE_MARGINAL" for f in result["findings"]))
+
+    def test_pcb_thermal_boundary(self):
+        # 40 K daily cycle -> 20,000 cycles to failure; 8 cycles/day makes
+        # damage == age_days / 2500 exactly (integer arithmetic).
+        for ratio, expected in ((1.0, "warn"), (1.19, "warn"), (1.2, "fail"), (1.21, "fail")):
+            result = analyze(
+                {"component_id": "p", "type": "pcb", "thermal_cycles_per_day": 8, "delta_temperature_k": 40},
+                {"lifecycle": {"age_days": 2500.0 * ratio}},
+            )
+            self.assertEqual(result["status"], expected, "thermal ratio {:.2f}".format(ratio))
+            self.assertAlmostEqual(result["metrics"]["thermal_damage"], ratio, places=6)
+            if expected == "warn":
+                # The [1.0, 1.2) band must emit the MARGINAL finding, not
+                # the earlier margin-low WEAR branch.
+                self.assertTrue(any(f["code"] == "PCB_SOLDER_THERMAL_MARGINAL" for f in result["findings"]))
+                self.assertFalse(any(f["code"] == "PCB_SOLDER_THERMAL_WEAR" for f in result["findings"]))
+
+    @staticmethod
+    def _flex_stress(accel_g):
+        # Mirrors the model's plate-bending arithmetic for the default
+        # 40x60x1.6 mm board (b/a = 1.5 -> beta = 0.46) so the round-trip
+        # allowable lands the ratio exactly on the target.
+        a, b, thickness = 0.04, 0.06, 0.0016
+        board_mass = 1850.0 * a * b * thickness
+        load = (board_mass + 0.002) * accel_g * 9.80665
+        q = load / (a * b)
+        return 0.46 * q * a ** 2 / (thickness ** 2)
+
+    def test_pcb_flex_boundary(self):
+        for ratio, expected in ((1.0, "warn"), (1.19, "warn"), (1.2, "fail"), (1.21, "fail")):
+            result = analyze(
+                {"component_id": "p", "type": "pcb", "allowable_flex_stress_pa": self._flex_stress(100.0) / ratio},
+                {"drop": {"peak_accel_g": 100.0}},
+            )
+            self.assertEqual(result["status"], expected, "flex ratio {:.2f}".format(ratio))
+            if expected == "warn":
+                self.assertTrue(any(f["code"] == "PCB_FLEX_MARGINAL" for f in result["findings"]))
+                self.assertFalse(any(f["code"] == "PCB_FLEX_MARGIN_LOW" for f in result["findings"]))
+
+    @staticmethod
+    def _shock_shear(accel_g):
+        # Mirrors the model's direct-inertia solder shear for a 0.05 kg
+        # component on 200 joints of 2e-7 m^2.
+        force = 0.05 * accel_g * 9.80665
+        return force / (200 * 2e-7)
+
+    def test_pcb_solder_shock_boundary(self):
+        for ratio, expected in ((1.0, "warn"), (1.19, "warn"), (1.2, "fail"), (1.21, "fail")):
+            result = analyze(
+                {
+                    "component_id": "p",
+                    "type": "pcb",
+                    "component_mass_kg": 0.05,
+                    "solder_joint_area_m2": 2e-7,
+                    "solder_joint_count": 200,
+                    "solder_allowable_shear_pa": self._shock_shear(1000.0) / ratio,
+                    "allowable_flex_stress_pa": 1e9,
+                },
+                {"drop": {"peak_accel_g": 1000.0}},
+            )
+            self.assertEqual(result["status"], expected, "shock ratio {:.2f}".format(ratio))
+            if expected == "warn":
+                self.assertTrue(any(f["code"] == "PCB_SOLDER_SHOCK_MARGINAL" for f in result["findings"]))
+
+
+class InvalidInputElecTests(unittest.TestCase):
+    def test_nan_and_inf_spec_values_rejected(self):
+        specs = (
+            {"component_id": "b", "type": "battery", "mass_kg": float("nan")},
+            {"component_id": "p", "type": "pcb", "allowable_flex_stress_pa": float("inf")},
+            {"component_id": "s", "type": "switch", "rated_cycles": float("-inf")},
+        )
+        for spec in specs:
+            result = analyze(spec, {"drop": {"peak_accel_g": 400.0}})
+            self.assertEqual(result["status"], "not_evaluated", spec)
+            self.assertTrue(any(f["code"] == "NOT_EVALUATED" for f in result["findings"]))
+
+    def test_huge_finite_spec_value_rejected(self):
+        result = analyze(
+            {"component_id": "b", "type": "battery", "crush_load_n": 1e13},
+            {"drop": {"peak_accel_g": 400.0}},
+        )
+        self.assertEqual(result["status"], "not_evaluated")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,11 @@
 import { defineConfig, devices } from '@playwright/test';
 
+declare const process: any;
+
+const isWindows = process.platform === 'win32';
+const pythonCmd = isWindows ? 'python' : 'python3';
+const setPythonPath = isWindows ? 'set PYTHONPATH=.&& ' : 'PYTHONPATH=. ';
+
 export default defineConfig({
   testDir: './e2e',
   fullyParallel: true,
@@ -13,7 +19,7 @@ export default defineConfig({
   },
   webServer: [
     {
-      command: 'cd .. && PYTHONPATH=. python3 -S -m mouse_sim serve --host 127.0.0.1 --port 8899 --project-root . --cache-dir .e2e-cache --quiet',
+      command: `cd .. && ${setPythonPath}${pythonCmd} -S -m mouse_sim serve --host 127.0.0.1 --port 8899 --project-root . --cache-dir .e2e-cache --quiet`,
       url: 'http://127.0.0.1:8899/api/health',
       reuseExistingServer: false,
       timeout: 30_000,
@@ -25,7 +31,7 @@ export default defineConfig({
       timeout: 30_000,
     },
     {
-      command: 'cd .. && PYTHONPATH=. python3 -S -m mouse_sim serve --host 127.0.0.1 --port 8898 --project-root . --web-dist web/dist --quiet',
+      command: `cd .. && ${setPythonPath}${pythonCmd} -S -m mouse_sim serve --host 127.0.0.1 --port 8898 --project-root . --web-dist web/dist --quiet`,
       url: 'http://127.0.0.1:8898/api/health',
       reuseExistingServer: false,
       timeout: 30_000,

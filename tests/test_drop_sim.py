@@ -4,6 +4,7 @@ import unittest
 from mouse_sim.drop_sim import (
     DropSimulationError,
     _axis_angle_quaternion,
+    _conjugate_quaternion,
     box_inertia,
     _quaternion_rotate,
     simulate,
@@ -497,6 +498,283 @@ class DropSimulationPhysicsCoreTests(unittest.TestCase):
             result["trajectory"],
             simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, test="tumble", spin_rps=0.0)["trajectory"],
         )
+
+    def test_explicit_zero_spin_tumble_is_honored(self):
+        # Regression: the web UI launches a tumble with an explicit 0 rev/s
+        # release spin; that 0 must reach the simulator as 0 (a plain drop),
+        # never be treated as "absent" and replaced by the 6 rev/s default.
+        config = validate_config({"test": "tumble", "spin_rps": 0})
+        self.assertEqual(config["spin_rps"], 0.0)
+        result = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, test="tumble", spin_rps=0.0)
+        self.assertEqual(result["config"]["spin_rps"], 0.0)
+        # A zero-spin tumble is physically a plain drop: bit-identical
+        # trajectory to the drop test at the same height.
+        plain = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, test="drop")
+        self.assertEqual(result["trajectory"], plain["trajectory"])
+        self.assertEqual(result["impacts"], plain["impacts"])
+        # And the payload an explicit 0 for a non-tumble test is accepted
+        # (the frontend now always sends the configured spin value).
+        config = validate_config({"test": "drop", "spin_rps": 0})
+        self.assertEqual(config["spin_rps"], 0.0)
+
+
+class PhysicalBoundRegressionTests(unittest.TestCase):
+    """Tight physical bounds for the headline claims (audit item 15).
+
+    The audit found the impressive validation numbers lived only in handoff
+    prose with loose committed tolerances (1.3-2.6%).  These tests pin the
+    PHYSICAL relationships with defensible bounds derived from the model's
+    documented behavior (the semi-implicit crossing-time bias is
+    conservative: impact speed is under-reported by ~g*dt/2, growing toward
+    low drop heights).
+    """
+
+    def test_first_impact_speed_within_documented_bias(self):
+        # The integrator under-reports sqrt(2gh) by ~0.5% at 0.75 m and
+        # ~1.5% at 0.1 m (documented conservative bias); it must never
+        # exceed the free-fall speed (no energy creation).
+        for height, floor in ((0.75, 0.985), (0.1, 0.97), (2.0, 0.99)):
+            result = simulate(
+                0.1, CUBE_INERTIA, CUBE_SUPPORT, height,
+                surface="concrete", drop_count=1, test="drop", orientation="flat",
+            )
+            expected = math.sqrt(2.0 * 9.81 * height)
+            speed = result["impacts"][0]["impact_speed_m_s"]
+            self.assertGreaterEqual(speed, floor * expected, "h={}".format(height))
+            self.assertLessEqual(speed, 1.001 * expected, "h={}".format(height))
+
+    def test_gravity_scaling_matches_square_root_law(self):
+        normal = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.75, gravity=9.81)
+        half = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.75, gravity=4.905)
+        ratio = half["impacts"][0]["impact_speed_m_s"] / normal["impacts"][0]["impact_speed_m_s"]
+        self.assertAlmostEqual(ratio, math.sqrt(0.5), delta=0.01)
+
+    def test_energy_sweep_across_surfaces_and_orientations(self):
+        # 3 heights x 4 surfaces x 4 orientations x 2 seeds: no ENERGY
+        # check may fire (creation/drift/rebound overspeed), raw kinetic
+        # energy must stay within the release budget, and free-flight drift
+        # must stay far below the 1% check threshold.  DID_NOT_SETTLE
+        # warnings are honest flags for chaotic corner bounces (documented)
+        # and are allowed; energy checks are never.
+        from mouse_sim.drop_sim import SURFACES
+
+        energy_codes = (
+            "DROP_SIM_ENERGY_CREATION",
+            "DROP_SIM_ENERGY_DRIFT",
+            "DROP_SIM_REBOUND_OVERSPEED",
+        )
+        runs = 0
+        for height in (0.05, 0.5, 1.5):
+            for surface in SURFACES:
+                for orientation in ("flat", "edge", "corner", "random"):
+                    for seed in (0, 1):
+                        result = simulate(
+                            0.1, CUBE_INERTIA, CUBE_SUPPORT, height,
+                            surface=surface, orientation=orientation, seed=seed,
+                        )
+                        runs += 1
+                        drop = result["drops"][0]
+                        fired = [check["code"] for check in drop["checks"]]
+                        for code in energy_codes:
+                            self.assertNotIn(
+                                code, fired,
+                                "h={} surface={} orientation={} seed={}".format(
+                                    height, surface, orientation, seed
+                                ),
+                            )
+                        release = drop["energy"]["release_j"]
+                        peak = result["peak"]
+                        self.assertLessEqual(
+                            peak["raw_kinetic_energy_j"], release * 1.001,
+                            "h={} surface={} orientation={}".format(height, surface, orientation),
+                        )
+                        self.assertLess(drop["energy"]["drift_pct"], 0.2)
+                        settled = drop["energy"]["settled_j"]
+                        if settled is not None:
+                            self.assertLess(settled, release)
+        self.assertEqual(runs, 3 * len(SURFACES) * 4 * 2)
+
+
+class ExplicitPoseReproducibilityTests(unittest.TestCase):
+    """Validation-preparation: recorded poses must be numerically replayable.
+
+    An explicit pose ``{"quaternion_wxyz": [w, x, y, z]}`` fixes drop 0
+    exactly (drops 1+ keep the seeded jitter on top) and every per-drop
+    result records the actual initial conditions so a physical drop recorded
+    as a pose can be re-run from the recorded numbers.
+    """
+
+    def test_validate_config_accepts_explicit_quaternion(self):
+        config = validate_config({"orientation": {"quaternion_wxyz": [1.0, 0.0, 0.0, 0.0]}})
+        self.assertEqual(config["orientation"], "explicit")
+        self.assertEqual(config["orientation_quaternion_wxyz"], [1.0, 0.0, 0.0, 0.0])
+        # A scaled quaternion is normalized internally.
+        config = validate_config({"orientation": {"quaternion_wxyz": [3.0, 0.0, 0.0, 0.0]}})
+        self.assertEqual(config["orientation"], "explicit")
+        self.assertAlmostEqual(config["orientation_quaternion_wxyz"][0], 1.0, places=9)
+        self.assertAlmostEqual(config["orientation_quaternion_wxyz"][1], 0.0, places=9)
+        # -q is the same orientation and is accepted, not rejected.
+        config = validate_config({"orientation": {"quaternion_wxyz": [-1.0, 0.0, 0.0, 0.0]}})
+        self.assertEqual(config["orientation"], "explicit")
+        self.assertAlmostEqual(config["orientation_quaternion_wxyz"][0], -1.0, places=9)
+        # String modes keep their legacy behavior exactly.
+        config = validate_config({"orientation": "edge"})
+        self.assertEqual(config["orientation"], "edge")
+        self.assertNotIn("orientation_quaternion_wxyz", config)
+
+    def test_validate_rejects_invalid_quaternions(self):
+        for bad in (
+            {"quaternion_wxyz": [float("nan"), 0.0, 0.0, 0.0]},
+            {"quaternion_wxyz": [float("inf"), 0.0, 0.0, 0.0]},
+            {"quaternion_wxyz": [0.0, 0.0, 0.0, 0.0]},
+            {"quaternion_wxyz": [1.0, 0.0, 0.0]},
+            {"quaternion_wxyz": [1.0, 0.0, 0.0, 0.0, 0.0]},
+            {"quaternion_wxyz": ["a", 0.0, 0.0, 0.0]},
+            {"quaternion_wxyz": None},
+            {},
+        ):
+            with self.assertRaises(DropSimulationError):
+                validate_config({"orientation": bad})
+        # simulate() validates through the same path.
+        with self.assertRaises(DropSimulationError):
+            simulate(
+                0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5,
+                orientation={"quaternion_wxyz": [float("nan"), 0.0, 0.0, 0.0]},
+            )
+
+    def test_explicit_quaternion_reproducible(self):
+        pose = {"quaternion_wxyz": [0.6, 0.4, -0.3, 0.62]}
+        first = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, drop_count=2, orientation=pose, seed=9)
+        second = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, drop_count=2, orientation=pose, seed=9)
+        self.assertEqual(first["drops"], second["drops"])
+        self.assertEqual(first["trajectory"], second["trajectory"])
+        self.assertEqual(first["impacts"], second["impacts"])
+        # Drop 0 uses exactly the normalized explicit quaternion.
+        config = first["config"]
+        self.assertEqual(config["orientation"], "explicit")
+        self.assertAlmostEqual(
+            math.sqrt(sum(c * c for c in config["orientation_quaternion_wxyz"])), 1.0, places=9
+        )
+        self.assertEqual(first["drops"][0]["orientation"], "explicit")
+        self.assertEqual(
+            first["drops"][0]["orientation_quaternion_wxyz"],
+            config["orientation_quaternion_wxyz"],
+        )
+
+    def test_explicit_identity_matches_flat_drop_zero(self):
+        identity = {"quaternion_wxyz": [1.0, 0.0, 0.0, 0.0]}
+        flat = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, drop_count=1, orientation="flat")
+        explicit = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, drop_count=1, orientation=identity)
+        self.assertEqual(flat["drops"][0]["orientation_quaternion_wxyz"], [1.0, 0.0, 0.0, 0.0])
+        self.assertEqual(explicit["drops"][0]["orientation"], "explicit")
+        # Identity explicit pose == flat mode: bit-identical first contact.
+        self.assertEqual(explicit["trajectory"], flat["trajectory"])
+        self.assertEqual(explicit["impacts"], flat["impacts"])
+        for key, value in flat["drops"][0].items():
+            if key == "orientation":
+                continue
+            self.assertEqual(explicit["drops"][0][key], value)
+        # Recorded reproducibility fields for the pristine flat drop.
+        drop = explicit["drops"][0]
+        self.assertEqual(drop["gravity_vector_body"], [0.0, 0.0, -1.0])
+        self.assertEqual(drop["initial_angular_velocity_rad_s"], [0.0, 0.0, 0.0])
+        self.assertEqual(drop["initial_velocity_m_s"], [0.0, 0.0, 0.0])
+        # z = height_m above the lowest support point (cube lowest point at
+        # z = -0.05 in body frame): 0.5 - (-0.05) = 0.55.
+        self.assertEqual(drop["starting_pose_m"], [0.0, 0.0, 0.55])
+
+    def test_gravity_vector_body_flat_and_edge(self):
+        flat = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, drop_count=1, orientation="flat")
+        self.assertEqual(flat["drops"][0]["gravity_vector_body"], [0.0, 0.0, -1.0])
+        edge = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, drop_count=1, orientation="edge")
+        q_edge = _axis_angle_quaternion((1.0, 0.0, 0.0), math.pi / 2.0)
+        self.assertEqual(edge["drops"][0]["orientation_quaternion_wxyz"], list(q_edge))
+        # Body-frame gravity = world -z rotated by the inverse quaternion.
+        expected = _quaternion_rotate(_conjugate_quaternion(q_edge), (0.0, 0.0, -1.0))
+        recorded = edge["drops"][0]["gravity_vector_body"]
+        for got, want in zip(recorded, expected):
+            self.assertAlmostEqual(got, want, places=12)
+        # Physical value: a 90 deg edge rest leaves the body z-axis horizontal.
+        self.assertAlmostEqual(recorded[0], 0.0, places=12)
+        self.assertAlmostEqual(recorded[1], -1.0, places=12)
+        self.assertAlmostEqual(recorded[2], 0.0, places=12)
+
+    def test_recorded_quaternion_replays_corner_drop_zero(self):
+        original = simulate(
+            0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, drop_count=1, orientation="corner", seed=3
+        )
+        recorded_q = original["drops"][0]["orientation_quaternion_wxyz"]
+        replay = simulate(
+            0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, drop_count=1,
+            orientation={"quaternion_wxyz": recorded_q}, seed=3,
+        )
+        self.assertEqual(replay["drops"][0]["orientation"], "explicit")
+        for got, want in zip(
+            replay["drops"][0]["orientation_quaternion_wxyz"], recorded_q
+        ):
+            self.assertAlmostEqual(got, want, places=12)
+        for key in (
+            "gravity_vector_body",
+            "starting_pose_m",
+            "initial_angular_velocity_rad_s",
+            "initial_velocity_m_s",
+        ):
+            for got, want in zip(replay["drops"][0][key], original["drops"][0][key]):
+                self.assertAlmostEqual(got, want, places=12)
+        self.assertEqual(len(replay["impacts"]), len(original["impacts"]))
+        for got, want in zip(replay["impacts"], original["impacts"]):
+            self.assertAlmostEqual(got["t_s"], want["t_s"], places=10)
+            self.assertAlmostEqual(
+                got["impact_speed_m_s"], want["impact_speed_m_s"], places=10
+            )
+            self.assertAlmostEqual(
+                got["kinetic_energy_j"], want["kinetic_energy_j"], places=10
+            )
+        for got, want in zip(replay["trajectory"], original["trajectory"]):
+            for got_c, want_c in zip(got, want):
+                self.assertAlmostEqual(got_c, want_c, places=10)
+
+    def test_jitter_applies_on_top_of_explicit_pose(self):
+        pose = {"quaternion_wxyz": [1.0, 0.0, 0.0, 0.0]}
+        explicit = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, drop_count=3, orientation=pose, seed=11)
+        flat = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, drop_count=3, orientation="flat", seed=11)
+        # Explicit identity base == flat base: every drop matches bit-for-bit
+        # (drop 0 pristine, drops 1+ carrying the identical seeded jitter).
+        self.assertEqual(explicit["trajectory"], flat["trajectory"])
+        self.assertEqual(explicit["impacts"], flat["impacts"])
+        for drop_e, drop_f in zip(explicit["drops"], flat["drops"]):
+            for key, value in drop_f.items():
+                if key == "orientation":
+                    continue
+                self.assertEqual(drop_e[key], value)
+        # Drops 1+ really are jittered on top of the explicit pose.
+        self.assertNotEqual(
+            explicit["drops"][1]["orientation_quaternion_wxyz"], [1.0, 0.0, 0.0, 0.0]
+        )
+        self.assertGreater(explicit["drops"][1]["tilt_deg"], 0.0)
+        self.assertEqual(
+            explicit["drops"][0]["initial_angular_velocity_rad_s"], [0.0, 0.0, 0.0]
+        )
+        self.assertNotEqual(
+            explicit["drops"][1]["initial_angular_velocity_rad_s"], [0.0, 0.0, 0.0]
+        )
+        self.assertNotEqual(
+            explicit["drops"][1]["starting_pose_m"], explicit["drops"][0]["starting_pose_m"]
+        )
+
+    def test_model_records_reference_initial_conditions(self):
+        result = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, drop_count=1, orientation="corner")
+        model = result["model"]
+        drop = result["drops"][0]
+        self.assertEqual(
+            model["orientation_quaternion_wxyz"], drop["orientation_quaternion_wxyz"]
+        )
+        self.assertEqual(model["gravity_vector_body"], drop["gravity_vector_body"])
+        self.assertEqual(
+            model["initial_angular_velocity_rad_s"], drop["initial_angular_velocity_rad_s"]
+        )
+        self.assertEqual(model["initial_velocity_m_s"], [0.0, 0.0, 0.0])
+        self.assertEqual(model["starting_pose_m"], drop["starting_pose_m"])
 
 
 if __name__ == "__main__":

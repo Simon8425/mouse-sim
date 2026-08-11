@@ -12,21 +12,63 @@ restitution (damaged material absorbs more energy) and friction (worn skates
 expose the base polymer), and are disclosed in ``result["lifecycle"]`` so the
 applied history is auditable.  The response's ``next_usage`` snapshot lets the
 client persist the accumulated history for the following run.
+
+FATIGUE MODEL (what it means, exactly):
+
+  Each drop is one event with impact energy ``E``.  The reference law is
+  ``N(E) = 1e6 * (0.5 J / E) ** 2.5`` cycles to exhaustion (energy-based S-N
+  slope of 2.5, typical of engineering polymers).  Miner accumulation is the
+  EVENT-WISE sum ``D = sum_i 1/N(E_i)``; fatigue is exhausted at ``D >= 1``.
+
+  Properties of the event-wise sum (all verified by tests):
+  - D is non-negative and monotone non-decreasing: appending an event never
+    reduces damage;
+  - D(A) + D(B) == D(A + B) and reordering invariance hold exactly below the
+    saturation cap (1e15) and to floating-point associativity (1 ulp at
+    1e-15 relative); at or above the cap every value means "exhausted"
+    (D >= 1), so the exhaustion verdict is preserved under splitting and
+    merging even though the reported number saturates;
+  - zero-energy events contribute exactly 0;
+  - events with ``N(E) < 1`` (E large) each contribute > 1, so D >= 1.
+
+  WHAT THE MODEL DOES NOT CLAIM: it is not a crack-initiation/growth law, it
+  makes no stress-localization claim, and it says nothing about the shell's
+  actual stress state — ``E`` is the rigid-body impact energy, not a local
+  stress.  The 0.5 J / 1e6 / 2.5 constants are class-level screening values
+  (typical polymer S-N slope), not a validated material fatigue curve.
+
+  When the client supplies only the aggregate history ``(prior_drops,
+  prior_impact_energy_j)`` the energy distribution is unknown, so the model
+  applies the documented UNIFORM-EVENT approximation ``D = n/N(E_total/n)``.
+  By Jensen's inequality (1/N convex in E) this UNDER-reports the event-wise
+  sum of a heterogeneous history; the approximation is disclosed in the
+  diagnostics whenever it is used.  Clients with measured per-drop energies
+  should supply ``prior_drop_energies_j`` for the exact event-wise path.
+
+  Input domains (documented): drop counts are clamped to
+  ``MAX_PRIOR_DROPS`` (10^9) and per-event energies to
+  ``MAX_EVENT_ENERGY_J`` (1e6 J — four orders of magnitude above any
+  hand-drop) with a disclosure diagnostic; non-finite (NaN/Inf) or negative
+  values are rejected as invalid input, never silently converted into a
+  valid physical value.
 """
 
 import math
 
 # Fatigue screening law (event-wise Miner accumulation, polymer-style):
-# each prior drop is one event at the AVERAGE event energy Ebar = E_total/n;
-# an event of the reference energy E0 = 0.5 J supports 1e6 cycles and higher
+# an event of the reference energy E0 = 0.5 J supports 1e6 cycles; higher
 # energies shorten life with a power-law exponent of 2.5 (typical of
-# energy-based S-N slopes for engineering polymers).  Damage D = n/N(Ebar)
-# therefore scales linearly with drop count; a lumped law applied to the
-# accumulated total inflates damage by n^2.5 (the audited 33,000x at 64
-# drops).  The law is disclosed as a screening estimate.
+# energy-based S-N slopes for engineering polymers).  Damage is the
+# event-wise sum D = sum 1/N(E_i).
 REFERENCE_IMPACT_ENERGY_J = 0.5
 REFERENCE_CYCLES = 1e6
 FATIGUE_EXPONENT = 2.5
+# Documented screening input domain (see module docstring).
+MAX_PRIOR_DROPS = 10 ** 9
+MAX_EVENT_ENERGY_J = 1e6
+# Damage saturation: values above this are all "exhausted" (D >= 1); the cap
+# keeps rounding and reporting safe while preserving the exhaustion verdict.
+_DAMAGE_SATURATION = 1e15
 # Degradation: each unit of fatigue index reduces the effective restitution
 # by up to 7% (micro-cracks absorb impact energy).  Audit: 10% derate equals
 # ~19% stiffness loss, the top of the defensible band; 5-7% (~10-13%
@@ -65,22 +107,79 @@ def _clamp(value, low, high):
     return max(low, min(high, value))
 
 
-def fatigue_damage_index(prior_drop_count, prior_impact_energy_j):
-    """Event-wise Miner damage from the prior drop count and total energy.
+def _event_damage(energy_j):
+    """Miner damage of ONE event at ``energy_j``: 1/N(E), overflow-safe.
 
-    ``D = n/N(Ebar)`` with ``Ebar = E_total/n`` and the energy-based cycles
-    law above; each prior drop counts as one event at the average event
-    energy, so damage scales linearly with the number of drops.  Zero drops
-    (or zero total energy) yield no damage; values above 1 mean the
-    screening life estimate is exhausted.
+    Computed in log10 space: ``log10(D) = 2.5*log10(E/0.5) - 6``.  Tiny
+    events underflow to 0 (no damage); the result is saturated at
+    ``_DAMAGE_SATURATION`` so reporting never overflows.
     """
-    count = max(0, int(prior_drop_count or 0))
-    energy = max(0.0, float(prior_impact_energy_j or 0.0))
+    if energy_j <= 0.0:
+        return 0.0
+    log_damage = FATIGUE_EXPONENT * math.log10(energy_j / REFERENCE_IMPACT_ENERGY_J) - math.log10(
+        REFERENCE_CYCLES
+    )
+    if log_damage > math.log10(_DAMAGE_SATURATION):
+        return _DAMAGE_SATURATION
+    return 10.0 ** log_damage
+
+
+def _drop_count(value):
+    """Strict drop-count coercion: absent -> 0, invalid -> ValueError."""
+    if value is None:
+        return 0
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("drop count must be a finite number") from None
+    if not math.isfinite(number) or number < 0.0:
+        raise ValueError("drop count must be a finite non-negative number")
+    return int(number)
+
+
+def _energy_value(value):
+    """Strict energy coercion: absent -> 0.0, non-finite/negative -> error."""
+    if value is None:
+        return 0.0
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("impact energy must be a finite number") from None
+    if not math.isfinite(number):
+        raise ValueError("impact energy must be a finite number")
+    if number < 0.0:
+        raise ValueError("impact energy must be non-negative")
+    return number
+
+
+def fatigue_damage_index(prior_drop_count, prior_impact_energy_j, drop_energies_j=None):
+    """Event-wise Miner damage from the prior drop history.
+
+    With ``drop_energies_j`` (a sequence of per-event energies) the damage is
+    the exact event-wise sum ``D = sum_i 1/N(E_i)``: monotone non-decreasing
+    in the event set, split/merge consistent, reorder invariant.  Without it,
+    the documented UNIFORM-EVENT approximation ``D = n/N(E_total/n)`` is
+    applied (a lower bound for heterogeneous histories; see module docstring).
+    Zero drops (or zero energy) yield no damage; values above 1 mean the
+    screening life estimate is exhausted.  Raises ValueError on non-finite or
+    negative inputs rather than silently converting them.
+    """
+    if drop_energies_j is not None:
+        if isinstance(drop_energies_j, (str, bytes)) or not hasattr(drop_energies_j, "__iter__"):
+            raise ValueError("drop_energies_j must be a sequence of event energies")
+        total = 0.0
+        for value in drop_energies_j:
+            energy = _energy_value(value)
+            if energy <= 0.0:
+                continue
+            total += _event_damage(energy)
+        return min(total, _DAMAGE_SATURATION)
+    count = _drop_count(prior_drop_count)
+    energy = _energy_value(prior_impact_energy_j)
     if count <= 0 or energy <= 0.0:
         return 0.0
     average_energy = energy / count
-    cycles = REFERENCE_CYCLES * (REFERENCE_IMPACT_ENERGY_J / average_energy) ** FATIGUE_EXPONENT
-    return count / max(cycles, 1.0)
+    return min(count * _event_damage(average_energy), _DAMAGE_SATURATION)
 
 
 def skate_wear_rate_mm_per_km(pad_surface):
@@ -114,18 +213,52 @@ def degradation_factors(usage):
     Returns (restitution_scale, friction_scale, damage, diagnostics) where
     ``damage`` is a dict of screening metrics and ``diagnostics`` lists the
     models applied.  Deterministic: a pure function of the usage snapshot.
+
+    Raises ValueError on non-finite or negative usage values (invalid input);
+    huge-but-finite values are clamped to the documented screening domain
+    (``MAX_PRIOR_DROPS`` drops, ``MAX_EVENT_ENERGY_J`` per event) with an
+    explicit disclosure diagnostic.
     """
     usage = dict(usage or {})
-    prior_drops = _positive_int(usage.get("prior_drops"))
-    prior_energy = _positive_float(usage.get("prior_impact_energy_j"))
-    actuation_cycles = _positive_int(usage.get("actuation_cycles"))
-    slide_km = _positive_float(usage.get("slide_distance_km"))
-    age_days = _positive_float(usage.get("age_days"))
+    prior_drops = _drop_count(usage.get("prior_drops"))
+    prior_energy = _energy_value(usage.get("prior_impact_energy_j"))
+    prior_energies = usage.get("prior_drop_energies_j")
+    clamped_notes = []
+    if prior_drops > MAX_PRIOR_DROPS:
+        clamped_notes.append(
+            "prior_drops {} exceeds the documented screening maximum {}; clamped".format(
+                prior_drops, MAX_PRIOR_DROPS
+            )
+        )
+        prior_drops = MAX_PRIOR_DROPS
+    energies = None
+    if prior_energies is not None:
+        energies = []
+        for value in prior_energies:
+            energy = _energy_value(value)
+            if energy > MAX_EVENT_ENERGY_J:
+                clamped_notes.append(
+                    "event energy {} J exceeds the documented screening maximum {} J; clamped".format(
+                        energy, MAX_EVENT_ENERGY_J
+                    )
+                )
+                energy = MAX_EVENT_ENERGY_J
+            energies.append(energy)
+    elif prior_energy > MAX_EVENT_ENERGY_J:
+        clamped_notes.append(
+            "prior_impact_energy_j {} J exceeds the documented screening maximum {} J; clamped".format(
+                prior_energy, MAX_EVENT_ENERGY_J
+            )
+        )
+        prior_energy = MAX_EVENT_ENERGY_J
+    actuation_cycles = _drop_count(usage.get("actuation_cycles"))
+    slide_km = _energy_value(usage.get("slide_distance_km"))
+    age_days = _energy_value(usage.get("age_days"))
     switch_type = _switch_type(usage.get("switch_type"))
     pad_surface = _pad_surface(usage.get("pad_surface"))
-    scroll_rotations = _positive_int(usage.get("scroll_encoder_rotations"))
+    scroll_rotations = _drop_count(usage.get("scroll_encoder_rotations"))
 
-    fatigue = fatigue_damage_index(prior_drops, prior_energy)
+    fatigue = fatigue_damage_index(prior_drops, prior_energy, drop_energies_j=energies)
     restitution_scale = 1.0 - FATIGUE_RESTITUTION_DERATE * _clamp(fatigue, 0.0, 1.0)
     restitution_scale = _clamp(restitution_scale, 0.5, 1.0)
 
@@ -140,6 +273,11 @@ def degradation_factors(usage):
     damage = {
         "fatigue_index": round(fatigue, 6),
         "fatigue_exhausted": fatigue >= 1.0,
+        "fatigue_model": (
+            "event_wise_energies"
+            if energies is not None
+            else "uniform_event_approximation"
+        ),
         "skate_remaining_mm": round(skate, 4),
         "actuation_cycles": actuation_cycles,
         "actuation_exceeded": actuation_cycles > rated_switch,
@@ -150,15 +288,25 @@ def degradation_factors(usage):
         > SCROLL_ENCODER_RATED_ROTATIONS,
         "age_days": age_days,
     }
-    diagnostics = []
+    diagnostics = list(clamped_notes)
     if fatigue > 0.0:
-        diagnostics.append(
-            "Miner-rule fatigue accumulation: {} prior drop(s), {:.2f} J total "
-            "impact energy ({:.4f} J average per event); restitution derated {:.1f}%".format(
-                prior_drops, prior_energy, prior_energy / prior_drops,
-                100.0 * (1.0 - restitution_scale),
+        if energies is not None:
+            diagnostics.append(
+                "Miner-rule fatigue accumulation: {} prior drop event(s) with "
+                "per-event energies (event-wise sum, fatigue index {:.6f}); "
+                "restitution derated {:.1f}%".format(
+                    len(energies), fatigue, 100.0 * (1.0 - restitution_scale)
+                )
             )
-        )
+        else:
+            diagnostics.append(
+                "Miner-rule fatigue accumulation: {} prior drop(s), {:.2f} J total "
+                "impact energy; UNIFORM-EVENT APPROXIMATION ({:.4f} J average per event) "
+                "— a lower bound for heterogeneous histories; restitution derated {:.1f}%".format(
+                    prior_drops, prior_energy, prior_energy / prior_drops,
+                    100.0 * (1.0 - restitution_scale),
+                )
+            )
     if slide_km > 0.0:
         diagnostics.append(
             "PTFE skate wear over {:.1f} km on a {} pad leaves {:.2f} mm; "
@@ -187,39 +335,50 @@ def degradation_factors(usage):
     return restitution_scale, friction_scale, damage, diagnostics
 
 
-def next_usage(usage, drop_count, drop_energy_j):
-    """Accumulate the just-run test into the usage snapshot for the client."""
+def next_usage(usage, drop_count, drop_energy_j, drop_energies_j=None):
+    """Accumulate the just-run test into the usage snapshot for the client.
+
+    When the incoming snapshot carries per-event energies
+    (``prior_drop_energies_j``), the just-run drops' energies are appended
+    event-wise (exact chaining, full precision).  Otherwise the aggregate
+    counters are incremented under the same uniform-event approximation the
+    fatigue model uses.  ``drop_count`` must be non-negative and
+    ``drop_energy_j`` must be finite and non-negative.
+    """
+    if drop_count is None:
+        drop_count = 0
+    try:
+        count = int(drop_count)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("drop_count must be a finite number") from None
+    if count < 0:
+        raise ValueError("drop_count must be non-negative")
+    run_energy = _energy_value(drop_energy_j)
     usage = dict(usage or {})
-    return {
-        "prior_drops": _positive_int(usage.get("prior_drops")) + int(drop_count),
+    snapshot = {
+        "prior_drops": _drop_count(usage.get("prior_drops")) + count,
         "prior_impact_energy_j": round(
-            _positive_float(usage.get("prior_impact_energy_j")) + max(0.0, float(drop_energy_j)), 6
+            _energy_value(usage.get("prior_impact_energy_j")) + run_energy, 6
         ),
-        "actuation_cycles": _positive_int(usage.get("actuation_cycles")),
-        "slide_distance_km": round(_positive_float(usage.get("slide_distance_km")), 4),
-        "age_days": round(_positive_float(usage.get("age_days")), 3),
+        "actuation_cycles": _drop_count(usage.get("actuation_cycles")),
+        "slide_distance_km": round(_energy_value(usage.get("slide_distance_km")), 4),
+        "age_days": round(_energy_value(usage.get("age_days")), 3),
         "switch_type": _switch_type(usage.get("switch_type")),
         "pad_surface": _pad_surface(usage.get("pad_surface")),
-        "scroll_encoder_rotations": _positive_int(usage.get("scroll_encoder_rotations")),
+        "scroll_encoder_rotations": _drop_count(usage.get("scroll_encoder_rotations")),
     }
-
-
-def _positive_int(value):
-    try:
-        number = int(value)
-    except (TypeError, ValueError, OverflowError):
-        return 0
-    return number if number > 0 else 0
-
-
-def _positive_float(value):
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-    if not math.isfinite(number) or number <= 0.0:
-        return 0.0
-    return number
+    prior_energies = usage.get("prior_drop_energies_j")
+    if prior_energies is not None:
+        events = [_energy_value(value) for value in prior_energies]
+        if drop_energies_j is not None:
+            events.extend(_energy_value(value) for value in drop_energies_j)
+        elif count > 0:
+            per_event = run_energy / count
+            events.extend([per_event] * count)
+        # Full precision: rounding stored event energies would destroy tiny
+        # events and break split/merge consistency of the chained history.
+        snapshot["prior_drop_energies_j"] = events
+    return snapshot
 
 
 __all__ = [

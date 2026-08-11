@@ -124,7 +124,7 @@ describe('FileDropzone preview lifecycle', () => {
 
     await waitFor(() => expect(normalizeGeometryMock).toHaveBeenCalledTimes(1));
     expect(normalizeGeometryMock).toHaveBeenCalledWith(
-      { format: 'step', name: 'housing.step', body: expect.any(ArrayBuffer) },
+      { format: 'step', units: 'mm', name: 'housing.step', body: expect.any(ArrayBuffer) },
       expect.any(AbortSignal),
     );
     expect(onClose).toHaveBeenCalledTimes(1);

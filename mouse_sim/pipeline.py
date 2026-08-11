@@ -9,6 +9,7 @@ the lifecycle is marked ``failed``.
 """
 
 import math
+import os
 import traceback
 from typing import Mapping, Optional
 
@@ -37,9 +38,14 @@ ENGINE_VERSION = "0.1.0"
 RESULT_SCHEMA_ID = "gms.pipeline-result/1"
 MANIFEST_SCHEMA_ID = "gms.run-manifest/1"
 
-# Modules whose source defines the engine's numerical behavior.  A change in
-# any of them invalidates every cached run: the run id embeds a hash of these
-# sources, so stale cache entries silently serving old physics are impossible.
+# Modules whose source defines the engine's numerical behavior — including
+# every implementation dependency that can change a computed result: geometry
+# import/parse (importers, step_kernel, freecad_step_worker), object semantics
+# (model), canonical serialization (canonical), and input schema handling
+# (schema).  A change in any of them invalidates every cached run: the run id
+# embeds a hash of these sources, so stale cache entries silently serving old
+# physics are impossible.  Presentation/transport-only modules (web_api, cli,
+# reports, cache, errors) are deliberately excluded.
 _ENGINE_BEHAVIOR_MODULES = (
     "pipeline",
     "physics",
@@ -58,6 +64,13 @@ _ENGINE_BEHAVIOR_MODULES = (
     "components_mech",
     "profiles",
     "population",
+    "importers",
+    "canonical",
+    "model",
+    "schema",
+    "step_kernel",
+    "freecad_step_worker",
+    "shell_validation",
 )
 
 _ENGINE_HASH = None
@@ -121,7 +134,7 @@ _IMPACT_KWARGS = (
 
 def _normalize_mode(mode):
     value = str(mode or "exploration").strip().casefold()
-    return value if value in ("exploration", "qualification") else "exploration"
+    return value if value in ("exploration", "qualification", "validation") else "exploration"
 
 
 def _issue(code, severity, category, message, evidence_blocking=False):
@@ -178,21 +191,31 @@ def _new_result(mode):
 
 
 def _lifecycle_int(value):
+    """Snapshot echo of a drop count, clamped to the documented screening
+    maximum so the snapshot always matches what the fatigue model used."""
+    from . import lifecycle as lifecycle_module
+
     try:
         number = int(value)
     except (TypeError, ValueError, OverflowError):
         return 0
-    return number if number > 0 else 0
+    if number <= 0:
+        return 0
+    return min(number, lifecycle_module.MAX_PRIOR_DROPS)
 
 
 def _lifecycle_float(value):
+    """Snapshot echo of an impact energy, clamped to the documented
+    screening maximum so the snapshot always matches the model's input."""
+    from . import lifecycle as lifecycle_module
+
     try:
         number = float(value)
     except (TypeError, ValueError):
         return 0.0
     if not math.isfinite(number) or number <= 0.0:
         return 0.0
-    return number
+    return min(number, lifecycle_module.MAX_EVENT_ENERGY_J)
 
 
 def _append_correlation_metric(condition, metric_key, measured, predicted, max_error):
@@ -236,6 +259,18 @@ def _append_correlation_metric(condition, metric_key, measured, predicted, max_e
             }
         )
         return
+    if measured < 0.0 or predicted < 0.0:
+        condition["metrics"].append(
+            {
+                "metric_key": metric_key,
+                "measured": measured,
+                "predicted": predicted,
+                "relative_error": None,
+                "pass": False,
+                "reason": "comparison value is negative",
+            }
+        )
+        return
     relative_error = abs(measured - predicted) / abs(measured)
     condition["metrics"].append(
         {
@@ -248,6 +283,105 @@ def _append_correlation_metric(condition, metric_key, measured, predicted, max_e
     )
 
 
+def _resolve_structure_material(structure_data, catalog, materials_by_object):
+    """Resolve the material used by the structural section and the shell
+    material chain — ONE authoritative resolution.
+
+    Returns ``(material_def_or_None, label)``.  A pinned material is used
+    as-is (a catalog miss yields None: the structural run proceeds without a
+    material payload and the impact estimate derives no allowable).  An
+    unpinned structure resolves the FIRST OBJECT's material (the shell — the
+    same material the geometry/mass model used), falling back to catalog
+    order only when no object carries a material.
+    """
+    if isinstance(structure_data, Mapping):
+        material_ref = structure_data.get("material")
+        if material_ref is not None:
+            return catalog.get(material_ref), material_ref
+    for object_id, material in materials_by_object.items():
+        if material is not None:
+            return material, object_id
+    return _first_material(catalog), None
+
+
+def _shell_material(request, catalog, materials_by_object):
+    """Resolve the material actually used for the shell structural response.
+
+    Returns ``(material_def_or_None, label)``; ``label`` names the resolved
+    material for disclosure.  Delegates to :func:`_resolve_structure_material`
+    so the structural solver, the impact allowable, and the disclosure can
+    never disagree (audit finding: an unpinned structure previously resolved
+    catalog-first ABS while the mass model used the object's Default).
+    """
+    return _resolve_structure_material(request.get("structure"), catalog, materials_by_object)
+
+
+def _validate_raw_measured_drops(measured_drops):
+    """W2-05: validate raw correlation.measured_drops entries BEFORE any
+    canonical serialization (a NaN crashed the run as PIPELINE_INTERNAL in
+    _collect_inputs; negative/implausible values and unknown keys were
+    silently accepted).  Raises ValueError on the first problem."""
+    allowed_drop_keys = {
+        "drop_id", "height_m", "surface", "orientation",
+        "measured_peak_accel_g", "measured_impact_duration_s",
+        "measured_settle_s", "measured_settle_time_s",
+        "measured_peak_accel_g_uncertainty",
+        "measured_impact_duration_s_uncertainty",
+        "measured_settle_s_uncertainty",
+        "sensor", "identity_ok", "identity_flags", "uncertainty",
+    }
+    if not isinstance(measured_drops, (list, tuple)):
+        raise ValueError("correlation.measured_drops must be an array")
+    for raw_drop in measured_drops:
+        if not isinstance(raw_drop, Mapping):
+            raise ValueError("correlation.measured_drops entries must be objects")
+        drop_id = str(raw_drop.get("drop_id", "drop"))
+        unknown_keys = sorted(set(raw_drop.keys()) - allowed_drop_keys)
+        if unknown_keys:
+            raise ValueError(
+                "correlation.measured_drops entry {!r} has unsupported "
+                "key(s) {}: a physical test must never silently ignore "
+                "unvalidated fields".format(drop_id, sorted(unknown_keys))
+            )
+        for key, low, high in (
+            ("measured_peak_accel_g", 0.0, 10000.0),
+            ("measured_impact_duration_s", 0.0, 1.0),
+            ("measured_settle_s", 0.0, 60.0),
+        ):
+            if raw_drop.get(key) is None:
+                continue
+            value = float(raw_drop[key])
+            if not math.isfinite(value):
+                raise ValueError(
+                    "correlation.measured_drops entry {!r} {} must be "
+                    "finite".format(drop_id, key)
+                )
+            if value <= low:
+                raise ValueError(
+                    "correlation.measured_drops entry {!r} {} must be "
+                    "positive".format(drop_id, key)
+                )
+            if value > high:
+                raise ValueError(
+                    "correlation.measured_drops entry {!r} {} {} exceeds "
+                    "the physical plausibility bound ({}) for a hand "
+                    "drop".format(drop_id, key, value, high)
+                )
+        raw_sensor = raw_drop.get("sensor")
+        if raw_sensor is not None and not isinstance(raw_sensor, Mapping):
+            raise ValueError(
+                "correlation.measured_drops entry {!r} sensor must be an "
+                "object".format(drop_id)
+            )
+        if isinstance(raw_sensor, Mapping) and raw_sensor.get("sampling_rate_hz") is not None:
+            rate = float(raw_sensor["sampling_rate_hz"])
+            if not math.isfinite(rate) or rate <= 0.0:
+                raise ValueError(
+                    "correlation.measured_drops entry {!r} "
+                    "sensor.sampling_rate_hz must be positive and finite".format(drop_id)
+                )
+
+
 def _run_correlation_section(
     correlation_section,
     mass_kg,
@@ -257,6 +391,7 @@ def _run_correlation_section(
     surface_restitution,
     stiffness,
     result,
+    drop_overrides=None,
 ):
     """Evaluate a measured-drop correlation section against the simulator.
 
@@ -277,15 +412,45 @@ def _run_correlation_section(
         if not math.isfinite(max_error) or max_error <= 0.0:
             raise ValueError("correlation.acceptance.max_relative_error must be positive")
         min_conditions = int(acceptance.get("min_drop_conditions", 3))
+        # Validation-mode pins (gravity, restitution/friction scales, mass/
+        # inertia scales, CoM override) must reach the correlation re-sim so
+        # measured-vs-simulated compares the SAME physical configuration.
+        correlation_gravity = float(drop_overrides.get("gravity_m_s2") or drop_module.GRAVITY_M_S2)
+        correlation_restitution_scale = float(drop_overrides.get("restitution_scale") or 1.0)
+        correlation_friction_scale = float(drop_overrides.get("friction_scale") or 1.0)
+        correlation_mass_scale = float(drop_overrides.get("mass_scale") or 1.0)
+        correlation_inertia_scale = float(drop_overrides.get("inertia_scale") or 1.0)
+        correlation_com = drop_overrides.get("com_override_m") or com_offset_m
+        # Audit finding: the re-sim previously ran default dt/seed/unit_seed
+        # while the trace reported the pins as applied — the compared
+        # configuration must be the reported configuration.
+        correlation_timestep = drop_overrides.get("timestep_s")
+        correlation_seed = drop_overrides.get("seed", 0)
+        correlation_unit_seed = drop_overrides.get("unit_seed")
         conditions = []
         for raw_drop in measured_drops:
             if not isinstance(raw_drop, Mapping):
                 continue
             drop_id = str(raw_drop.get("drop_id", "drop"))
             condition = {"drop_id": drop_id, "metrics": []}
+            # W2-05 follow-up: the raw measured_drops path had no measurement
+            # validation (NaN crashed the run as PIPELINE_INTERNAL at
+            # serialization; negative/implausible values and unknown keys
+            # were silently accepted).  Mirror the measured_tests rules:
+            # unknown keys rejected, measured values finite and within the
+            # documented plausibility bounds.  A rejected drop fails its
+            # condition (verdict fail), never the whole run.
+            try:
+                _validate_raw_measured_drops([raw_drop])
+            except (TypeError, ValueError) as exc:
+                condition["error"] = str(exc)
+                conditions.append(condition)
+                continue
             height = raw_drop.get("height_m")
             surface = str(raw_drop.get("surface", "concrete")).strip().lower()
-            orientation = str(raw_drop.get("orientation", "flat")).strip().lower()
+            orientation = raw_drop.get("orientation", "flat")
+            if isinstance(orientation, str):
+                orientation = orientation.strip().lower()
             try:
                 height = float(height)
                 if not math.isfinite(height):
@@ -299,8 +464,37 @@ def _run_correlation_section(
                         "orientation": orientation,
                     }
                 )
+                condition["height_m"] = correlation_config["height_m"]
+                condition["surface"] = correlation_config["surface"]
+                condition["orientation"] = correlation_config["orientation"]
                 measured_accel = raw_drop.get("measured_peak_accel_g")
-                measured_settle = raw_drop.get("measured_settle_time_s")
+                measured_duration = raw_drop.get("measured_impact_duration_s")
+                measured_settle = raw_drop.get(
+                    "measured_settle_s", raw_drop.get("measured_settle_time_s")
+                )
+                # Audit finding (W2-02F): a sensor whose sampling rate cannot
+                # resolve the measured impact duration was compared as if the
+                # pulse were fully captured.  Fewer than two sample periods
+                # across the pulse cannot resolve its shape or peak; disclose
+                # the limitation on the condition (never silent).
+                sensor_definition = raw_drop.get("sensor") or {}
+                sampling_rate = sensor_definition.get("sampling_rate_hz")
+                if (
+                    sampling_rate is not None
+                    and measured_duration is not None
+                    and float(sampling_rate) > 0.0
+                    and float(measured_duration) < 2.0 / float(sampling_rate)
+                ):
+                    condition["sampling_resolution_warning"] = (
+                        "the {:.0f} Hz sensor samples every {:.3g} s; the "
+                        "measured impact duration {:.4g} s spans fewer than "
+                        "two sample periods and may not resolve the pulse "
+                        "peak or duration".format(
+                            float(sampling_rate),
+                            1.0 / float(sampling_rate),
+                            float(measured_duration),
+                        )
+                    )
                 correlation_run = drop_module.simulate(
                     mass_kg,
                     inertia,
@@ -309,9 +503,24 @@ def _run_correlation_section(
                     surface=correlation_config["surface"],
                     drop_count=1,
                     test="drop",
-                    orientation=correlation_config["orientation"],
-                    seed=0,
-                    com_offset_m=com_offset_m,
+                    orientation=(
+                        {"quaternion_wxyz": list(correlation_config["orientation_quaternion_wxyz"])}
+                        if correlation_config.get("orientation_quaternion_wxyz") is not None
+                        else correlation_config["orientation"]
+                    ),
+                    seed=correlation_seed,
+                    unit_seed=correlation_unit_seed,
+                    com_offset_m=correlation_com,
+                    gravity=correlation_gravity,
+                    restitution_scale=correlation_restitution_scale,
+                    friction_scale=correlation_friction_scale,
+                    mass_scale=correlation_mass_scale,
+                    inertia_scale=correlation_inertia_scale,
+                    dt=(
+                        float(correlation_timestep)
+                        if correlation_timestep is not None
+                        else drop_module.DT_S
+                    ),
                 )
                 correlation_peak = correlation_run["peak"]
                 predicted_accel_g = None
@@ -319,27 +528,144 @@ def _run_correlation_section(
                     raw_energy = correlation_peak.get("raw_kinetic_energy_j") or correlation_peak[
                         "kinetic_energy_j"
                     ]
-                    budget = mass_kg * drop_module.GRAVITY_M_S2 * correlation_config["height_m"]
+                    correlation_model = correlation_run["model"]
+                    correlation_mass = float(correlation_model.get("mass_kg") or mass_kg)
+                    budget = correlation_mass * correlation_gravity * correlation_config["height_m"]
                     capped = min(raw_energy, budget)
-                    speed = math.sqrt(max(0.0, 2.0 * capped / mass_kg))
+                    speed = math.sqrt(max(0.0, 2.0 * capped / correlation_mass))
                     estimate = impact.estimate_impact(
-                        mass_kg,
+                        correlation_mass,
                         velocity_m_s=speed,
-                        restitution=surface_restitution,
+                        restitution=float(correlation_model.get("restitution") or surface_restitution),
                         contact_stiffness_n_per_m=stiffness,
                     )
                     predicted_accel_g = (
                         estimate.to_dict().get("peak_acceleration_m_s2", 0.0) / 9.80665
                     )
-                predicted_settle = correlation_run["drops"][0]["settled_s"]
+                first_drop = correlation_run["drops"][0]
+                predicted_settle = first_drop["settled_s"]
+                did_not_settle = any(
+                    str(check.get("code") or "") == "DROP_SIM_DID_NOT_SETTLE"
+                    for check in first_drop.get("checks") or []
+                )
+                # Reproducibility echo: the EXACT simulated pose for THIS
+                # condition (a physical test's recorded orientation can be
+                # compared 1:1 against it).
+                condition["orientation_quaternion_wxyz"] = correlation_run["model"].get(
+                    "orientation_quaternion_wxyz"
+                )
+                condition["gravity_vector_body"] = correlation_run["model"].get(
+                    "gravity_vector_body"
+                )
+                condition["starting_pose_m"] = correlation_run["model"].get("starting_pose_m")
+                condition["initial_angular_velocity_rad_s"] = correlation_run["model"].get(
+                    "initial_angular_velocity_rad_s"
+                )
+                # Equivalence of the compared quantity (validation mode): the
+                # predicted peak is CoM-frame, quasi-static, rotation-free;
+                # it is only equivalent to a surface sensor reading for FLAT
+                # impacts with a defined sensor at/near the CoM reading the
+                # RESULTANT peak.  Non-equivalent conditions are excluded
+                # from the verdict (audit finding: they previously drove
+                # correlated + high confidence while every row was flagged
+                # NOT EQUIVALENT).
+                equivalent = True
+                if drop_overrides.get("enforce_equivalence"):
+                    sensor = raw_drop.get("sensor") or {}
+                    flat_impact = isinstance(orientation, str) and orientation == "flat"
+                    sensor_defined = bool(sensor)
+                    location = sensor.get("location_body_m") if sensor_defined else None
+                    # Near-CoM is judged against the BODY's actual center of
+                    # mass (the drop's com offset), not the mesh origin:
+                    # for an asymmetric prototype the origin can be far from
+                    # the CoM (audit follow-up).
+                    com_reference = correlation_com or (0.0, 0.0, 0.0)
+                    near_com = (
+                        location is not None
+                        and math.sqrt(
+                            sum(
+                                (float(component) - float(reference)) ** 2
+                                for component, reference in zip(location, com_reference)
+                            )
+                        )
+                        <= 0.005
+                    )
+                    resultant = (
+                        str(sensor.get("quantity") or "resultant_peak_g") == "resultant_peak_g"
+                        if sensor_defined
+                        else False
+                    )
+                    equivalent = bool(flat_impact and sensor_defined and near_com and resultant)
+                    if not sensor_defined:
+                        condition["equivalence_note"] = (
+                            "no sensor definition supplied; the comparison quantity "
+                            "is unknown and treated as NOT equivalent"
+                        )
+                condition["equivalent"] = equivalent
+                if not equivalent and not condition.get("equivalence_note"):
+                    condition["equivalence_note"] = (
+                        "the simulated peak is CoM-frame and rotation-free; a "
+                        "surface-mounted sensor reading body-frame acceleration "
+                        "at its own location includes rotational terms for "
+                        "non-flat impacts (factor ~2-3 at corner/edge) — the "
+                        "comparison is NOT directly equivalent unless the "
+                        "sensor is at the CoM during a flat impact reading "
+                        "the resultant peak"
+                    )
+                # Prototype identity (all modes): a test from a different
+                # CAD revision / material / prototype must not contribute to
+                # the verdict (audit finding).
+                identity_ok = True
+                identity_flags = []
+                if drop_overrides.get("enforce_equivalence"):
+                    identity_ok = bool(raw_drop.get("identity_ok", True))
+                    identity_flags = list(raw_drop.get("identity_flags") or [])
+                condition["identity_ok"] = identity_ok
+                condition["identity_flags"] = identity_flags
                 if measured_accel is not None and predicted_accel_g is not None:
                     _append_correlation_metric(
                         condition, "peak_accel_g", measured_accel, predicted_accel_g, max_error
                     )
+                if measured_duration is not None:
+                    # Audit finding: the measured full contact pulse was
+                    # compared against the compression-phase-only model value
+                    # (~30% systematic bias).  Compare against the FULL
+                    # contact duration (compression + restitution).
+                    compression = estimate.to_dict().get("contact_duration_s")
+                    if compression is not None:
+                        full_duration = (1.0 + float(
+                            correlation_model.get("restitution") or 0.0
+                        )) * float(compression)
+                        condition["duration_convention"] = (
+                            "full contact duration (1+e)*t with e = effective "
+                            "restitution; compression phase t = (pi/2)*sqrt(m/k)"
+                        )
+                        _append_correlation_metric(
+                            condition,
+                            "impact_duration_s",
+                            measured_duration,
+                            full_duration,
+                            max_error,
+                        )
                 if measured_settle is not None:
-                    _append_correlation_metric(
-                        condition, "settle_time_s", measured_settle, predicted_settle, max_error
-                    )
+                    if did_not_settle:
+                        # Audit finding: the 8.0 s DID_NOT_SETTLE sentinel must
+                        # never be compared as a settle value.
+                        condition["metrics"].append(
+                            {
+                                "metric_key": "settle_time_s",
+                                "measured": measured_settle,
+                                "predicted": None,
+                                "relative_error": None,
+                                "pass": False,
+                                "reason": "simulated drop did not settle "
+                                "(DROP_SIM_DID_NOT_SETTLE); settle comparison not applicable",
+                            }
+                        )
+                    else:
+                        _append_correlation_metric(
+                            condition, "settle_time_s", measured_settle, predicted_settle, max_error
+                        )
             except (TypeError, ValueError) as exc:
                 condition["error"] = str(exc)
             conditions.append(condition)
@@ -388,6 +714,15 @@ def _run_component_and_population_sections(
             mass_kg = drop_mass
     if mass_kg is None:
         mass_kg = 0.1
+        result["issues"].append(
+            _issue(
+                "DROP_SIMULATION_MASS_ASSUMED",
+                "warning",
+                "components",
+                "component/population load chain mass assumed to be 0.1 kg "
+                "(mesh has no safe mass properties)",
+            )
+        )
     vertices = []
     for geometry in geometry_objs.values():
         mesh_vertices = getattr(geometry, "world_vertices", None)
@@ -425,6 +760,15 @@ def _run_component_and_population_sections(
         inertia = result["mass"].get("inertia_tensor_kg_m2")
     if inertia is None:
         inertia = drop_module.box_inertia(mass_kg, bounds)
+        result["issues"].append(
+            _issue(
+                "DROP_SIMULATION_INERTIA_APPROXIMATED",
+                "warning",
+                "components",
+                "component/population load chain uses a uniform-density box "
+                "inertia model (mass properties unavailable)",
+            )
+        )
     com_offset_m = None
     if result["mass"] is not None and result["mass"].get("center_of_mass_m") is not None:
         com_offset_m = tuple(result["mass"]["center_of_mass_m"])
@@ -611,7 +955,7 @@ def _run_component_and_population_sections(
                 )
 
 
-def _assemble_shell_result(request, result):
+def _assemble_shell_result(request, result, validation_run=None):
     """Assemble the authoritative SHELL engineering result.
 
     The shell is the primary engineering target: the structural response
@@ -637,8 +981,19 @@ def _assemble_shell_result(request, result):
             sf = None
     validity = str(response.get("validity") or "not_evaluated")
     issue_codes = [item.get("code") for item in result.get("issues") or ()]
+    validation_findings = (result.get("validation") or {}).get("findings") or ()
+    validation_codes = {str(item.get("code") or "") for item in validation_findings}
     mass_assumed = "DROP_SIMULATION_MASS_ASSUMED" in issue_codes
     inertia_approximated = "DROP_SIMULATION_INERTIA_APPROXIMATED" in issue_codes
+    # W4-03: inverted thickness limits (min > max) were flagged by the
+    # validation report but the shell verdict ignored them — a contradictory
+    # PASS/SAFE next to a fail report.  Geometry-configuration contradictions
+    # must restrict the verdict like any other unverifiable-geometry case.
+    thickness_limits_invalid = "THICKNESS_LIMITS_INVALID" in validation_codes
+    # Geometry integrity is INCOMPLETE for meshes beyond the exact
+    # self-intersection sweep limit: the mass may be affected, so the shell
+    # must never be declared safe or highly confident on such a mesh.
+    geometry_integrity_uncertain = "SELF_INTERSECTION_UNVERIFIED" in validation_codes
     invalid_input = bool(result.get("errors")) or any(
         code in ("GEOMETRY_PARSE_FAILED", "GEOMETRY_MISSING", "INVALID_OBJECTS")
         for code in issue_codes
@@ -648,20 +1003,32 @@ def _assemble_shell_result(request, result):
         flag for flag in (response.get("flags") or ()) if str(flag).startswith("UNSUPPORTED_")
     ]
     calibration = result.get("correlation")
-    calibration_passed = (
-        isinstance(calibration, dict) and calibration.get("verdict") == "pass"
-    )
+    # Audit finding: confidence "high" previously gated on verdict=="pass"
+    # only, so a 1-2 condition pass (user-lowered min_drop_conditions) or a
+    # non-equivalent pass unlocked high confidence while model_status stayed
+    # below correlated.  ONE standard: high requires model_status ==
+    # "correlated" (>= 3 equivalent, identity-consistent conditions with a
+    # peak-acceleration comparison).
+    from . import shell_validation as validation_module
+
+    model_status_data = validation_module.build_model_status(result, validation_run)
+    calibration_passed = model_status_data["model_status"] == "correlated"
     if invalid_input:
         status = "not_evaluated"
         classification = "invalid_input"
     elif sf is None:
         status = "not_evaluated"
         classification = "insufficient_evidence"
-    elif (mass_assumed or inertia_approximated) and sf is not None and sf >= 1.2:
-        # The geometry could not certify a solid (mass/inertia assumed): the
-        # pinned structural analysis is still shown, but the shell cannot be
-        # declared SAFE — the physical object's drop-side behavior is
-        # unverifiable.
+    elif (
+        (mass_assumed or inertia_approximated or geometry_integrity_uncertain or thickness_limits_invalid)
+        and sf is not None
+        and sf >= 1.2
+    ):
+        # The geometry could not certify a solid (mass/inertia assumed, or
+        # self-intersection unverified beyond the sweep limit, or the
+        # thickness limits are contradictory): the pinned structural analysis
+        # is still shown, but the shell cannot be declared SAFE — the
+        # physical object's drop-side behavior is unverifiable.
         status = "warn"
         classification = "insufficient_evidence"
     elif (
@@ -712,6 +1079,7 @@ def _assemble_shell_result(request, result):
         and not mass_assumed
         and not inertia_approximated
         and not point_load_present
+        and not geometry_integrity_uncertain
         and calibration_passed
     ):
         physical_model_confidence = "high"
@@ -739,6 +1107,11 @@ def _assemble_shell_result(request, result):
         limitations.append("mass assumed 0.1 kg (geometry mass properties unavailable)")
     if inertia_approximated:
         limitations.append("inertia approximated by a bounding box")
+    if geometry_integrity_uncertain:
+        limitations.append(
+            "self-intersection unverified beyond the exact sweep limit; "
+            "geometry integrity and mass are not fully certified"
+        )
     if not calibration_passed:
         limitations.append(
             "no passed measured-drop correlation: the physical model is uncalibrated screening"
@@ -772,6 +1145,14 @@ def _assemble_shell_result(request, result):
         "limitations": limitations,
         "loading": loading,
     }
+    # Physical-validation framing (validation-preparation phase): the model
+    # status separates SIMULATION RESULT from PHYSICALLY VALIDATED RESULT,
+    # the trace records one authoritative value per quantity used, and the
+    # invalidating-assumption list states what would invalidate the verdict.
+    result["shell"]["model_status"] = model_status_data["model_status"]
+    result["shell"]["physical_validation"] = model_status_data["physical_validation"]
+    result["shell"]["invalidating_assumptions"] = validation_module.build_invalidating_assumptions(result)
+    result["shell"]["inputs_trace"] = validation_module.build_shell_trace(request, result)
 
 
 def _critical_region_probe(request, result):
@@ -788,14 +1169,10 @@ def _critical_region_probe(request, result):
         return None
     structure = structural.get("structure")
     load_case = structural.get("load_case")
-    material_payload = {}
-    material_ref = structural.get("material")
-    if material_ref is not None:
-        try:
-            catalog = materials.builtin_materials()
-            material_payload = catalog.get(material_ref) or {}
-        except Exception:
-            material_payload = {}
+    # The probe re-solves with the SAME resolved material the nominal solve
+    # used (audit finding: re-resolving from the builtin catalog could
+    # silently re-probe with a different E/allowable than the nominal).
+    material_payload = structural.get("resolved_material") or {}
     if not isinstance(structure, dict) or not isinstance(load_case, dict):
         return None
     fixtures = None
@@ -866,13 +1243,39 @@ def _critical_region_probe(request, result):
 
 
 def _correlation_summary(conditions, max_error, min_conditions):
-    """Aggregate per-condition comparisons into the correlation verdict."""
-    evaluated = [condition for condition in conditions if condition["metrics"]]
+    """Aggregate per-condition comparisons into the correlation verdict.
+
+    Fail-closed: the verdict, R^2, and bias are computed from the
+    measured/predicted pairs only (never from reported summary fields).
+    Passing requires at least ``min_conditions`` DISTINCT evaluated
+    conditions, at least ``min_conditions`` distinct measured values (a
+    degenerate/duplicated dataset cannot define a meaningful R^2), every
+    per-metric relative error within ``max_error``, R^2 in [0, 1] and
+    >= 0.80, and |bias| <= 0.10.
+    """
+    # Audit finding: non-equivalent conditions (corner/edge impacts with
+    # off-CoM or axis sensors — factor ~2-3 mismatch) previously drove the
+    # verdict and the correlated/high-confidence labels while every row was
+    # flagged NOT EQUIVALENT.  They are now EXCLUDED from the verdict (the
+    # rows remain in the comparison table with their flags).  Conditions
+    # flagged with identity mismatches (different CAD revision / material /
+    # prototype) are likewise excluded.  When the equivalence field is
+    # absent (legacy exploration-mode correlation), conditions are treated
+    # as equivalent by default.
+    all_evaluated = [condition for condition in conditions if condition["metrics"]]
+    excluded = [
+        condition
+        for condition in all_evaluated
+        if not condition.get("equivalent", True) or not condition.get("identity_ok", True)
+    ]
+    evaluated = [
+        condition
+        for condition in all_evaluated
+        if condition.get("equivalent", True) and condition.get("identity_ok", True)
+    ]
     all_metrics = [metric for condition in evaluated for metric in condition["metrics"]]
     evaluated_metric_count = len(all_metrics)
-    failures = [
-        metric for metric in all_metrics if not metric.get("pass", False)
-    ]
+    failures = [metric for metric in all_metrics if not metric.get("pass", False)]
     measured_points = []
     predicted_points = []
     for condition in evaluated:
@@ -906,36 +1309,148 @@ def _correlation_summary(conditions, max_error, min_conditions):
     min_r_squared = 0.80
     max_bias = 0.10
     reasons = []
+    # W10-01: exclusions are disclosed in the explanation but never veto the
+    # verdict (they do not contribute to it, by the campaign matrix design).
+    exclusion_note = None
     if len(evaluated) < min_conditions:
         reasons.append(
             "{} of {} required drop conditions evaluated".format(len(evaluated), min_conditions)
+        )
+    distinct_measured = len(set(round(value, 9) for value in measured_points))
+    if distinct_measured < min_conditions:
+        reasons.append(
+            "{} distinct measured value(s) across {} comparison(s); R^2 is not meaningful".format(
+                distinct_measured, len(measured_points)
+            )
+        )
+    if len(measured_points) >= 2 and r_squared is None:
+        # Zero variance in measured or predicted: R^2 is undefined (e.g. all
+        # repeats at one height).  Fail closed rather than pass vacuously.
+        reasons.append("measured or predicted values have zero variance; R^2 is undefined")
+    duplicate_identities = []
+    seen_identities = []
+    for condition in evaluated:
+        # Independence is judged on the PHYSICAL POSE: (height, surface,
+        # resolved orientation QUATERNION), not the orientation label.
+        # Audit finding: mode "corner" and the explicit corner quaternion
+        # are the SAME pose but were previously counted as two conditions
+        # (the quaternion label collapsed to "explicit"), letting two
+        # physical conditions pass as three; conversely, two genuinely
+        # different explicit quaternions at one height/surface were falsely
+        # flagged as duplicates.
+        quaternion = condition.get("orientation_quaternion_wxyz")
+        if isinstance(quaternion, (list, tuple)) and len(quaternion) == 4:
+            # Canonicalize the sign: q and -q describe the same orientation
+            # (audit follow-up: the sign-sensitive key let (-1,0,0,0) and
+            # (1,0,0,0) count as two distinct conditions).
+            components = [float(component) for component in quaternion]
+            sign = 1.0
+            for component in components:
+                if abs(component) > 1e-9:
+                    sign = 1.0 if component > 0.0 else -1.0
+                    break
+            orientation_key = tuple(
+                round(component * sign, 6) for component in components
+            )
+        else:
+            orientation_key = str(condition.get("orientation", "") or "").strip().lower()
+        height_value = float(condition.get("height_m"))
+        surface_key = str(condition.get("surface", "") or "").strip().lower()
+        # W2-02E follow-up: the 4dp cell key had a knife-edge — heights
+        # straddling a cell boundary (e.g. 0.75005 vs 0.75006, 10 um apart)
+        # counted as independent.  Independence uses a 1 mm pose tolerance
+        # (same physical drop) instead of exact cell equality.
+        is_duplicate = any(
+            surface_key == seen_surface
+            and orientation_key == seen_orientation
+            and abs(height_value - seen_height) < 1e-3
+            for seen_height, seen_surface, seen_orientation in seen_identities
+        )
+        if is_duplicate:
+            duplicate_identities.append((height_value, surface_key, orientation_key))
+        else:
+            seen_identities.append((height_value, surface_key, orientation_key))
+    if duplicate_identities:
+        reasons.append(
+            "{} duplicate drop condition(s) (same height/surface/orientation pose)".format(
+                len(duplicate_identities)
+            )
+        )
+    # Audit finding (W2-13 follow-up / W10-01): non-equivalent conditions are
+    # EXCLUDED from the verdict — they must not contribute to it, and they
+    # must not VETO it either.  The campaign matrix documents rows 4-8/11 as
+    # diagnostic rows that appear in the comparison table with their flags
+    # but do NOT contribute to the verdict; a full campaign with a passing
+    # equivalent subset must still be able to reach correlated.  Exclusions
+    # are disclosed (excluded_conditions / excluded_reasons / explanation)
+    # but never fail the verdict on their own.
+    if excluded:
+        exclusion_note = (
+            "{} condition(s) excluded from the verdict (disclosed, not "
+            "counted): {}".format(
+                len(excluded),
+                "; ".join(
+                    "{} ({})".format(
+                        str(condition.get("drop_id") or "?"),
+                        "NOT EQUIVALENT sensor comparison"
+                        if not condition.get("equivalent", True)
+                        else "identity mismatch: " + "; ".join(condition.get("identity_flags") or []),
+                    )
+                    for condition in excluded
+                ),
+            )
         )
     if failures:
         reasons.append("{} of {} metric comparisons exceeded the {:.0%} error bound".format(
             len(failures), evaluated_metric_count, max_error
         ))
-    if r_squared is not None and r_squared < min_r_squared:
-        reasons.append("R-squared {:.3f} below {:.2f}".format(r_squared, min_r_squared))
+    if r_squared is not None and (r_squared < min_r_squared or r_squared > 1.0 + 1e-9):
+        reasons.append("R-squared {:.3f} outside [{:.2f}, 1]".format(r_squared, min_r_squared))
     if bias is not None and abs(bias) > max_bias:
         reasons.append("signed bias {:.3f} exceeds {:.3f}".format(bias, max_bias))
     if not evaluated:
         reasons.append("no measured drop conditions could be evaluated")
     verdict = "pass" if not reasons else "fail"
+    # W10-01: the explanation discloses both the failing reasons and the
+    # excluded conditions (which are disclosed but never veto).
+    explanation_parts = list(reasons)
+    if exclusion_note:
+        explanation_parts.append(exclusion_note)
+    explanation = "; ".join(explanation_parts) if explanation_parts else (
+        "predicted vs measured drop response within acceptance"
+    )
     return {
         "conditions": conditions,
+        "evaluated_conditions": len(evaluated),
+        "excluded_conditions": len(excluded),
+        "excluded_reasons": [
+            {
+                "drop_id": str(condition.get("drop_id") or "?"),
+                "reason": "NOT EQUIVALENT sensor comparison"
+                if not condition.get("equivalent", True)
+                else "identity mismatch",
+                "details": condition.get("identity_flags") or condition.get("equivalence_note"),
+            }
+            for condition in excluded
+        ],
         "max_relative_error": round(max_error, 6),
         "min_drop_conditions": min_conditions,
         "r_squared": round(r_squared, 6) if r_squared is not None else None,
         "bias": round(bias, 6) if bias is not None else None,
         "verdict": verdict,
-        "explanation": "; ".join(reasons) if reasons else (
-            "predicted vs measured drop response within acceptance"
-        ),
+        "explanation": explanation,
     }
 
 
 def _normalize_load(load):
-    """Materialize magnitude_pa/force_n from a ``magnitude``/``force`` input."""
+    """Materialize magnitude_pa/force_n from a ``magnitude``/``force`` input.
+
+    W4-03: a non-positive load magnitude (e.g. -1 kPa) previously flowed into
+    the solver — the von Mises stress is sign-invariant, so a negative load
+    produced a plausible-looking PASS/SAFE with a negative displacement.
+    Loads must be strictly positive; a zero or negative load is an input
+    error, never a valid structural case.
+    """
     result = dict(load or {})
     magnitude = result.get("magnitude")
     if magnitude is not None:
@@ -948,6 +1463,13 @@ def _normalize_load(load):
                 result["magnitude_pa"] = float(magnitude.get("value", 0.0))
         else:
             result["magnitude_pa"] = float(magnitude)
+        value = result["magnitude_pa"]
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                "load_case.magnitude must be a positive, finite pressure: a "
+                "zero or negative load is not a valid structural case "
+                "(received {!r})".format(value)
+            )
     force = result.get("force")
     if force is not None:
         if isinstance(force, Mapping) and "unit" in force:
@@ -956,6 +1478,13 @@ def _normalize_load(load):
             result["force_n"] = float(force.get("value", 0.0))
         else:
             result["force_n"] = float(force)
+        value = result["force_n"]
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                "load_case.force must be a positive, finite force: a zero or "
+                "negative load is not a valid structural case (received "
+                "{!r})".format(value)
+            )
     return result
 
 
@@ -1378,7 +1907,17 @@ def _validity(result):
         or result.get("drop_simulation") is not None
     )
     if state == "valid":
-        confidence = "high" if analysis_evidence else "medium"
+        # 'high' only with analysis evidence AND model_status == "correlated"
+        # (>= 3 equivalent measured conditions passing acceptance):
+        # analytical/numerical correctness is separate from physical
+        # validation (freeze-phase item 12) — a solver that passes its own
+        # tests never yields high confidence by itself, and a 1-2 condition
+        # pass never does either.
+        model_status = (result.get("shell") or {}).get("model_status")
+        if analysis_evidence and model_status == "correlated":
+            confidence = "high"
+        else:
+            confidence = "medium"
     else:
         confidence = "low"
     return {
@@ -1626,9 +2165,342 @@ def _run_collision(request, geometry_objs, result):
     }
 
 
+def _attach_validation_extras(request, result, validation_run):
+    """Attach the shell-validation preparation artifacts to the result.
+
+    Runs only in validation mode: the contact-stiffness sweep (sensitivity
+    of the shell loading to the largest identified uncertainty), the
+    end-to-end parameter sensitivity, the uncertainty bands derived from
+    the sweep, and the measured-vs-simulated comparison.  Nothing here
+    modifies the physics; measured data is never applied automatically.
+    """
+    from . import shell_validation as validation_module
+
+    shell = result["shell"]
+    applied = validation_run.get("applied") or {}
+    sweep_values = applied.get("contact_stiffness_sweep_n_per_m")
+    sensitivity_config = applied.get("sensitivity") or {}
+    measured_tests = applied.get("measured_tests")
+
+    block = {
+        "config": applied,
+        "note": (
+            "shell validation preparation: the chain above is pinned by the "
+            "validation section; measured data never modifies the physics"
+        ),
+    }
+    # Shell-only explicitness: which objects are the engineering target and
+    # which are context only, plus the drop-dynamics vs structural track
+    # separation.
+    block.update(validation_module.build_validation_tracks(request, result))
+    # Prototype measurement disclosure: when the user pinned a MEASURED
+    # prototype mass, report the difference against the geometry-derived
+    # mass so a real 45 g prototype is never silently compared against a
+    # differently-massed simulation.  The EFFECTIVE mass actually solved
+    # (incl. any mass_scale) is reported (audit finding: the disclosure
+    # previously ignored a compounding mass_scale).
+    prototype = (applied.get("prototype") or {})
+    if prototype.get("mass_kg") is not None:
+        model_mass = (result.get("mass") or {}).get("mass_kg")
+        drop_model = (result.get("drop_simulation") or {}).get("model") or {}
+        effective_mass = drop_model.get("mass_kg")
+        if model_mass is not None:
+            try:
+                measured_mass = float(prototype["mass_kg"])
+                solved_mass = float(effective_mass) if effective_mass is not None else measured_mass
+                delta_pct = 100.0 * (solved_mass - float(model_mass)) / float(model_mass)
+            except (TypeError, ValueError, ZeroDivisionError):
+                delta_pct = None
+            scale_active = bool((applied.get("drop") or {}).get("mass_scale"))
+            block["prototype_mass_disclosure"] = {
+                "measured_kg": prototype["mass_kg"],
+                "model_kg": model_mass,
+                "solved_kg": effective_mass,
+                "delta_pct": round(delta_pct, 2) if delta_pct is not None else None,
+                "note": (
+                    "the simulation uses the MEASURED prototype mass"
+                    + (" multiplied by the pinned mass_scale" if scale_active else "")
+                    + "; the delta against the geometry-derived mass is disclosed"
+                ),
+            }
+    # Inert-pin disclosures (audit findings): pins that are validated and
+    # recorded but cannot affect the executed chain must warn, not silently
+    # pretend to be applied.
+    prototype = applied.get("prototype") or {}
+    if prototype.get("thickness_m") is not None:
+        structure = request.get("structure") or {}
+        model_t = structure.get("t_m")
+        try:
+            pinned_t = float(prototype["thickness_m"])
+            mismatch = model_t is None or abs(pinned_t - float(model_t)) / float(model_t) > 0.01
+        except (TypeError, ValueError, ZeroDivisionError):
+            mismatch = True
+        if mismatch:
+            result["issues"].append(
+                _issue(
+                    "VALIDATION_THICKNESS_PIN_NOT_APPLIED",
+                    "warning",
+                    "validation",
+                    "validation.prototype.thickness_m ({}) is recorded but does "
+                    "not drive the structural solve (structure.t_m = {}); the "
+                    "structural track is validated by a separate quasi-static "
+                    "test, not by the drop campaign".format(
+                        prototype["thickness_m"], model_t
+                    ),
+                )
+            )
+    contact = applied.get("contact") or {}
+    if contact.get("substeps") is not None:
+        result["issues"].append(
+            _issue(
+                "VALIDATION_SUBSTEPS_PIN_INERT",
+                "warning",
+                "validation",
+                "validation.contact.substeps is recorded but the integrator "
+                "derives its own subdivisions; the pin has no effect on the "
+                "simulation",
+            )
+        )
+    structural_pin = (applied.get("structural") or {}).get("model")
+    executed_method = (result.get("structural") or {}).get("response", {}).get("method_id")
+    if structural_pin and executed_method and structural_pin != executed_method:
+        result["issues"].append(
+            _issue(
+                "VALIDATION_STRUCTURAL_MODEL_PIN_MISMATCH",
+                "warning",
+                "validation",
+                "validation.structural.model {!r} does not match the executed "
+                "solver method {!r}: the pin is recorded but the solve follows "
+                "request.structure".format(structural_pin, executed_method),
+            )
+        )
+    shell["statement"] = (
+        shell.get("statement", "")
+        + " SHELL VALIDATION: drop tests validate the drop-dynamics chain "
+        "(contact stiffness, restitution, friction, rigid-body dynamics); "
+        "the structural safety factor comes from the pinned quasi-static "
+        "load case and is NOT validated by drop tests."
+    )
+    # Measured comparison first: the k-sensitivity below scales each test's
+    # own simulated acceleration.
+    if measured_tests:
+        revision = (applied.get("geometry") or {}).get("cad_revision")
+        block["measured_comparison"] = validation_module.measured_comparison(
+            measured_tests, _simulated_by_condition(result), validation_revision=revision
+        )
+    sweep = None
+    bands = None
+    drop = result.get("drop_simulation") or {}
+    estimate = drop.get("peak_force_estimate") or {}
+    if sweep_values and estimate:
+        sweep = validation_module.run_contact_stiffness_sweep(
+            sweep_values,
+            float(estimate.get("mass_kg")),
+            float(estimate.get("impact_speed_m_s")),
+            float(estimate.get("restitution")),
+        )
+        block["contact_stiffness_sweep"] = sweep
+        structural = result.get("structural") or {}
+        structural_response = structural.get("response") or {}
+        pinned_stiffness = drop.get("contact_stiffness_n_per_m")
+        bands = validation_module.build_uncertainty_bands(
+            sweep["rows"], structural_response, pinned_stiffness
+        )
+        block["uncertainty_bands"] = bands
+        # k-sensitivity of the measured comparison: per stiffness value, the
+        # bias/RMSE of simulated vs measured peak acceleration, with each
+        # test's simulated value scaled from ITS OWN predicted acceleration
+        # (a = v*sqrt(k/m) under the linear-spring model).
+        if measured_tests:
+            block["measured_k_sensitivity"] = _measured_k_sensitivity(
+                measured_tests,
+                sweep["rows"],
+                pinned_stiffness,
+                block.get("measured_comparison"),
+            )
+    elif sweep_values:
+        result["issues"].append(
+            _issue(
+                "VALIDATION_SWEEP_UNAVAILABLE",
+                "warning",
+                "validation",
+                "contact_stiffness_sweep requested but no drop-derived estimate "
+                "is available (drop simulation did not produce a peak estimate)",
+            )
+        )
+    # Always expose the uncertainty-bands block (basis not_computed when no
+    # sweep ran) so consumers never hit a missing key.
+    if bands is None:
+        block["uncertainty_bands"] = validation_module.build_uncertainty_bands(None, None)
+
+    if sensitivity_config:
+        try:
+            block["sensitivity"] = validation_module.run_sensitivity(
+                request,
+                fraction=sensitivity_config.get("perturbation_fraction", 0.1),
+                parameters=sensitivity_config.get("parameters"),
+            )
+        except Exception as exc:
+            result["issues"].append(
+                _issue(
+                    "VALIDATION_SENSITIVITY_FAILED",
+                    "warning",
+                    "validation",
+                    "sensitivity analysis failed: {}".format(str(exc)),
+                )
+            )
+
+    shell["validation"] = block
+
+
+def _simulated_by_condition(result):
+    """Map drop_id (test_id) -> the simulated peak acceleration g plus the
+    exact simulated pose for that condition.
+
+    Audit finding: the previous (height, surface, orientation) key collapsed
+    distinct explicit quaternions at one height/surface (last-wins), pairing
+    a measured value with the WRONG simulation.  Keying by drop_id (= test_id
+    in the validation workflow) pairs each measured test with its own
+    condition's simulation exactly.
+    """
+    conditions = (result.get("correlation") or {}).get("conditions") or []
+    by_condition = {}
+    for condition in conditions:
+        drop_id = str(condition.get("drop_id") or "")
+        if not drop_id:
+            continue
+        block = {
+            "orientation_quaternion_wxyz": condition.get("orientation_quaternion_wxyz"),
+            "gravity_vector_body": condition.get("gravity_vector_body"),
+            "starting_pose_m": condition.get("starting_pose_m"),
+            "initial_angular_velocity_rad_s": condition.get(
+                "initial_angular_velocity_rad_s"
+            ),
+            "equivalent": condition.get("equivalent", True),
+            "identity_ok": condition.get("identity_ok", True),
+            "equivalence_note": condition.get("equivalence_note"),
+        }
+        for metric in condition.get("metrics") or []:
+            key = metric.get("metric_key")
+            if key == "peak_accel_g":
+                block["peak_acceleration_g"] = metric.get("predicted")
+            elif key == "settle_time_s":
+                block["settle_time_s_predicted"] = metric.get("predicted")
+            elif key == "impact_duration_s":
+                block["impact_duration_s_predicted"] = metric.get("predicted")
+        by_condition[drop_id] = block
+    return by_condition
+
+
+def _measured_k_sensitivity(measured_tests, sweep_rows, pinned_stiffness, comparison):
+    """Bias/RMSE of simulated vs measured peak acceleration at each k.
+
+    Each test's simulated acceleration at a swept stiffness is scaled from
+    ITS OWN predicted acceleration at the pinned stiffness (a = v*sqrt(k/m)
+    under the linear-spring model), so a 0.5 m test is never compared
+    against a 1.0 m simulation.
+    """
+    if pinned_stiffness is None or not sweep_rows:
+        return {"note": "no stiffness reference for the k-sensitivity comparison"}
+    per_test = []
+    for row in (comparison or {}).get("rows") or []:
+        simulated = row.get("simulated") or {}
+        measured = row.get("measured") or {}
+        simulated_g = simulated.get("peak_acceleration_g")
+        measured_g = measured.get("measured_peak_accel_g")
+        if simulated_g is None or measured_g is None:
+            continue
+        try:
+            per_test.append((float(simulated_g), float(measured_g)))
+        except (TypeError, ValueError):
+            continue
+    if not per_test:
+        return {"note": "no matched measured-vs-simulated peak accelerations"}
+    rows = []
+    for sweep_row in sweep_rows:
+        stiffness = float(sweep_row["contact_stiffness_n_per_m"])
+        scale = math.sqrt(stiffness / float(pinned_stiffness))
+        residuals = [
+            simulated_g * scale - measured_g for simulated_g, measured_g in per_test
+        ]
+        rows.append(
+            {
+                "contact_stiffness_n_per_m": stiffness,
+                "bias_g": round(sum(residuals) / len(residuals), 4),
+                "rmse_g": round(
+                    math.sqrt(sum(value * value for value in residuals) / len(residuals)), 4
+                ),
+            }
+        )
+    return {
+        "rows": rows,
+        "note": "each test's simulated value scaled from its own predicted "
+        "acceleration at the pinned k (linear-spring a ~ sqrt(k)); this does "
+        "NOT select a 'correct' k — measurement of the physical contact is required",
+    }
+
+
 def _execute(request, mode, options, result):
+    # Shell validation mode: pin the entire shell chain (material, drop,
+    # contact, structural) explicitly from the validation section - nothing
+    # is silently inherited from unrelated settings.
+    validation_run = None
+    if mode == "validation":
+        from . import shell_validation as validation_module
+        from .errors import ValidationError as _ValidationError
+
+        try:
+            request, validation_run = validation_module.apply_validation_config(request)
+        except _ValidationError as exc:
+            message = str(exc)
+            result["issues"].append(
+                _issue(
+                    "VALIDATION_CONFIG_INVALID",
+                    "error",
+                    "validation",
+                    message,
+                    evidence_blocking=True,
+                )
+            )
+            result["errors"].append({"code": "VALIDATION_CONFIG_INVALID", "message": message})
+            result["validity"] = {
+                "state": "failed",
+                "reasons": [message],
+                "assumptions": [],
+                "unsupported_failure_modes": [],
+                "confidence": "low",
+            }
+            return
+        result["validation_run"] = validation_run
     units = str(request.get("units") or "m")
     catalog = _material_catalog(request, result)
+    # Fail-closed material pin: a validation run must never claim a material
+    # pin that the catalog cannot deliver (audit finding: an unknown key ran
+    # the structural solve without a material payload, silently).
+    if validation_run is not None:
+        pinned_material = (validation_run.get("applied") or {}).get("material")
+        if pinned_material is not None and catalog.get(pinned_material) is None:
+            message = "validation.material {!r} is not in the resolved material catalog".format(
+                pinned_material
+            )
+            result["issues"].append(
+                _issue(
+                    "VALIDATION_CONFIG_INVALID",
+                    "error",
+                    "validation",
+                    message,
+                    evidence_blocking=True,
+                )
+            )
+            result["errors"].append({"code": "VALIDATION_CONFIG_INVALID", "message": message})
+            result["validity"] = {
+                "state": "failed",
+                "reasons": [message],
+                "assumptions": [],
+                "unsupported_failure_modes": [],
+                "confidence": "low",
+            }
+            return
     raw_requirements = request.get("requirements")
     if raw_requirements is None and request.get("requirement") is not None:
         raw_requirements = [request["requirement"]]
@@ -1689,8 +2561,9 @@ def _execute(request, mode, options, result):
                 normalized_load = dict(normalized_load)
                 normalized_load["temperature_k"] = environment_temperature_k
             structure_data = dict(structure)
-            material_ref = structure_data.get("material")
-            material_def = catalog.get(material_ref) if material_ref is not None else _first_material(catalog)
+            material_def, material_label = _resolve_structure_material(
+                structure_data, catalog, materials_by_object
+            )
             material_payload = material_def if material_def is not None else {}
             fixtures = request.get("fixtures")
             preflight = [
@@ -1702,7 +2575,8 @@ def _execute(request, mode, options, result):
             result["structural"] = {
                 "load_case": normalized_load,
                 "structure": structure_data,
-                "material": material_ref,
+                "material": material_label,
+                "resolved_material": material_def,
                 "fixtures": fixtures,
                 "preflight": preflight,
                 "response": response.to_dict(),
@@ -1718,6 +2592,7 @@ def _execute(request, mode, options, result):
 
     impact_request = request.get("impact")
     result["impact"] = None
+    impact_material_label = None
     if impact_request is not None:
         try:
             if not isinstance(impact_request, Mapping):
@@ -1738,12 +2613,18 @@ def _execute(request, mode, options, result):
             else:
                 kwargs = {key: impact_data[key] for key in _IMPACT_KWARGS if key in impact_data}
                 # When the user did not pin an allowable, derive the safety
-                # factor from the assembly's primary material so derated (or
-                # plain) allowables actually reach the impact estimate
-                # instead of reporting not_available.
+                # factor from the SHELL's actual resolved material (the
+                # structural section's material, or the primary object's),
+                # so derated (or plain) allowables reach the impact estimate
+                # from the material the result reports — never from catalog
+                # insertion order.
+                impact_material = None
+                impact_material_label = None
                 if "allowable_pa" not in kwargs:
-                    primary = _first_material(catalog)
-                    properties = getattr(primary, "properties", None)
+                    impact_material, impact_material_label = _shell_material(
+                        request, catalog, materials_by_object
+                    )
+                    properties = getattr(impact_material, "properties", None)
                     if properties is not None:
                         allowable = getattr(properties, "tensile_allowable", None)
                         if allowable is not None:
@@ -1756,6 +2637,7 @@ def _execute(request, mode, options, result):
                     "result": estimate.to_dict(),
                     "reason": None,
                     "unsupported_failure_modes": unsupported,
+                    "material": impact_material_label,
                 }
         except Exception as exc:
             message = str(exc) or "impact evaluation failed"
@@ -1816,8 +2698,41 @@ def _execute(request, mode, options, result):
                 for index in range(3)
             ]
             inertia = None
+            inertia_source = "mass_model"
             if result["mass"] is not None:
                 inertia = result["mass"].get("inertia_tensor_kg_m2")
+            # Absolute measured-inertia override (validation mode: the real
+            # prototype's inertia tensor replaces the geometry-derived one).
+            inertia_override = drop_request.get("inertia_override_kg_m2")
+            if inertia_override is not None:
+                if (
+                    not isinstance(inertia_override, (list, tuple))
+                    or len(inertia_override) != 3
+                    or any(
+                        not isinstance(row, (list, tuple)) or len(row) != 3
+                        for row in inertia_override
+                    )
+                ):
+                    raise ValueError(
+                        "drop_simulation.inertia_override_kg_m2 must be a 3x3 matrix"
+                    )
+                inertia_override = [
+                    [float(value) for value in row] for row in inertia_override
+                ]
+                if not all(
+                    math.isfinite(value) for row in inertia_override for value in row
+                ):
+                    raise ValueError("drop_simulation.inertia_override_kg_m2 must be finite")
+                if any(
+                    abs(inertia_override[i][j] - inertia_override[j][i]) > 1e-9
+                    for i in range(3)
+                    for j in range(3)
+                ):
+                    raise ValueError(
+                        "drop_simulation.inertia_override_kg_m2 must be symmetric"
+                    )
+                inertia = inertia_override
+                inertia_source = "prototype_override"
             if inertia is None:
                 inertia = drop_module.box_inertia(mass_kg, bounds)
                 result["issues"].append(
@@ -1841,19 +2756,89 @@ def _execute(request, mode, options, result):
             stiffness = float(drop_request.get("contact_stiffness_n_per_m", 1e5))
             if not math.isfinite(stiffness) or stiffness <= 0.0:
                 raise ValueError("drop_simulation.contact_stiffness_n_per_m must be positive")
+            # Validation-mode contact/input pins (documented in the shell
+            # validation module): timestep, gravity, mass/inertia scales,
+            # restitution/friction scales, and an explicit CoM override.  All
+            # are optional; defaults match the integrator's documented values.
+            timestep_s = drop_request.get("timestep_s")
+            if timestep_s is not None:
+                timestep_s = float(timestep_s)
+                if not math.isfinite(timestep_s) or timestep_s <= 0.0 or timestep_s > 0.1:
+                    raise ValueError("drop_simulation.timestep_s must be in (0, 0.1] s")
+            gravity_m_s2 = drop_request.get("gravity_m_s2")
+            if gravity_m_s2 is not None:
+                gravity_m_s2 = float(gravity_m_s2)
+                if not math.isfinite(gravity_m_s2) or gravity_m_s2 <= 0.0:
+                    raise ValueError("drop_simulation.gravity_m_s2 must be positive")
+            mass_scale = drop_request.get("mass_scale")
+            if mass_scale is not None:
+                mass_scale = float(mass_scale)
+                if not math.isfinite(mass_scale) or mass_scale <= 0.0:
+                    raise ValueError("drop_simulation.mass_scale must be positive")
+            inertia_scale = drop_request.get("inertia_scale")
+            if inertia_scale is not None:
+                inertia_scale = float(inertia_scale)
+                if not math.isfinite(inertia_scale) or inertia_scale <= 0.0:
+                    raise ValueError("drop_simulation.inertia_scale must be positive")
+            restitution_scale = drop_request.get("restitution_scale")
+            if restitution_scale is not None:
+                restitution_scale = float(restitution_scale)
+                if not math.isfinite(restitution_scale) or restitution_scale <= 0.0:
+                    raise ValueError("drop_simulation.restitution_scale must be positive")
+            friction_scale = drop_request.get("friction_scale")
+            if friction_scale is not None:
+                friction_scale = float(friction_scale)
+                if not math.isfinite(friction_scale) or friction_scale <= 0.0:
+                    raise ValueError("drop_simulation.friction_scale must be positive")
             surface_restitution = drop_module.SURFACES[config["surface"]]["restitution"]
+            com_override = drop_request.get("com_override_m")
+            if com_override is not None:
+                if not isinstance(com_override, (list, tuple)) or len(com_override) != 3:
+                    raise ValueError("drop_simulation.com_override_m must be a 3-vector")
+                com_override = tuple(float(component) for component in com_override)
+                if not all(math.isfinite(component) for component in com_override):
+                    raise ValueError("drop_simulation.com_override_m must be finite")
+                # An off-body CoM makes the rigid-body integration numerically
+                # explosive (audit finding): bound the override to the body's
+                # own extent (0.75 x the bounding-box diagonal covers hollow
+                # shells whose CoM can sit near the surface).
+                diagonal = math.sqrt(
+                    sum((bounds[index][1] - bounds[index][0]) ** 2 for index in range(3))
+                )
+                magnitude = math.sqrt(sum(component * component for component in com_override))
+                if diagonal > 0.0 and magnitude > 0.75 * diagonal:
+                    raise ValueError(
+                        "drop_simulation.com_override_m magnitude {:.4f} m exceeds the "
+                        "geometry extent ({:.4f} m): the center of mass must lie "
+                        "within the shell".format(magnitude, 0.75 * diagonal)
+                    )
+                if magnitude > 1.0:
+                    raise ValueError(
+                        "drop_simulation.com_override_m magnitude {:.4f} m exceeds the "
+                        "absolute ceiling (1 m) for a hand-held shell".format(magnitude)
+                    )
+            com_override = drop_request.get("com_override_m")
+            if com_override is not None:
+                if not isinstance(com_override, (list, tuple)) or len(com_override) != 3:
+                    raise ValueError("drop_simulation.com_override_m must be a 3-vector")
+                com_override = tuple(float(component) for component in com_override)
+                if not all(math.isfinite(component) for component in com_override):
+                    raise ValueError("drop_simulation.com_override_m must be finite")
             # The sim resolves contact about the center of mass: the mass
             # model's world-frame CoM is the body-fixed offset from the
             # support-model anchor (support points are the world vertices).
-            com_offset_m = None
-            if result["mass"] is not None and result["mass"].get("center_of_mass_m") is not None:
+            # An explicit com_override_m (validation pinning) takes precedence.
+            com_offset_m = com_override
+            if com_offset_m is None and result["mass"] is not None and result["mass"].get("center_of_mass_m") is not None:
                 com_offset_m = tuple(result["mass"]["center_of_mass_m"])
             # Lifecycle degradation: prior usage (drops, impact energy, slide
             # distance, actuation) degrades the unit's restitution and
             # friction deterministically; the applied factors and damage
-            # metrics are disclosed in result["lifecycle"].
-            friction_scale = 1.0
-            restitution_scale = 1.0
+            # metrics are disclosed in result["lifecycle"].  Config-pinned
+            # restitution/friction scales (validation mode) multiply with
+            # the lifecycle degradation.
+            friction_scale = friction_scale if friction_scale is not None else 1.0
+            restitution_scale = restitution_scale if restitution_scale is not None else 1.0
             lifecycle_section = request.get("lifecycle")
             if lifecycle_section is not None:
                 from . import lifecycle as lifecycle_module
@@ -1863,8 +2848,8 @@ def _execute(request, mode, options, result):
                 rest_scale, fric_scale, damage, diagnostics = lifecycle_module.degradation_factors(
                     lifecycle_section
                 )
-                restitution_scale = rest_scale
-                friction_scale = fric_scale
+                restitution_scale = restitution_scale * rest_scale
+                friction_scale = friction_scale * fric_scale
                 if damage["fatigue_index"] > 0.0 or damage["actuation_exceeded"]:
                     result["issues"].append(
                         _issue(
@@ -1883,6 +2868,7 @@ def _execute(request, mode, options, result):
                         "prior_impact_energy_j": _lifecycle_float(
                             lifecycle_section.get("prior_impact_energy_j")
                         ),
+                        "prior_drop_energies_j": lifecycle_section.get("prior_drop_energies_j"),
                         "actuation_cycles": _lifecycle_int(
                             lifecycle_section.get("actuation_cycles")
                         ),
@@ -1898,7 +2884,26 @@ def _execute(request, mode, options, result):
                     },
                     "applied_to": ["drop_simulation"],
                     "diagnostics": diagnostics,
+                    # CERT-04 follow-up: the fatigue S-N law is a class-level
+                    # screening assumption, NOT a validated material curve —
+                    # the limitation must be visible in the run payload, not
+                    # only in module docstrings/HANDOFF.
+                    "fatigue_model": {
+                        "law": "N(E) = 1e6 * (0.5 J / E)^2.5 (Miner linear accumulation)",
+                        "basis": "class-level screening values (typical polymer "
+                        "S-N slope), NOT a validated material fatigue curve",
+                        "limitation": "fatigue results are screening estimates, "
+                        "not fatigue predictions; do not use for life "
+                        "certification without material-specific calibration",
+                    },
                 }
+            # An explicit pose (validation pinning / physical-test replay)
+            # travels as a quaternion dict to the simulator; a mode string
+            # passes through unchanged.
+            orientation_arg = config["orientation"]
+            explicit_quaternion = config.get("orientation_quaternion_wxyz")
+            if explicit_quaternion is not None:
+                orientation_arg = {"quaternion_wxyz": list(explicit_quaternion)}
             simulation = drop_module.simulate(
                 mass_kg,
                 inertia,
@@ -1907,35 +2912,53 @@ def _execute(request, mode, options, result):
                 surface=config["surface"],
                 drop_count=config["drop_count"],
                 test=config["test"],
-                orientation=config["orientation"],
+                orientation=orientation_arg,
                 spin_rps=config["spin_rps"],
                 seed=config.get("seed", 0),
                 unit_seed=config.get("unit_seed"),
                 com_offset_m=com_offset_m,
                 friction_scale=friction_scale,
                 restitution_scale=restitution_scale,
+                gravity=gravity_m_s2 if gravity_m_s2 is not None else drop_module.GRAVITY_M_S2,
+                dt=timestep_s if timestep_s is not None else drop_module.DT_S,
+                mass_scale=mass_scale if mass_scale is not None else 1.0,
+                inertia_scale=inertia_scale if inertia_scale is not None else 1.0,
             )
             if lifecycle_section is not None:
                 from . import lifecycle as lifecycle_module
 
                 total_energy = 0.0
+                per_drop_energies = []
                 for drop in simulation["drops"]:
                     drop_energy = drop.get("energy") or {}
-                    total_energy += float(drop_energy.get("release_j") or 0.0)
+                    release = float(drop_energy.get("release_j") or 0.0)
+                    total_energy += release
+                    per_drop_energies.append(release)
                 result["lifecycle"]["next_usage"] = lifecycle_module.next_usage(
                     lifecycle_section,
                     config["drop_count"],
                     total_energy,
+                    drop_energies_j=per_drop_energies,
                 )
             peak = simulation["peak"]
             peak_force = None
+            estimate_inputs = None
             if peak is not None:
                 # Energy-honest handoff: the contact-point speed can exceed
                 # free fall via legitimate lever amplification, but the impact
                 # energy fed to the estimate must never exceed the drop's
                 # energy budget (m*g*h plus any tumble spin budget).
+                model_used = simulation["model"]
+                # The estimate must use the SAME body the integrator solved:
+                # the effective mass (incl. unit variation and lifecycle
+                # scales) and the degraded/unit restitution — NOT the base
+                # pre-variation values (audit finding: the estimate used the
+                # base mass/restitution, inflating the force ~1.3%).
+                effective_mass = float(model_used.get("mass_kg") or mass_kg)
+                effective_restitution = float(model_used.get("restitution") or surface_restitution)
+                effective_gravity = float(model_used.get("gravity_m_s2") or drop_module.GRAVITY_M_S2)
                 raw_energy = peak.get("raw_kinetic_energy_j") or peak["kinetic_energy_j"]
-                budget = mass_kg * drop_module.GRAVITY_M_S2 * config["height_m"]
+                budget = effective_mass * effective_gravity * config["height_m"]
                 if config["test"] == "tumble" and config["spin_rps"]:
                     spin_inertia = inertia[1][1]
                     budget += 0.5 * spin_inertia * (2.0 * math.pi * config["spin_rps"]) ** 2
@@ -1950,22 +2973,34 @@ def _execute(request, mode, options, result):
                             "(lever-amplified contact speed exceeds the release energy)",
                         )
                     )
-                effective_speed = math.sqrt(max(0.0, 2.0 * capped_energy / mass_kg))
+                effective_speed = math.sqrt(max(0.0, 2.0 * capped_energy / effective_mass))
                 estimate = impact.estimate_impact(
-                    mass_kg,
+                    effective_mass,
                     velocity_m_s=effective_speed,
-                    restitution=surface_restitution,
+                    restitution=effective_restitution,
                     contact_stiffness_n_per_m=stiffness,
                 )
                 peak_force = estimate.to_dict().get("peak_force_n")
+                estimate_inputs = {
+                    "mass_kg": round(effective_mass, 6),
+                    "restitution": round(effective_restitution, 6),
+                    "energy_j": round(capped_energy, 6),
+                    "impact_speed_m_s": round(effective_speed, 6),
+                    "contact_stiffness_n_per_m": stiffness,
+                    "model": "linear-spring quasi-static estimate (drop-derived, "
+                    "effective mass and degraded restitution)",
+                }
             result["drop_simulation"] = {
                 "config": simulation["config"],
+                "inertia_source": inertia_source,
                 "model": simulation["model"],
                 "drops": simulation["drops"],
                 "impacts": simulation["impacts"],
                 "checks": simulation["checks"],
                 "peak": simulation["peak"],
                 "peak_force_estimate_n": peak_force,
+                "peak_force_estimate": estimate_inputs,
+                "contact_stiffness_n_per_m": stiffness,
                 "trajectory": simulation["trajectory"],
             }
             # Wire drop evidence into the impact section so the qualification
@@ -1974,17 +3009,34 @@ def _execute(request, mode, options, result):
             impact_missing = impact_section is None or impact_section.get("result") is None
             if impact_missing and peak is not None:
                 estimate = impact.estimate_impact(
-                    mass_kg,
+                    effective_mass,
                     velocity_m_s=effective_speed,
-                    restitution=surface_restitution,
+                    restitution=effective_restitution,
                     contact_stiffness_n_per_m=stiffness,
                 )
                 result["impact"] = {
-                    "mass_kg": mass_kg,
+                    "mass_kg": effective_mass,
                     "result": estimate.to_dict(),
                     "reason": None,
                     "unsupported_failure_modes": list(impact.IMPACT_UNSUPPORTED_FAILURE_MODES),
                     "source": "drop_simulation",
+                    "material": impact_material_label,
+                }
+            elif impact_section is not None and peak_force is not None:
+                # A user-supplied impact section is a SEPARATE standalone
+                # quasi-static model (g=9.80665, restitution defaults to 0
+                # there); cross-reference the drop-derived integrator value so
+                # the two peak forces in one document cannot be confused.
+                impact_section["cross_reference"] = {
+                    "drop_derived_peak_force_estimate_n": round(peak_force, 4),
+                    "drop_derived_energy_j": round(
+                        estimate_inputs["energy_j"], 6
+                    ) if estimate_inputs else None,
+                    "note": (
+                        "the impact section is a standalone quasi-static energy "
+                        "model; the drop simulation's integrator-based estimate "
+                        "is the shell loading reference"
+                    ),
                 }
             # Measured-drop correlation: for every user-supplied measured drop,
             # re-run the simulator under the same condition and compare the
@@ -2004,6 +3056,24 @@ def _execute(request, mode, options, result):
                     surface_restitution,
                     stiffness,
                     result,
+                    drop_overrides={
+                        "gravity_m_s2": gravity_m_s2 if gravity_m_s2 is not None else drop_module.GRAVITY_M_S2,
+                        "restitution_scale": restitution_scale,
+                        "friction_scale": friction_scale,
+                        "mass_scale": mass_scale if mass_scale is not None else 1.0,
+                        "inertia_scale": inertia_scale if inertia_scale is not None else 1.0,
+                        "com_override_m": com_override,
+                        "timestep_s": timestep_s if timestep_s is not None else None,
+                        "seed": config.get("seed", 0),
+                        "unit_seed": config.get("unit_seed"),
+                        # Equivalence and prototype identity are properties of
+                        # the MEASUREMENT DEFINITION, not the mode: they are
+                        # enforced in every mode (audit follow-up: exploration
+                        # mode previously bypassed the gate entirely).  Raw
+                        # correlation drops without a sensor definition are
+                        # NOT equivalent (fail-closed).
+                        "enforce_equivalence": True,
+                    },
                 )
         except Exception as exc:
             message = str(exc) or "drop simulation failed"
@@ -2035,7 +3105,14 @@ def _execute(request, mode, options, result):
     # secondary component screening below.  Component verdicts never feed
     # back into this section, so arbitrary component thresholds cannot
     # contaminate the shell result.
-    _assemble_shell_result(request, result)
+    _assemble_shell_result(request, result, validation_run)
+
+    # Validation-mode extras: contact-stiffness sweep, parameter sensitivity,
+    # uncertainty bands, and the measured-vs-simulated comparison.  These are
+    # preparation artifacts for physical testing — they never modify the
+    # physics and never run outside validation mode.
+    if validation_run is not None:
+        _attach_validation_extras(request, result, validation_run)
 
     # SECONDARY COMPONENT SCREENING — simplified observations with honest
     # low confidence.  Never combined into the shell verdict.
@@ -2061,43 +3138,83 @@ def _execute(request, mode, options, result):
             qual_load_case = None
     else:
         qual_load_case = None
-    try:
-        qualification_result = qualification.evaluate_qualification(
-            mode=mode,
-            method=request.get("method"),
-            geometry=request.get("geometry"),
-            materials=list(materials_by_object.values()) if materials_by_object else None,
-            load_case=qual_load_case,
-            fixtures=request.get("fixtures"),
-            tolerance_profile=request.get("tolerance_profile"),
-            correlation_records=request.get("correlation_records"),
-            requirement=request.get("requirement"),
-            validation_report=result["validation"],
-            solver=physics.SOLVER_CAPABILITIES,
-            convergence_evidence=bool(request.get("convergence_evidence", False)),
-            force_balance=bool(request.get("force_balance", False)),
-            reviewed_flags=request.get("reviewed_flags"),
-            structural_response=structural_response.to_dict() if structural_response is not None else None,
-            impact=result["impact"],
-            requirements=result["requirements"],
-            pipeline_result=result,
-        )
-        result["qualification"] = qualification_result.to_dict()
-    except Exception as exc:
-        message = str(exc) or "qualification evaluation failed"
-        result["issues"].append(
-            _issue("QUALIFICATION_EVALUATION_FAILED", "error", "qualification", message, evidence_blocking=True)
-        )
-        result["errors"].append({"code": "QUALIFICATION_EVALUATION_FAILED", "message": message})
+    # The qualification gates run in exploration and qualification modes
+    # (exploration reports the never-qualifies disposition); validation mode
+    # is a shell-focused preparation run and must not produce a
+    # qualification verdict.
+    if mode in ("exploration", "qualification"):
+        try:
+            qualification_result = qualification.evaluate_qualification(
+                mode=mode,
+                method=request.get("method"),
+                geometry=request.get("geometry"),
+                materials=list(materials_by_object.values()) if materials_by_object else None,
+                load_case=qual_load_case,
+                fixtures=request.get("fixtures"),
+                tolerance_profile=request.get("tolerance_profile"),
+                correlation_records=request.get("correlation_records"),
+                requirement=request.get("requirement"),
+                validation_report=result["validation"],
+                solver=physics.SOLVER_CAPABILITIES,
+                convergence_evidence=bool(request.get("convergence_evidence", False)),
+                force_balance=bool(request.get("force_balance", False)),
+                reviewed_flags=request.get("reviewed_flags"),
+                structural_response=structural_response.to_dict() if structural_response is not None else None,
+                impact=result["impact"],
+                requirements=result["requirements"],
+                pipeline_result=result,
+            )
+            result["qualification"] = qualification_result.to_dict()
+        except Exception as exc:
+            message = str(exc) or "qualification evaluation failed"
+            result["issues"].append(
+                _issue("QUALIFICATION_EVALUATION_FAILED", "error", "qualification", message, evidence_blocking=True)
+            )
+            result["errors"].append({"code": "QUALIFICATION_EVALUATION_FAILED", "message": message})
 
     result["validity"] = _validity(result)
 
 
 def _collect_inputs(request):
-    """Canonical snapshot of every input dict, keyed by request key."""
+    """Canonical snapshot of every input dict, keyed by request key.
+
+    Materials passed as a FILE PATH are substituted with the file CONTENT
+    hash (audit finding: hashing the path string let a changed catalog file
+    serve stale cached results under the same run_id).
+    """
     inputs = {}
     for key in sorted(request.keys()):
-        inputs[str(key)] = canonical_value(request[key])
+        value = request[key]
+        if key == "materials" and isinstance(value, (str, os.PathLike)):
+            try:
+                with open(value, "rb") as stream:
+                    content_sha256 = sha256_bytes(stream.read())
+                inputs[str(key)] = {"path": str(value), "content_sha256": content_sha256}
+            except OSError:
+                inputs[str(key)] = {"path": str(value), "content_sha256": None}
+            continue
+        if key == "materials" and isinstance(value, Mapping):
+            # Audit finding (W2-10D): canonical hashing sorts dict keys while
+            # the catalog resolver is insertion-order sensitive for
+            # normalized-equal keys - two orders resolved DIFFERENT materials
+            # under the SAME run_id (cache poisoning).  Bind the ORDER by
+            # hashing the mapping as an ordered [key, definition] list.
+            # W2-10F follow-up: the WRAPPER root {"materials": {catalog}}
+            # collapsed to a single ["materials", sorted-catalog] pair; the
+            # inner catalog's order must be bound too.
+            catalog = value
+            if (
+                len(value) == 1
+                and "materials" in value
+                and isinstance(value.get("materials"), Mapping)
+            ):
+                catalog = value["materials"]
+            ordered_pairs = []
+            for catalog_key, definition in catalog.items():
+                ordered_pairs.append([str(catalog_key), canonical_value(definition)])
+            inputs[str(key)] = {"ordered_catalog": ordered_pairs}
+            continue
+        inputs[str(key)] = canonical_value(value)
     return inputs
 
 
@@ -2117,10 +3234,12 @@ def _run_id_for(mode, input_hashes, options):
     )
 
 
-def _build_manifest(mode, inputs, input_hashes):
+def _build_manifest(mode, inputs, input_hashes, run_id=None):
     return {
         "schema_id": MANIFEST_SCHEMA_ID,
         "engine_version": ENGINE_VERSION,
+        "engine_hash": _engine_hash(),
+        "run_id": run_id,
         "mode": mode,
         "inputs": inputs,
         "input_hashes": input_hashes,
@@ -2143,10 +3262,38 @@ def _cached_matches(cached, mode, inputs, input_hashes, run_id):
     manifest = cached.get("manifest")
     if not isinstance(manifest, dict):
         return False
+    # W4-01 follow-up: a cached payload written by a DIFFERENT engine build
+    # whose manifest was re-signed consistently was served (attack 4b — the
+    # engine_hash was never cross-checked at hit time, only at store time via
+    # the run_id key).  The manifest must bind the CURRENT engine hash and
+    # its own recorded manifest_hash must be self-consistent, mirroring
+    # reproduce_from_manifest.
+    if manifest.get("engine_hash") != _engine_hash():
+        return False
     cached_hashes = manifest.get("input_hashes")
     if not isinstance(cached_hashes, dict) or cached_hashes != input_hashes:
         return False
-    return manifest.get("manifest_hash") is not None
+    # W12-01 follow-up: a cache-writer who re-signed the manifest could tamper
+    # the INPUTS SNAPSHOT (e.g. height 1.0 -> 0.5) while keeping the recorded
+    # input_hashes/run_id/engine_hash genuine — the hit was then served with a
+    # body computed for different physics.  The inputs snapshot must re-derive
+    # to the recorded input_hashes (which are bound to the current request).
+    if not isinstance(manifest.get("inputs"), dict):
+        return False
+    try:
+        if _input_hashes(manifest["inputs"]) != cached_hashes:
+            return False
+    except Exception:
+        return False
+    if not isinstance(manifest.get("manifest_hash"), str) or not manifest.get("manifest_hash"):
+        return False
+    try:
+        presented = {key: value for key, value in manifest.items() if key != "manifest_hash"}
+        if canonical.manifest_hash(presented) != manifest.get("manifest_hash"):
+            return False
+    except Exception:
+        return False
+    return True
 
 
 def run_pipeline(request: dict, cache: Optional[ArtifactCache] = None, use_cache: bool = True) -> dict:
@@ -2163,6 +3310,14 @@ def run_pipeline(request: dict, cache: Optional[ArtifactCache] = None, use_cache
         result["run_id"] = _run_id_for(mode, {}, {})
         _pipeline_error(result, "INVALID_REQUEST", "request must be an object")
         result["lifecycle_state"] = "failed"
+        # SENIOR-04: same fail-closed validity as the hard-failure handler.
+        result["validity"] = {
+            "state": "failed",
+            "reasons": ["request must be an object"],
+            "assumptions": [],
+            "unsupported_failure_modes": [],
+            "confidence": "low",
+        }
         return result
     request = dict(request or {})
     mode = _normalize_mode(request.get("mode", "exploration"))
@@ -2170,7 +3325,114 @@ def run_pipeline(request: dict, cache: Optional[ArtifactCache] = None, use_cache
     options = dict(options) if isinstance(options, Mapping) else {}
     debug = bool(options.get("debug", False))
     result = _new_result(mode)
+    # Validation-mode inputs are classified by the validation layer BEFORE
+    # canonical input hashing runs: a NaN/Inf in a validation field must
+    # surface as VALIDATION_CONFIG_INVALID (a user-input error), not as the
+    # generic PIPELINE_INTERNAL that canonical serialization reports.
+    if mode != "validation" and request.get("validation") is not None:
+        # Audit finding (W5-01): a validation section in a non-validation run
+        # was silently ignored.  Disclose it.
+        result["issues"].append(
+            _issue(
+                "VALIDATION_SECTION_IGNORED",
+                "warning",
+                "validation",
+                "a validation section is present but mode is not 'validation'; "
+                "the section is ignored by this run",
+            )
+        )
+    if mode == "validation" and request.get("validation") is not None:
+        try:
+            from . import shell_validation as validation_module
+            from .errors import ValidationError as _ValidationError
+
+            validation_module.apply_validation_config(request)
+        except _ValidationError as exc:
+            message = str(exc)
+            result["issues"].append(
+                _issue(
+                    "VALIDATION_CONFIG_INVALID",
+                    "error",
+                    "validation",
+                    message,
+                    evidence_blocking=True,
+                )
+            )
+            result["errors"].append({"code": "VALIDATION_CONFIG_INVALID", "message": message})
+            result["lifecycle_state"] = "failed"
+            result["validity"] = {
+                "state": "failed",
+                "reasons": [message],
+                "assumptions": [],
+                "unsupported_failure_modes": [],
+                "confidence": "low",
+            }
+            return result
     try:
+        # W2-05 follow-up: raw correlation.measured_drops with NaN/Inf would
+        # crash canonical input hashing (PIPELINE_INTERNAL) BEFORE _execute
+        # runs; reject only the non-finite entries here (fail-closed
+        # correlation issue).  Finite-but-implausible values and unknown
+        # keys are handled per-condition inside _run_correlation_section,
+        # where they fail the verdict honestly.
+        raw_correlation = request.get("correlation")
+        if (
+            mode != "validation"
+            and isinstance(raw_correlation, Mapping)
+            and isinstance(raw_correlation.get("measured_drops"), (list, tuple))
+        ):
+            non_finite = False
+            for raw_drop in raw_correlation.get("measured_drops"):
+                if not isinstance(raw_drop, Mapping):
+                    continue
+                for key in (
+                    "measured_peak_accel_g",
+                    "measured_impact_duration_s",
+                    "measured_settle_s",
+                    "measured_settle_time_s",
+                ):
+                    value = raw_drop.get(key)
+                    if value is None:
+                        continue
+                    try:
+                        finite = math.isfinite(float(value))
+                    except (TypeError, ValueError):
+                        finite = False
+                    if not finite:
+                        non_finite = True
+                        break
+            if non_finite:
+                # W8-02 follow-up: popping the correlation section before
+                # hashing let the run COMPLETE under the correlation-less
+                # request's run_id — a NaN request then collided with a
+                # legitimately correlation-less request and the cache served
+                # a payload with the submitted correlation evidence silently
+                # dropped.  Fail closed: the request never enters the
+                # hashing/cache closure.
+                message = (
+                    "correlation evaluation failed: raw measured_drops "
+                    "contain a non-finite measured value; the request cannot "
+                    "be certified or cached"
+                )
+                result["issues"].append(
+                    _issue(
+                        "CORRELATION_EVALUATION_FAILED",
+                        "error",
+                        "correlation",
+                        message,
+                        evidence_blocking=True,
+                    )
+                )
+                result["errors"].append({"code": "CORRELATION_EVALUATION_FAILED", "message": message})
+                result["lifecycle_state"] = "failed"
+                result["validity"] = {
+                    "state": "failed",
+                    "reasons": [message],
+                    "assumptions": [],
+                    "unsupported_failure_modes": [],
+                    "confidence": "low",
+                }
+                return result
         inputs = _collect_inputs(request)
         input_hashes = _input_hashes(inputs)
         run_id = _run_id_for(mode, input_hashes, options)
@@ -2180,13 +3442,55 @@ def run_pipeline(request: dict, cache: Optional[ArtifactCache] = None, use_cache
             if cached is not None and _cached_matches(cached, mode, inputs, input_hashes, run_id):
                 return cached
         _execute(request, mode, options, result)
-        manifest = _build_manifest(mode, inputs, input_hashes)
+        # The structural section carries the RESOLVED material definition for
+        # the probe; serialize it for the result payload (traceability: the
+        # exact material used, incl. catalog-miss and object-resolution).
+        structural = result.get("structural")
+        if isinstance(structural, dict) and structural.get("resolved_material") is not None:
+            try:
+                structural["resolved_material"] = structural["resolved_material"].to_dict()
+            except Exception:
+                structural["resolved_material"] = None
+        manifest = _build_manifest(mode, inputs, input_hashes, run_id=run_id)
         manifest["manifest_hash"] = canonical.manifest_hash(manifest)
         result["manifest"] = manifest
         result["lifecycle_state"] = "failed" if result["errors"] else "completed"
         if use_cache and cache is not None and not result["errors"]:
             try:
-                cache.store(run_id, result)
+                # Audit finding (W2-10E): the materials file is read twice
+                # (hashed in _collect_inputs, re-read by load_material_catalog);
+                # a change between the reads would store content-B results
+                # under content-A's key and poison later A-runs.  Verify the
+                # file still matches the keyed hash before storing; on
+                # mismatch, skip the store and warn.
+                materials_ok = True
+                raw_materials = request.get("materials")
+                if isinstance(raw_materials, (str, os.PathLike)):
+                    try:
+                        with open(raw_materials, "rb") as stream:
+                            current_hash = sha256_bytes(stream.read())
+                        keyed_hash = None
+                        for entry in inputs.values():
+                            if isinstance(entry, dict) and entry.get("path") == str(raw_materials):
+                                keyed_hash = entry.get("content_sha256")
+                                break
+                        if keyed_hash is not None and current_hash != keyed_hash:
+                            materials_ok = False
+                            result["issues"].append(
+                                _issue(
+                                    "MATERIALS_CONTENT_CHANGED_DURING_RUN",
+                                    "warning",
+                                    "materials",
+                                    "the materials catalog file changed while the "
+                                    "run was executing; the result is NOT cached "
+                                    "(it would poison the cache under the wrong "
+                                    "content key)",
+                                )
+                            )
+                    except OSError:
+                        materials_ok = False
+                if materials_ok:
+                    cache.store(run_id, result)
             except (OSError, ValueError, TypeError):
                 pass
         return result
@@ -2196,6 +3500,16 @@ def run_pipeline(request: dict, cache: Optional[ArtifactCache] = None, use_cache
             error["traceback"] = traceback.format_exc()
         result["errors"].append(error)
         result["lifecycle_state"] = "failed"
+        # SENIOR-04: a hard failure previously left validity.state at the
+        # default "valid" (the crash happened before _validity ran).  A
+        # failed run must never present a valid-looking state.
+        result["validity"] = {
+            "state": "failed",
+            "reasons": [str(exc)],
+            "assumptions": [],
+            "unsupported_failure_modes": [],
+            "confidence": "low",
+        }
         return result
 
 
@@ -2211,11 +3525,83 @@ def reproduce_from_manifest(manifest) -> dict:
     inputs = manifest.get("inputs")
     if not isinstance(inputs, Mapping):
         return {"supported": False, "reason": "manifest has no replayable inputs snapshot"}
+    # Audit finding (W2-11B): fields added to the manifest AFTER manifest_hash
+    # was computed are outside the certification closure.  Re-verify the
+    # PRESENTED document's own hash before replaying.
+    try:
+        presented = {key: value for key, value in manifest.items() if key != "manifest_hash"}
+        if canonical.manifest_hash(presented) != manifest.get("manifest_hash"):
+            return {
+                "supported": False,
+                "reason": "the manifest document does not match its recorded manifest_hash",
+            }
+    except Exception:
+        return {"supported": False, "reason": "the manifest document is not self-consistent"}
+    # Audit finding: the manifest previously bound inputs only, so a physics
+    # change (engine hash drift) was certified "supported" with silently
+    # different physics.  Engine identity and run_id must match.
+    if manifest.get("engine_hash") != _engine_hash():
+        return {
+            "supported": False,
+            "reason": "engine source hash differs from the manifest's recorded "
+            "engine hash: the recorded physics cannot be reproduced by the "
+            "current engine",
+        }
     request = {key: canonical_value(value) for key, value in inputs.items()}
+    # W2-10G follow-up: dict-form catalogs are snapshotted as an ordered
+    # [key, definition] list; rebuild the DICT (preserving order) so the
+    # replay executes the same catalog resolution instead of failing.
+    raw_materials = request.get("materials")
+    if (
+        isinstance(raw_materials, dict)
+        and set(raw_materials.keys()) == {"ordered_catalog"}
+        and isinstance(raw_materials.get("ordered_catalog"), (list, tuple))
+    ):
+        rebuilt = {}
+        for pair in raw_materials["ordered_catalog"]:
+            if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                rebuilt[str(pair[0])] = canonical_value(pair[1])
+        request["materials"] = rebuilt
+    # Audit finding (W1-09/W2-10E): path-form materials were snapshotted as
+    # {path, content_sha256} but the content was never embedded - replay fed
+    # the dict back, failed, and was still certified supported.  Re-resolve
+    # the recorded path, verify the recorded sha, and replay with the path.
+    raw_materials = request.get("materials")
+    if isinstance(raw_materials, dict) and "path" in raw_materials and "content_sha256" in raw_materials:
+        recorded_path = raw_materials["path"]
+        recorded_sha = raw_materials["content_sha256"]
+        try:
+            with open(recorded_path, "rb") as stream:
+                current_sha = sha256_bytes(stream.read())
+        except OSError:
+            return {
+                "supported": False,
+                "reason": "the manifest references a materials catalog file that "
+                "cannot be read; its content was not embedded",
+            }
+        if recorded_sha != current_sha:
+            return {
+                "supported": False,
+                "reason": "the materials catalog file content differs from the "
+                "manifest's recorded content hash; the recorded physics cannot "
+                "be reproduced",
+            }
+        request["materials"] = recorded_path
     result = run_pipeline(request)
     replay_manifest = result.get("manifest") or {}
     if replay_manifest.get("manifest_hash") != manifest.get("manifest_hash"):
         return {"supported": False, "reason": "replay produced a different manifest hash"}
+    if result.get("run_id") != manifest.get("run_id"):
+        return {
+            "supported": False,
+            "reason": "replay produced a different run_id than the manifest records",
+        }
+    if result.get("lifecycle_state") != "completed":
+        return {
+            "supported": False,
+            "reason": "the replay did not complete (lifecycle {}); the recorded "
+            "physics was not reproduced".format(result.get("lifecycle_state")),
+        }
     return {
         "supported": True,
         "run_id": result.get("run_id"),

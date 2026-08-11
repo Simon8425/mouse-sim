@@ -138,8 +138,8 @@ describe('ModelTree', () => {
     const { rerender } = render(
       <TreeFixture
         actions={[
-          { type: 'ANALYZE_START', version: 1 },
-          { type: 'ANALYZE_OK', version: 1, result: mockResult },
+          { type: 'ANALYZE_START', version: 1, requestKey: 'k1' },
+          { type: 'ANALYZE_OK', version: 1, requestKey: 'k1', result: mockResult },
         ]}
       />,
     );
@@ -153,8 +153,8 @@ describe('ModelTree', () => {
     rerender(
       <TreeFixture
         actions={[
-          { type: 'ANALYZE_START', version: 1 },
-          { type: 'ANALYZE_OK', version: 1, result: mockResult },
+          { type: 'ANALYZE_START', version: 1, requestKey: 'k1' },
+          { type: 'ANALYZE_OK', version: 1, requestKey: 'k1', result: mockResult },
           { type: 'SELECT', id: 'battery_pack' },
         ]}
       />,
@@ -167,13 +167,14 @@ describe('ModelTree', () => {
     });
   });
 
-  it('shows the default-material banner and chips, dropping the count when a material is assigned', async () => {
+  it('keeps material controls aligned without competing DEFAULT chips', async () => {
     const { rerender } = render(<TreeFixture />);
 
-    expect(
-      await screen.findByText('2 component(s) using Default Material'),
-    ).toBeInTheDocument();
-    expect(screen.getAllByText('DEFAULT')).toHaveLength(2);
+    await waitFor(() => {
+      expect(screen.queryByText('DEFAULT')).not.toBeInTheDocument();
+      expect(screen.getByRole('treeitem', { name: /shell_top/i })).toBeInTheDocument();
+      expect(screen.getByRole('treeitem', { name: /battery_pack/i })).toBeInTheDocument();
+    });
 
     rerender(
       <TreeFixture
@@ -183,9 +184,9 @@ describe('ModelTree', () => {
       />,
     );
 
-    expect(
-      await screen.findByText('1 component(s) using Default Material'),
-    ).toBeInTheDocument();
-    expect(screen.getAllByText('DEFAULT')).toHaveLength(1);
+    await waitFor(() => {
+      expect(screen.queryByText('DEFAULT')).not.toBeInTheDocument();
+      expect(screen.getByRole('treeitem', { name: /shell_top/i })).toBeInTheDocument();
+    });
   });
 });
