@@ -77,6 +77,31 @@ def canonical_bytes(value, exclude_top_level=()):
     return canonical_json(value, exclude_top_level).encode("utf-8")
 
 
+def canonical_bytes_preserialized(value):
+    """Canonical bytes of an ALREADY-canonical (plain JSON-compatible) value.
+
+    ``canonical_bytes`` re-normalizes its input through ``canonical_value``
+    (``_plain``), which is pure overhead when the caller already holds the
+    canonical form (e.g. the pipeline's ``inputs`` snapshot produced by
+    ``_collect_inputs``).  The output is byte-identical to
+    ``canonical_bytes(value)`` for canonical input: both serialize with
+    ``sort_keys``, compact separators, ``ensure_ascii=False`` and
+    ``allow_nan=False``.  Non-plain input (dataclasses, enums, non-finite
+    floats) raises the same :class:`CanonicalizationError` as the standard
+    path — this helper is a fast path, never a silent behavior change.
+    """
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise CanonicalizationError(str(exc))
+
+
 def sha256_bytes(data):
     if not isinstance(data, (bytes, bytearray, memoryview)):
         raise TypeError("sha256_bytes expects bytes")

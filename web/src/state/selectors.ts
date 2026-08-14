@@ -73,6 +73,10 @@ export function selectFindingsFor(state: ProjectState, id: string | null): Valid
   });
 }
 
+export function selectObjectFindingCodes(state: ProjectState, id: string | null): Set<string> {
+  return new Set(selectFindingsFor(state, id).map((f) => f.code));
+}
+
 export function selectWarningsCount(state: ProjectState, id: string | null): number {
   const findings = selectFindingsFor(state, id);
   return findings.filter(

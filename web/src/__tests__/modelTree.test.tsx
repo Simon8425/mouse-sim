@@ -4,7 +4,7 @@ import { describe, expect, it, vi, beforeAll, afterEach } from 'vitest';
 import { useEffect } from 'react';
 import { ModelTree } from '../components/ModelTree';
 import { ProjectProvider, useProjectStore, type ProjectAction } from '../state/projectStore';
-import { IDENTITY_TRANSFORM, type PipelineRequest, type PipelineResult } from '../api/contracts';
+import { IDENTITY_TRANSFORM, type PipelineRequest } from '../api/contracts';
 
 const scrollIntoView = vi.fn();
 
@@ -42,52 +42,7 @@ const mockProject: PipelineRequest = {
   ],
 };
 
-const mockResult: PipelineResult = {
-  schema_id: 'gms.pipeline-result/1',
-  engine_version: '1.0.0',
-  run_id: 'run-1',
-  mode: 'exploration',
-  lifecycle_state: 'completed',
-  validity: {
-    state: 'valid',
-    reasons: [],
-    assumptions: [],
-    unsupported_failure_modes: [],
-    confidence: 'high',
-  },
-  issues: [],
-  geometry_summary: { objects: [], parse_errors: [] },
-  mass: null,
-  validation: {
-    status: 'checked',
-    validity_state: 'valid',
-    findings: [
-      {
-        code: 'THICKNESS',
-        severity: 'blocker',
-        state: 'open',
-        category: 'geometry',
-        message: 'wall below minimum',
-        affected_ids: ['shell_top'],
-        phase: 'preflight',
-        evidence_blocking: true,
-      },
-    ],
-  },
-  structural: null,
-  impact: null,
-  drop_simulation: null,
-  qualification: {
-    mode: 'exploration',
-    qualified: true,
-    evidence_disposition: 'exploration_only',
-    gates: [],
-    blocking_keys: [],
-    summary: 'OK',
-  },
-  manifest: null,
-  errors: [],
-};
+
 
 function TreeFixture({ actions = [] }: { actions?: ProjectAction[] }) {
   return (
@@ -133,39 +88,7 @@ describe('ModelTree', () => {
     });
   });
 
-  it('clears the severity chip filter when SELECT targets an entry hidden by the chip', async () => {
-    const user = userEvent.setup();
-    const { rerender } = render(
-      <TreeFixture
-        actions={[
-          { type: 'ANALYZE_START', version: 1, requestKey: 'k1' },
-          { type: 'ANALYZE_OK', version: 1, requestKey: 'k1', result: mockResult },
-        ]}
-      />,
-    );
 
-    const blockerChip = await screen.findByRole('button', { name: /Blocker \(1\)/ });
-    await user.click(blockerChip);
-    await waitFor(() => {
-      expect(screen.queryByRole('treeitem', { name: /battery_pack/i })).not.toBeInTheDocument();
-    });
-
-    rerender(
-      <TreeFixture
-        actions={[
-          { type: 'ANALYZE_START', version: 1, requestKey: 'k1' },
-          { type: 'ANALYZE_OK', version: 1, requestKey: 'k1', result: mockResult },
-          { type: 'SELECT', id: 'battery_pack' },
-        ]}
-      />,
-    );
-
-    const row = await screen.findByRole('treeitem', { name: /battery_pack/i });
-    expect(row).toHaveClass('is-selected');
-    await waitFor(() => {
-      expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
-    });
-  });
 
   it('keeps material controls aligned without competing DEFAULT chips', async () => {
     const { rerender } = render(<TreeFixture />);

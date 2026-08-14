@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(curl -s http://localhost:8000/api/health)",
+      "Shell(lsof:*)",
+      "Shell(ls -la /Users/macbook/Downloads/mousetesting/scripts/ 2>/dev/null; echo \"---\"; git status --short | head -30)"
+    ],
+    "deny": [],
+    "defaultMode": "default"
+  }
+}

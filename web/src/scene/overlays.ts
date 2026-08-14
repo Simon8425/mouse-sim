@@ -5,7 +5,7 @@ import { SELECTION_ACCENT, WARNING_ACCENT, BLOCKER_ACCENT } from './materialPale
 export interface OverlaySpec {
   loadVector: { origin: Vec3; direction: Vec3 } | null;
   fixtures: { name: string; location: Vec3 }[] | null;
-  stressBadge: { location: Vec3 } | null;
+  stressBadge: { location: Vec3; label?: string; color?: number } | null;
   contactPlane: { normal: Vec3; point: Vec3 } | null;
   severityMarkers: { id: string; location: Vec3; severity: string }[] | null;
   selectionAnchor: Vec3 | null;
@@ -87,9 +87,16 @@ export function createOverlayLayer(
         ctx.fill();
 
         ctx.fillStyle = '#f2f0ea';
-        ctx.font = '600 26px Inter Variable';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
+        // Auto-fit long badge text (e.g. "CRITICAL STRESS: 48.2 MPa - RISK OF
+        // CRACK") by shrinking the font until it fits the 256 px canvas.
+        let fontSize = 26;
+        ctx.font = '600 26px Inter Variable';
+        while (fontSize > 12 && ctx.measureText(text).width > 232) {
+          fontSize -= 2;
+          ctx.font = `600 ${fontSize}px Inter Variable`;
+        }
         ctx.fillText(text, 128, 32);
       }
       texture = new THREE.CanvasTexture(canvas);
@@ -166,13 +173,13 @@ export function createOverlayLayer(
       if (spec.stressBadge && isFiniteVec3(spec.stressBadge.location)) {
         const loc = spec.stressBadge.location;
         const geom = new THREE.OctahedronGeometry(r * 0.09);
-        const mat = new THREE.MeshBasicMaterial({ color: WARNING_ACCENT });
+        const mat = new THREE.MeshBasicMaterial({ color: spec.stressBadge.color ?? WARNING_ACCENT });
         mat.userData.owned = true;
         const mesh = new THREE.Mesh(geom, mat);
         mesh.position.set(...loc);
         container.add(mesh);
 
-        const sprite = createLabelSprite('stress (filtered)', r);
+        const sprite = createLabelSprite(spec.stressBadge.label ?? 'stress (filtered)', r);
         sprite.position.set(loc[0], loc[1], loc[2] + r * 0.14);
         container.add(sprite);
       }

@@ -12,6 +12,7 @@ from mouse_sim.impact import (
     FATIGUE_ESTIMATE_EXCEEDED,
     FATIGUE_GENERIC_FALLBACK,
     HERTZ_CONTACT_DURATION_FACTOR,
+    HERTZ_REGIME_EXCEEDED,
     IMPACT_ACCELERATION_IMPLAUSIBLE,
     IMPACT_STRESS_IMPLAUSIBLE,
     INVALID_CONTACT_OFFSET,
@@ -20,16 +21,19 @@ from mouse_sim.impact import (
     INVALID_LOAD_PATH,
     INVALID_MASS,
     INVALID_RESTITUTION,
+    INVALID_SN_CURVE,
     INVALID_STIFFNESS,
     INSUFFICIENT_PARAMETERS,
     PEAK_FORCE_NOT_ESTIMATED,
     SCREENING_SURROGATE_MODEL_ID,
     UNSUPPORTED_BATTERY_CRUSH,
     desk_edge_impact,
+    effective_modulus,
     estimate_impact,
     impact_qualification_status,
     repeat_impact_cycles,
 )
+from mouse_sim.materials import builtin_materials
 
 
 class NoImpactTests(unittest.TestCase):
@@ -285,18 +289,29 @@ class FatigueTests(unittest.TestCase):
             fatigue_exponent_k=7,
         )
         self.assertNotIn(FATIGUE_GENERIC_FALLBACK, with_material["flags"])
-        self.assertEqual(with_material["assumptions"], [])
+        # The R-ratio/amplitude interpretation is always recorded (README
+        # contract: assumptions are always present).
+        self.assertTrue(
+            any("R~0" in item and "amplitude" in item for item in with_material["assumptions"])
+        )
+
+    def test_r_ratio_assumption_always_recorded(self):
+        summary = repeat_impact_cycles(cycles_n=1, stress_amplitude_pa=1e6, s_n_curve={1e6: 1e4})
+        self.assertTrue(
+            any("R~0" in item and "amplitude" in item for item in summary["assumptions"])
+        )
 
     def test_material_basquin_laws_exact_lives(self):
-        # Per-material S-N data (polymer fatigue compilations, R ~ 0.1):
-        # ABS 14 MPa @ 1e6, slope 6; PC 20 MPa @ 1e6, slope 7;
-        # POM 30 MPa @ 1e6, slope 9; FR-4 100 MPa @ 1e6, slope 8.
+        # Per-material S-N data matching the shipped catalog (polymer fatigue
+        # compilations, R ~ 0.1): ABS 14 MPa @ 1e6, slope 7;
+        # PC 25 MPa @ 1e6, slope 8; POM 30 MPa @ 1e6, slope 10;
+        # FR-4 65 MPa @ 1e6, slope 10.
         # N = 1e6*(sigma_ref/sigma)^k, hand-computed below.
         materials = (
-            ("ABS", 14e6, 6, 1e6 / 64.0),      # at 2*sigma_ref: 15625.0
-            ("PC", 20e6, 7, 1e6 / 128.0),      # 7812.5
-            ("POM", 30e6, 9, 1e6 / 512.0),     # 1953.125
-            ("FR-4", 100e6, 8, 1e6 / 256.0),   # 3906.25
+            ("ABS", 14e6, 7, 1e6 / 128.0),      # at 2*sigma_ref: 7812.5
+            ("PC", 25e6, 8, 1e6 / 256.0),       # 3906.25
+            ("POM", 30e6, 10, 1e6 / 1024.0),    # 976.5625
+            ("FR-4", 65e6, 10, 1e6 / 1024.0),   # 976.5625
         )
         for name, sigma_ref, exponent, expected_at_doubled in materials:
             at_ref = repeat_impact_cycles(
@@ -358,6 +373,161 @@ class FatigueTests(unittest.TestCase):
         self.assertEqual(summary["flags"], [])
 
 
+class FatigueAuditRegressionTests(unittest.TestCase):
+    """Audit E1/C2/LOW regressions: consistent built-in curves, endurance
+    knee, invalid-curve handling, and skipped-level disclosure."""
+
+    def test_steel_below_endurance_limit_is_infinite_life(self):
+        # Steel curve (catalog): 180 MPa @ 1e6, slope 10, endurance knee at
+        # 180 MPa.  Stress at or below the knee is screening-infinite life
+        # (the _MAX_SCREENING_LIFE_CYCLES cap of 1e18).
+        for stress in (100e6, 180e6):
+            summary = repeat_impact_cycles(
+                cycles_n=1,
+                stress_amplitude_pa=stress,
+                fatigue_strength_at_1e6_pa=180e6,
+                fatigue_exponent_k=10,
+                endurance_limit_pa=180e6,
+            )
+            self.assertEqual(summary["levels"][0]["cycles_to_failure"], 1e18, stress)
+            self.assertAlmostEqual(summary["damage_sum"], 1e-18, places=22, msg=stress)
+            self.assertTrue(any("endurance limit" in item for item in summary["assumptions"]))
+
+    def test_steel_above_endurance_limit_is_finite_life(self):
+        summary = repeat_impact_cycles(
+            cycles_n=1,
+            stress_amplitude_pa=181e6,
+            fatigue_strength_at_1e6_pa=180e6,
+            fatigue_exponent_k=10,
+            endurance_limit_pa=180e6,
+        )
+        life = summary["levels"][0]["cycles_to_failure"]
+        self.assertLess(life, 1e6)
+        self.assertGreater(life, 9e5)
+
+    def test_curve_without_endurance_limit_keeps_generic_path(self):
+        # No endurance limit supplied: the generic polymer fallback still
+        # caps tiny stresses at the screening-infinite value (unchanged).
+        summary = repeat_impact_cycles(cycles_n=100, stress_amplitude_pa=1e-300)
+        self.assertEqual(summary["levels"][0]["cycles_to_failure"], 1e18)
+        self.assertIn(FATIGUE_GENERIC_FALLBACK, summary["flags"])
+
+    def test_invalid_sn_curve_returns_failed_result_not_raise(self):
+        bad_life = repeat_impact_cycles(cycles_n=1, stress_amplitude_pa=1e6, s_n_curve={1e6: "lots"})
+        self.assertIn(INVALID_SN_CURVE, bad_life["flags"])
+        self.assertEqual(bad_life["levels"], [])
+        self.assertEqual(bad_life["damage_sum"], 0.0)
+        self.assertTrue(any("must be numeric" in item for item in bad_life["assumptions"]))
+        bad_key = repeat_impact_cycles(
+            cycles_n=1, stress_amplitude_pa=5e5, s_n_curve={"1e6": 1e4, "low": "many"}
+        )
+        self.assertIn(INVALID_SN_CURVE, bad_key["flags"])
+
+    def test_zero_and_negative_stress_levels_skipped_with_disclosure(self):
+        summary = repeat_impact_cycles(
+            [(10, 1e7), (5, 0.0), (3, -1e6)], s_n_curve={1e7: 1e3}
+        )
+        self.assertEqual(summary["skipped_levels"], 2)
+        self.assertEqual(summary["cycles_evaluated"], 10.0)
+        self.assertTrue(
+            any("2 zero/negative stress level(s) skipped" in item for item in summary["assumptions"])
+        )
+        self.assertEqual(len(summary["levels"]), 1)
+
+    def test_builtin_catalog_curves_respect_uts_at_1e3_cycles(self):
+        # Every shipped curve must keep sigma(1e3) = sigma_ref*1000^(1/k) at
+        # or below 0.9*UTS when evaluated through the screening estimator.
+        catalog = builtin_materials()
+        for key, material in catalog.items():
+            properties = material.properties
+            anchor = properties.fatigue_strength_at_1e6_pa
+            exponent = properties.fatigue_exponent_k
+            uts = properties.ultimate_strength
+            if anchor is None or exponent is None:
+                continue
+            implied = anchor.value_si * 1000.0 ** (1.0 / exponent)
+            self.assertLessEqual(implied, 0.9 * uts.value_si, key)
+
+
+class HertzRegimeTests(unittest.TestCase):
+    """Audit C2: the Hertz small-deformation regime is screened and the
+    breach is disclosed instead of silently extrapolating."""
+
+    def test_soft_contact_exceeding_regime_flags(self):
+        # Foam-surface case: 120 g at 4 m/s on a soft contact with R = 2 mm
+        # compresses ~1.1 mm, delta_max/R ~ 0.55 >> 0.1.
+        result = estimate_impact(
+            mass_kg=0.12,
+            velocity_m_s=4.0,
+            effective_modulus_pa=1e9,
+            contact_radius_m=0.002,
+        )
+        self.assertIn(HERTZ_REGIME_EXCEEDED, result.flags)
+        self.assertTrue(
+            any("delta_max/R" in item and "0.1" in item for item in result.assumptions)
+        )
+        ratio = result.contact_compression_m / 0.002
+        self.assertGreater(ratio, 0.1)
+
+    def test_stiff_contact_within_regime_no_flag(self):
+        result = estimate_impact(
+            mass_kg=0.1,
+            velocity_m_s=4.0,
+            effective_modulus_pa=1e9,
+            contact_radius_m=0.02,
+        )
+        self.assertNotIn(HERTZ_REGIME_EXCEEDED, result.flags)
+
+    def test_regime_flag_is_disclosure_only(self):
+        result = estimate_impact(
+            mass_kg=0.12,
+            velocity_m_s=4.0,
+            effective_modulus_pa=1e9,
+            contact_radius_m=0.002,
+        )
+        self.assertEqual(result.validity, "valid")
+        self.assertGreater(result.peak_force_n, 0.0)
+
+
+class DeterminismTests(unittest.TestCase):
+    """Two runs of the same inputs must produce identical payloads."""
+
+    def test_estimate_impact_runs_are_byte_identical(self):
+        kwargs = dict(
+            mass_kg=0.1,
+            velocity_m_s=4.0,
+            contact_stiffness_n_per_m=1e5,
+            load_path_area_m2=1e-4,
+            allowable_pa=2e6,
+            inertia_tensor_kg_m2=[[1e-6, 0.0, 0.0], [0.0, 1e-6, 0.0], [0.0, 0.0, 1e-6]],
+            contact_location_m=(0.01, 0.0, 0.0),
+        )
+        first = estimate_impact(**kwargs)
+        second = estimate_impact(**kwargs)
+        self.assertEqual(first.to_dict(), second.to_dict())
+        self.assertEqual(json.dumps(first.to_dict()), json.dumps(second.to_dict()))
+
+    def test_hertz_and_fatigue_runs_are_byte_identical(self):
+        hertz_kwargs = dict(
+            mass_kg=0.12,
+            velocity_m_s=4.0,
+            effective_modulus_pa=1e9,
+            contact_radius_m=0.002,
+        )
+        self.assertEqual(
+            estimate_impact(**hertz_kwargs).to_dict(), estimate_impact(**hertz_kwargs).to_dict()
+        )
+        fatigue_kwargs = dict(
+            cycles_n=[(10, 1e7), (2, 0.0)],
+            fatigue_strength_at_1e6_pa=180e6,
+            fatigue_exponent_k=10,
+            endurance_limit_pa=180e6,
+        )
+        self.assertEqual(
+            repeat_impact_cycles(**fatigue_kwargs), repeat_impact_cycles(**fatigue_kwargs)
+        )
+
+
 class QualificationTests(unittest.TestCase):
     def test_qualification_blocked_by_default(self):
         status = impact_qualification_status()
@@ -397,10 +567,143 @@ class DeskEdgeTests(unittest.TestCase):
         self.assertEqual(result.validity, "failed")
 
     def test_desk_edge_passes_through_other_kwargs(self):
+        # Pass-through of estimate_impact kwargs (reduced mass with
+        # target_mass_kg=0.1 gives m_eff = 0.1*0.1/(0.1+0.1) = 0.05).
         result = desk_edge_impact(
-            mass_kg=0.1, velocity_m_s=4.0, contact_radius_m=0.005, target_mass_kg=0.5
+            mass_kg=0.1, velocity_m_s=4.0, contact_radius_m=0.005, target_mass_kg=0.1
         )
-        self.assertAlmostEqual(result.effective_mass_kg, 0.1 * 0.5 / 0.6)
+        self.assertAlmostEqual(result.effective_mass_kg, 0.05, places=9)
+
+    def test_desk_edge_combined_radius_uses_cylinder_formula(self):
+        # Sphere R1 = 5 mm on a cylindrical edge R2 = 5 mm:
+        # R_eff = R1*sqrt(R2/(R1+R2)) = 5*sqrt(0.5) = 3.5355 mm.
+        r1 = 0.005
+        r2 = 0.005
+        r_eff = r1 * math.sqrt(r2 / (r1 + r2))
+        result = desk_edge_impact(
+            mass_kg=0.1, velocity_m_s=4.0, contact_radius_m=r1, desk_edge_radius_m=r2
+        )
+        k_h = (4.0 / 3.0) * 1e9 * math.sqrt(r_eff)
+        delta_max = ((5.0 / 4.0) * 0.1 * 4.0 * 4.0 / k_h) ** (2.0 / 5.0)
+        self.assertAlmostEqual(result.peak_force_n, k_h * delta_max ** 1.5, places=6)
+        alone = desk_edge_impact(mass_kg=0.1, velocity_m_s=4.0, contact_radius_m=r1)
+        self.assertLess(result.peak_force_n, alone.peak_force_n)
+        # Hertz peak force scales as R^0.2 (F ~ k_h*delta^1.5 with delta ~
+        # (1/k_h)^0.4 and k_h ~ sqrt(R)), so the overstatement using R1 alone
+        # is (R1/R_eff)^0.2 ~ 1.07 for R2 = R1.
+        self.assertAlmostEqual(
+            alone.peak_force_n / result.peak_force_n, (r1 / r_eff) ** 0.2, places=6
+        )
+        self.assertTrue(
+            any("R_eff = R1*sqrt(R2/(R1+R2))" in item for item in result.assumptions)
+        )
+        self.assertTrue(any("R2 = 0.005" in item for item in result.assumptions))
+
+    def test_desk_edge_default_discloses_shell_radius_alone(self):
+        result = desk_edge_impact(mass_kg=0.1, velocity_m_s=4.0, contact_radius_m=0.005)
+        self.assertTrue(
+            any("shell radius alone" in item and "non-conservative" in item for item in result.assumptions)
+        )
+        self.assertTrue(
+            any("R_eff = R1*sqrt(R2/(R1+R2))" in item for item in result.assumptions)
+        )
+
+    def test_desk_edge_invalid_edge_radius_failed(self):
+        for bad in (0.0, -0.001):
+            result = desk_edge_impact(
+                mass_kg=0.1, velocity_m_s=4.0, contact_radius_m=0.005, desk_edge_radius_m=bad
+            )
+            self.assertEqual(result.validity, "failed", bad)
+        result = desk_edge_impact(
+            mass_kg=0.1, velocity_m_s=4.0, contact_radius_m=0.005, desk_edge_radius_m="x"
+        )
+        self.assertEqual(result.validity, "failed")
+
+    def test_desk_edge_linear_stiffness_ignores_edge_radius_with_disclosure(self):
+        result = desk_edge_impact(
+            mass_kg=0.1,
+            velocity_m_s=4.0,
+            contact_radius_m=0.005,
+            desk_edge_radius_m=0.005,
+            shell_stiffness_n_per_m=1e5,
+        )
+        self.assertEqual(result.contact_model, CONTACT_MODEL_LINEAR_CALIBRATED)
+        self.assertAlmostEqual(result.peak_force_n, 4.0 * math.sqrt(0.1 * 1e5), places=9)
+        self.assertTrue(
+            any("desk_edge_radius_m ignored" in item for item in result.assumptions)
+        )
+
+
+class EffectiveModulusTests(unittest.TestCase):
+    """The Hertz effective contact modulus E_eff = ((1-nu1^2)/E1 +
+    (1-nu2^2)/E2)^-1 must be shared by every Hertz call site and reject
+    invalid material data instead of silently substituting."""
+
+    def test_effective_modulus_abs_on_concrete(self):
+        e = effective_modulus(2.3e9, 0.35, 30e9, 0.20)
+        expected = 1.0 / ((1.0 - 0.35 ** 2) / 2.3e9 + (1.0 - 0.20 ** 2) / 30e9)
+        self.assertAlmostEqual(e, expected, places=9)
+        self.assertAlmostEqual(e / 1e9, 2.418, delta=0.01)
+
+    def test_effective_modulus_abs_on_steel(self):
+        e = effective_modulus(2.3e9, 0.35, 200e9, 0.30)
+        self.assertLess(e, 2.7e9)
+        self.assertGreater(e, 2.3e9)
+
+    def test_effective_modulus_invalid_inputs_rejected(self):
+        for args in (
+            (0.0, 0.35, 30e9, 0.2),
+            (-2.3e9, 0.35, 30e9, 0.2),
+            (2.3e9, 0.6, 30e9, 0.2),
+            (2.3e9, -1.0, 30e9, 0.2),
+            (2.3e9, 0.35, 30e9, 1.0),
+            (2.3e9, 0.35, float("nan"), 0.2),
+        ):
+            with self.assertRaises(ValueError):
+                effective_modulus(*args)
+
+    def test_desk_edge_routes_material_pair_through_effective_modulus(self):
+        result = desk_edge_impact(
+            mass_kg=0.1,
+            velocity_m_s=4.0,
+            contact_radius_m=0.005,
+            shell_young_modulus_pa=2.3e9,
+            shell_poissons_ratio=0.35,
+            floor_young_modulus_pa=30e9,
+            floor_poissons_ratio=0.20,
+        )
+        e_eff = effective_modulus(2.3e9, 0.35, 30e9, 0.20)
+        k_h = (4.0 / 3.0) * e_eff * math.sqrt(0.005)
+        delta_max = ((5.0 / 4.0) * 0.1 * 4.0 * 4.0 / k_h) ** (2.0 / 5.0)
+        self.assertEqual(result.contact_model, CONTACT_MODEL_HERTZ_NONLINEAR)
+        self.assertAlmostEqual(result.peak_force_n, k_h * delta_max ** 1.5, places=6)
+        self.assertTrue(any("E_eff = ((1-nu1^2)/E1" in item for item in result.assumptions))
+
+    def test_desk_edge_explicit_effective_modulus_override(self):
+        result = desk_edge_impact(
+            mass_kg=0.1, velocity_m_s=4.0, contact_radius_m=0.005,
+            effective_modulus_pa=2.4e9,
+        )
+        k_h = (4.0 / 3.0) * 2.4e9 * math.sqrt(0.005)
+        delta_max = ((5.0 / 4.0) * 0.1 * 4.0 * 4.0 / k_h) ** (2.0 / 5.0)
+        self.assertAlmostEqual(result.peak_force_n, k_h * delta_max ** 1.5, places=6)
+
+    def test_desk_edge_default_effective_modulus_preserved(self):
+        # Documented behavior preserved: no E/nu supplied keeps the crude
+        # 1e9 Pa default.
+        result = desk_edge_impact(mass_kg=0.1, velocity_m_s=4.0, contact_radius_m=0.005)
+        k_h = (4.0 / 3.0) * 1e9 * math.sqrt(0.005)
+        delta_max = ((5.0 / 4.0) * 0.1 * 4.0 * 4.0 / k_h) ** (2.0 / 5.0)
+        self.assertAlmostEqual(result.peak_force_n, k_h * delta_max ** 1.5, places=6)
+        self.assertTrue(any("crude assumption" in item for item in result.assumptions))
+
+    def test_desk_edge_partial_material_pair_failed(self):
+        result = desk_edge_impact(
+            mass_kg=0.1, velocity_m_s=4.0, contact_radius_m=0.005,
+            shell_young_modulus_pa=2.3e9, shell_poissons_ratio=0.35,
+        )
+        self.assertEqual(result.validity, "failed")
+        self.assertIn(INVALID_STIFFNESS, result.flags)
 
 
 class DictTests(unittest.TestCase):

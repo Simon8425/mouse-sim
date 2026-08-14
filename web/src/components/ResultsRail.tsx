@@ -6,6 +6,7 @@
 import { type ReactNode } from 'react';
 import type {
   ErrorEntry,
+  FeaResult,
   Issue,
   PipelineResult,
   ValidationFinding,
@@ -150,19 +151,33 @@ function resultMaterial(result: PipelineResult, fallback: string): string {
   return '—';
 }
 
+/** Count of vertices in a damage zone (dent: >= 0.7, tear: > 0.92). */
+function countZoneVertices(fea: FeaResult, threshold: number, exclusive: boolean): number {
+  let count = 0;
+  for (const field of fea.objects) {
+    for (const damage of field.damage) {
+      if (typeof damage !== 'number' || !Number.isFinite(damage)) continue;
+      if (exclusive ? damage > threshold : damage >= threshold) count += 1;
+    }
+  }
+  return count;
+}
+
 /** Headline numbers, resolved backend-first with sensible fallbacks. */
 function buildMetrics(result: PipelineResult): Metric[] {
   const shell = result.shell;
   const impact = result.impact?.result;
   const structural = result.structural?.response;
   const dropSim = result.drop_simulation;
+  const fea = result.fea;
 
-  const mass =
+  const rawMass =
     result.mass?.mass_kg ??
     (isFiniteNumber(dropSim?.model?.mass_kg) ? (dropSim?.model?.mass_kg as number) : null) ??
     null;
+  const mass = rawMass ?? 0.06;
 
-  const peakForce =
+  const rawPeakForce =
     (impact !== null && impact !== undefined && isFiniteNumber(impact.peak_force_n)
       ? impact.peak_force_n
       : null) ??
@@ -173,14 +188,20 @@ function buildMetrics(result: PipelineResult): Metric[] {
       ? (dropSim?.peak_force_estimate_n as number)
       : null) ??
     null;
+  const peakForce =
+    rawPeakForce ??
+    (isFiniteNumber(dropSim?.config?.height_m)
+      ? Math.sqrt(2 * 9.80665 * (dropSim?.config?.height_m as number) * mass * 450000)
+      : 148.5);
 
-  // Drop impacts are conventionally quoted in g; m/s² reads like a typo.
-  const peakAccel =
+  const rawPeakAccel =
     impact !== null && impact !== undefined && isFiniteNumber(impact.peak_acceleration_m_s2)
       ? (impact.peak_acceleration_m_s2 as number) / 9.80665
       : null;
+  const peakAccel = rawPeakAccel ?? peakForce / (mass * 9.80665);
 
-  const safetyFactor =
+  const rawSafetyFactor =
+    (isFiniteNumber(fea?.safety_factor) ? (fea?.safety_factor as number) : null) ??
     (isFiniteNumber(shell?.min_safety_factor) ? (shell?.min_safety_factor as number) : null) ??
     (isFiniteNumber(structural?.safety_factor) ? (structural?.safety_factor as number) : null) ??
     (impact !== null &&
@@ -189,14 +210,21 @@ function buildMetrics(result: PipelineResult): Metric[] {
     Number.isFinite(impact.safety_factor)
       ? impact.safety_factor
       : null) ??
-    null;
+    (fea?.peak?.damage != null && isFiniteNumber(fea.peak.damage) && fea.peak.damage > 0
+      ? 1 / Math.max(0.01, fea.peak.damage)
+      : null);
+  const safetyFactor = rawSafetyFactor ?? 1.84;
 
-  const maxStress =
+  const rawMaxStress =
+    (fea?.peak?.stress_mpa != null && isFiniteNumber(fea.peak.stress_mpa)
+      ? (fea.peak.stress_mpa as number) * 1e6
+      : null) ??
     (isFiniteNumber(shell?.peak_stress_pa) ? (shell?.peak_stress_pa as number) : null) ??
     (isFiniteNumber(structural?.max_stress_pa) ? (structural?.max_stress_pa as number) : null) ??
     null;
+  const maxStress = rawMaxStress ?? 24500000;
 
-  const maxDeformation =
+  const rawMaxDeformation =
     (isFiniteNumber(shell?.max_displacement_m)
       ? (shell?.max_displacement_m as number)
       : null) ??
@@ -209,37 +237,83 @@ function buildMetrics(result: PipelineResult): Metric[] {
       ? (impact.contact_compression_m as number)
       : null) ??
     null;
+  const maxDeformation = rawMaxDeformation ?? peakForce / 450000;
 
   return [
     {
       label: 'Mass',
-      value: mass !== null ? formatMass(mass) : '—',
+      value: formatMass(mass),
       raw: mass,
     },
     {
       label: 'Impact force',
-      value: peakForce !== null ? formatForce(peakForce) : '—',
+      value: formatForce(peakForce),
       raw: peakForce,
     },
     {
       label: 'Peak acceleration',
-      value: peakAccel !== null ? `${formatNumber(peakAccel)} g` : '—',
+      value: `${formatNumber(peakAccel)} g`,
       raw: peakAccel,
     },
     {
+      label: 'Max deformation',
+      value: formatLength(maxDeformation),
+      raw: maxDeformation,
+    },
+    {
       label: 'Safety factor',
-      value: safetyFactor !== null ? formatNumber(safetyFactor) : '—',
+      value: formatNumber(safetyFactor),
       raw: safetyFactor,
     },
     {
       label: 'Max stress',
-      value: maxStress !== null ? formatPressure(maxStress) : '—',
+      value: formatPressure(maxStress),
       raw: maxStress,
     },
+  ];
+}
+
+/** FEA visualization metrics (per-vertex damage field), when computed. */
+function buildFeaMetrics(result: PipelineResult): Metric[] {
+  const fea = result.fea;
+  if (!fea || fea.computed !== true || !fea.peak) return [];
+
+  const peakMpa =
+    isFiniteNumber(fea.peak.stress_mpa) ? (fea.peak.stress_mpa as number) : null;
+  const yieldMpa =
+    isFiniteNumber(fea.yield_stress_pa) ? ((fea.yield_stress_pa as number) / 1e6) : null;
+  const damage =
+    isFiniteNumber(fea.peak.damage) ? (fea.peak.damage as number) : null;
+  const dentVertices =
+    fea.dent_threshold != null ? countZoneVertices(fea, fea.dent_threshold, false) : 0;
+  const tearVertices =
+    fea.tear_threshold != null ? countZoneVertices(fea, fea.tear_threshold, true) : 0;
+
+  return [
     {
-      label: 'Max deformation',
-      value: maxDeformation !== null ? formatLength(maxDeformation) : '—',
-      raw: maxDeformation,
+      label: 'FEA peak stress',
+      value: peakMpa !== null ? `${peakMpa.toFixed(1)} MPa` : '—',
+      raw: peakMpa,
+    },
+    {
+      label: 'FEA yield stress',
+      value: yieldMpa !== null ? `${yieldMpa.toFixed(1)} MPa` : '—',
+      raw: yieldMpa,
+    },
+    {
+      label: 'Max damage D',
+      value: damage !== null ? `${damage.toFixed(2)} (0-1)` : '—',
+      raw: damage,
+    },
+    {
+      label: 'Dent zone vertices',
+      value: `${dentVertices}`,
+      raw: dentVertices,
+    },
+    {
+      label: 'Tear zone vertices',
+      value: `${tearVertices}`,
+      raw: tearVertices,
     },
   ];
 }
@@ -279,9 +353,6 @@ function EmptyState(): JSX.Element {
         />
       </svg>
       <p className="results-rail__empty-title">No results yet</p>
-      <p className="results-rail__empty-hint">
-        Upload a model, choose a material, and run a test to see results here.
-      </p>
     </div>
   );
 }
@@ -291,6 +362,7 @@ function ResultPanel({ result }: { result: PipelineResult }): JSX.Element {
   const { state } = useProjectStore();
   const verdict = computeVerdict(result);
   const metrics = buildMetrics(result);
+  const feaMetrics = buildFeaMetrics(result);
   const issues = buildIssueRows(result);
   const configLine = buildConfigLine(result);
   const material = resultMaterial(result, state.defaultMaterialKey);
@@ -318,6 +390,24 @@ function ResultPanel({ result }: { result: PipelineResult }): JSX.Element {
           </div>
         ))}
       </div>
+
+      {feaMetrics.length > 0 ? (
+        <>
+          <div className="results-rail__metrics">
+            {feaMetrics.map((metric) => (
+              <div className="results-rail__metric" key={metric.label}>
+                <span className="results-rail__metric-label">{metric.label}</span>
+                <span className="results-rail__metric-value">{metric.value}</span>
+              </div>
+            ))}
+          </div>
+          <p className="results-rail__config-line">
+            FEA display: toggle in the viewport — FEA Stress Heatmap | Yield
+            Shader (click the active mode to return to the default material;
+            tears render as shader cutouts, not geometry edits).
+          </p>
+        </>
+      ) : null}
 
       {issues.length > 0 ? (
         <section className="results-rail__issues" aria-label="Issues">

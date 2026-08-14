@@ -168,6 +168,7 @@ export function App(): React.ReactElement {
   }, [state.cancelNonce]);
 
   React.useEffect(() => {
+    if (state.runNonce === 0) return;
     const request = analysisRequestRef.current;
     if (!request) return;
     const key = createAnalysisRequestKey(request);
@@ -285,6 +286,15 @@ export function App(): React.ReactElement {
       }
     }
 
+    // For drop simulations, suppress static structural overlays so stress/load vectors
+    // don't float under the floor during dynamic drop playback.
+    if (result?.drop_simulation && !state.stale) {
+      spec.stressBadge = null;
+      spec.loadVector = null;
+      spec.fixtures = null;
+      spec.contactPlane = null;
+    }
+
     // Contact plane from the current analysis request's impact section
     // (display aid, labeled assumption).
     const impactReq = analysisRequest?.impact;
@@ -293,6 +303,16 @@ export function App(): React.ReactElement {
       if (Array.isArray(normal) && normal.length === 3 && normal.every((n) => typeof n === 'number')) {
         spec.contactPlane = { normal: [normal[0], normal[1], normal[2]], point: [0, 0, 0] };
       }
+    }
+
+    // In FEA render modes the heatmap is the focus: suppress the structural
+    // load vector, the translucent contact-plane square and the in-scene 3D
+    // stress badge (the HUD overlay reports the numbers) so nothing distracts
+    // from the contour.
+    if (state.renderMode !== 'default') {
+      spec.contactPlane = null;
+      spec.loadVector = null;
+      spec.stressBadge = null;
     }
 
     // Severity markers from validation findings. Kernel-backed STEP previews
@@ -316,14 +336,16 @@ export function App(): React.ReactElement {
     }
     spec.severityMarkers = markers.length > 0 ? markers : null;
     return spec;
-  }, [lastResult, analysisRequest, shownEntries, state.preview?.display_asset]);
+  }, [lastResult, analysisRequest, shownEntries, state.preview?.display_asset, state.renderMode, state.stale]);
 
   return (
     <div className="app" data-theme={state.theme}>
       <TopBar
         onOpenNav={() => dispatch({ type: 'SET_NAV_OPEN', open: !state.navOpen })}
         onOpenInspector={() => dispatch({ type: 'SET_INSPECTOR_OPEN', open: !state.inspectorOpen })}
-        onOpenControl={() => dispatch({ type: 'SET_CONTROL_OPEN', open: !state.controlOpen })}
+        onOpenControl={() =>
+          dispatch({ type: 'SET_CONTROL_OPEN', open: !state.controlOpen, mode: 'settings' })
+        }
       />
       <div className="workspace">
         <aside
@@ -344,22 +366,25 @@ export function App(): React.ReactElement {
           }}
         >
           {!showGuideCard && !state.webglError ? (
-            <ViewportToolbar viewport={viewportRef} stats={stats} />
-          ) : null}
-          {showGuideCard ? null : (
-            <div className="viewport-column__header">
-              <RunControls />
-              <button
-                type="button"
-                className="btn viewport-column__replace"
-                onClick={() => setUploadOpen(!uploadOpen)}
-                aria-expanded={uploadOpen}
-                title="Replace the loaded model with another file"
-              >
-                Replace model
-              </button>
+            <div className="viewport-column__top-bar">
+              <ViewportToolbar viewport={viewportRef} stats={stats} />
+              <div className="viewport-column__header">
+                <RunControls
+                  onReplaceModel={() => setUploadOpen(!uploadOpen)}
+                  uploadOpen={uploadOpen}
+                />
+              </div>
             </div>
-          )}
+          ) : !showGuideCard ? (
+            <div className="viewport-column__top-bar viewport-column__top-bar--end-only">
+              <div className="viewport-column__header">
+                <RunControls
+                  onReplaceModel={() => setUploadOpen(!uploadOpen)}
+                  uploadOpen={uploadOpen}
+                />
+              </div>
+            </div>
+          ) : null}
           {uploadOpen ? (
             <FileDropzone onClose={() => setUploadOpen(false)} />
           ) : null}
@@ -381,10 +406,17 @@ export function App(): React.ReactElement {
                 // A stale result's trajectory belongs to the previous
                 // model/inputs; replaying it against the current model can
                 // render the model displaced (floating or under the floor).
-                // Only playback trajectories that match the current inputs.
-                state.stale ? null : (state.lastResult?.drop_simulation ?? null)
+                // Only playback trajectories that match the current inputs,
+                // and only while the test has not been dismissed (LEAVE_TEST
+                // keeps the results visible but exits playback).
+                state.stale || state.playbackDismissed
+                  ? null
+                  : (state.lastResult?.drop_simulation ?? null)
               }
+              renderMode={state.renderMode}
+              feaResult={state.lastResult?.fea ?? null}
               onDropEnded={() => viewportRef.current?.setDropPlayback?.(false)}
+              onPlaybackStateChange={(playing) => dispatch({ type: 'SET_DROP_PLAYING', playing })}
               onPick={(id) => {
                 dispatch({ type: 'SELECT', id });
                 // Clicking an object in the viewport is an explicit request to

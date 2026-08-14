@@ -1,7 +1,8 @@
-import { useProjectStore } from '../state/projectStore';
+import { useProjectStore, COMPONENT_ROLES } from '../state/projectStore';
 import {
   selectObjectById,
   selectFindingsFor,
+  selectObjectFindingCodes,
   selectMassObject,
   selectWarningsCount,
 } from '../state/selectors';
@@ -178,6 +179,9 @@ function approvalTone(approval: string): Tone {
  */
 export function InspectorPanel() {
   const { state, dispatch } = useProjectStore();
+  // Material/role assignment is locked while a test is running or loading:
+  // the analysis snapshot must reflect the model as it was submitted.
+  const isRunning = state.runStatus === 'loading' || state.runStatus === 'running';
 
   const entry =
     state.selectedId === null ? null : selectObjectById(state, state.selectedId);
@@ -208,6 +212,11 @@ export function InspectorPanel() {
   const youngModulus = num(material?.young_modulus_pa);
   const approval = readString(material?.approval_state);
   const confidence = displayText(material?.confidence);
+  const hasNoMaterial =
+    materialName === null && state.materials !== null && state.materials.length > 0;
+  const hasUnresolvedClassification = entry.id
+    ? selectObjectFindingCodes(state, entry.id).has('CLASSIFICATION_UNRESOLVED')
+    : false;
 
   const massObj = selectMassObject(state, state.selectedId);
   const massRecord = isRecord(massObj) ? massObj : null;
@@ -245,24 +254,38 @@ export function InspectorPanel() {
         </div>
         {entry.className ? <StatusBadge tone="neutral">{entry.className}</StatusBadge> : null}
       </div>
-      <h3 className="section-title">Geometry</h3>
-      <table className="dense-table">
-        <tbody>
-          {geometryRows.map(([label, value]) => (
-            <tr key={label}>
-              <th scope="row">{label}</th>
-              <td>{value}</td>
-            </tr>
+
+      <h3 className="section-title">Mouse Part Role</h3>
+      <label className="inspector-material-select">
+        <span>Part of the mouse (e.g. Top Shell, PCB, Wheel)</span>
+        <select
+          aria-label="Component role classification"
+          value={state.objectClassifications?.[entry.id] ?? ''}
+          disabled={isRunning}
+          onChange={(event) =>
+            dispatch({
+              type: 'SET_OBJECT_CLASSIFICATION',
+              objectId: entry.id,
+              role: event.target.value === '' ? null : event.target.value,
+            })
+          }
+        >
+          <option value="">Unclassified / General Surface</option>
+          {COMPONENT_ROLES.map((r) => (
+            <option key={r.value} value={r.value}>
+              {r.label}
+            </option>
           ))}
-        </tbody>
-      </table>
+        </select>
+      </label>
 
       <h3 className="section-title">Material</h3>
       {state.materials && state.materials.length > 0 ? (
         <label className="inspector-material-select">
-          <span>Assign for analysis</span>
+          <span>Assign material for analysis</span>
           <select
             value={materialName ?? ''}
+            disabled={isRunning}
             onChange={(event) =>
               dispatch({
                 type: 'SET_OBJECT_MATERIAL',
@@ -271,13 +294,18 @@ export function InspectorPanel() {
               })
             }
           >
-            <option value="">No material</option>
+            <option value="">Default (Project default)</option>
             {state.materials.map((m) => (
               <option key={m.key} value={m.key}>
                 {m.key}
               </option>
             ))}
           </select>
+          {hasNoMaterial ? (
+            <p className="inspector-hint inspector-hint--material">
+              No material assigned — this component uses Default material.
+            </p>
+          ) : null}
         </label>
       ) : null}
       <table className="dense-table">
@@ -315,6 +343,52 @@ export function InspectorPanel() {
         </tbody>
       </table>
 
+      <h3 className="section-title">
+        Diagnostics{warnings > 0 ? ` · ${warnings} warning${warnings === 1 ? '' : 's'}` : ''}
+      </h3>
+      {hasUnresolvedClassification ? (
+        <p className="inspector-hint inspector-hint--classification">
+          Component classification is unresolved. Assign a component role so results
+          can be interpreted by function.
+        </p>
+      ) : null}
+      {findings.length === 0 ? (
+        <p className="inspector-hint">No findings</p>
+      ) : (
+        <table className="dense-table">
+          <tbody>
+            {findings.map((finding, index) => {
+              const severity = finding.severity || 'info';
+              const message = displayText(finding.message) ?? '—';
+              const code = displayText(finding.code);
+              return (
+                <tr key={index}>
+                  <td>
+                    <StatusBadge tone={severityTone(severity)}>{severityLabel(severity)}</StatusBadge>
+                  </td>
+                  <td>
+                    {message}
+                    {code !== null ? <code>{code}</code> : null}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+
+      <h3 className="section-title">Geometry</h3>
+      <table className="dense-table">
+        <tbody>
+          {geometryRows.map(([label, value]) => (
+            <tr key={label}>
+              <th scope="row">{label}</th>
+              <td>{value}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
       <h3 className="section-title">Mass properties</h3>
       <table className="dense-table">
         <tbody>
@@ -344,34 +418,6 @@ export function InspectorPanel() {
           </tr>
         </tbody>
       </table>
-
-      <h3 className="section-title">
-        Diagnostics{warnings > 0 ? ` · ${warnings} warning${warnings === 1 ? '' : 's'}` : ''}
-      </h3>
-      {findings.length === 0 ? (
-        <p>No findings</p>
-      ) : (
-        <table className="dense-table">
-          <tbody>
-            {findings.map((finding, index) => {
-              const severity = finding.severity || 'info';
-              const message = displayText(finding.message) ?? '—';
-              const code = displayText(finding.code);
-              return (
-                <tr key={index}>
-                  <td>
-                    <StatusBadge tone={severityTone(severity)}>{severityLabel(severity)}</StatusBadge>
-                  </td>
-                  <td>
-                    {message}
-                    {code !== null ? <code>{code}</code> : null}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      )}
     </div>
   );
 }

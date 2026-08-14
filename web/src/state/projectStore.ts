@@ -12,6 +12,8 @@ import type {
   WebHealth,
   MaterialEntry,
   PipelineResult,
+  FeaResult,
+  RenderMode,
 } from '../api/contracts';
 import { isGeometryJson, isRecord } from '../api/contracts';
 
@@ -69,10 +71,20 @@ export interface ProjectState {
   webglError: string | null;
   previewRequestVersion: number;
   controlOpen: boolean;
+  controlMode: 'settings' | 'simulation';
   runNonce: number;
   objectMaterials: Record<string, string>;
+  objectClassifications: Record<string, string>;
   defaultMaterialKey: string;
   partGeometry: Record<string, GeometryJson> | null;
+  /** Viewport material mode: default palette, FEA heatmap, or yield shader. */
+  renderMode: RenderMode;
+  /** Per-vertex FEA damage field from the last completed run (null when none). */
+  feaResult: FeaResult | null;
+  /** True after LEAVE_TEST: results stay visible but drop playback is off. */
+  playbackDismissed: boolean;
+  /** True while the drop playback is animating (the FEA switch is hidden during drops). */
+  dropPlaying: boolean;
   /** Legacy load gate retained for persisted/reducer compatibility. */
   skipAutoRun: boolean;
 }
@@ -120,32 +132,54 @@ export type ProjectAction =
         orientation: 'flat' | 'edge' | 'corner' | 'random';
         spin_rps?: number;
         mass_kg?: number | null;
-        /** Optional structural shell-panel section derived from the model. */
         structure?: Record<string, unknown> | null;
-        /** Optional load case for the structural response. */
         load_case?: Record<string, unknown> | null;
       };
     }
   | { type: 'START_EDIT_DRAFT' }
   | { type: 'DISCARD_DRAFT' }
   | { type: 'APPLY_DRAFT' }
+  | { type: 'LEAVE_TEST' }
   | { type: 'SET_TAB'; tab: string }
   | { type: 'SET_SEVERITY_FILTER'; severity: string | null }
   | { type: 'SET_QUALITY_TIER'; tier: 'ultra' | 'high' | 'medium' | 'low' | null }
   | { type: 'SET_NAV_OPEN'; open: boolean }
   | { type: 'SET_INSPECTOR_OPEN'; open: boolean }
   | { type: 'SET_WEBGL_ERROR'; message: string | null }
-  | { type: 'SET_CONTROL_OPEN'; open: boolean }
+  | { type: 'SET_CONTROL_OPEN'; open: boolean; mode?: 'settings' | 'simulation' }
   | { type: 'RUN_STUDY' }
   | { type: 'RUN_POPULATION'; worst_case?: boolean }
   | { type: 'SET_OBJECT_MATERIAL'; objectId: string; materialKey: string | null }
+  | { type: 'SET_OBJECT_CLASSIFICATION'; objectId: string; role: string | null }
   | { type: 'SET_DEFAULT_MATERIAL'; key: string }
+  | { type: 'SET_RENDER_MODE'; mode: RenderMode }
+  | { type: 'SET_DROP_PLAYING'; playing: boolean }
   | {
       type: 'PARTS_OK';
       assetId: string;
       parts: { id: string; name: string; geometry: GeometryJson }[];
     }
   | { type: 'PARTS_ERROR'; assetId: string };
+
+export interface ComponentRoleOption {
+  value: string;
+  label: string;
+}
+
+export const COMPONENT_ROLES: readonly ComponentRoleOption[] = [
+  { value: 'top_shell', label: 'Top Shell / Upper Housing' },
+  { value: 'bottom_shell', label: 'Bottom Shell / Base Plate' },
+  { value: 'main_button', label: 'Main Button (Left / Right)' },
+  { value: 'side_button', label: 'Side Button (Thumb)' },
+  { value: 'scroll_wheel', label: 'Scroll Wheel / Ring' },
+  { value: 'encoder', label: 'Encoder / Wheel Module' },
+  { value: 'pcb', label: 'PCB / Main Electronics' },
+  { value: 'sensor', label: 'Sensor Assembly / Lens' },
+  { value: 'foot_pad', label: 'Mouse Foot / Skate (PTFE)' },
+  { value: 'battery', label: 'Battery / Mass Block' },
+  { value: 'internal_structure', label: 'Internal Frame / Chassis' },
+  { value: 'screw_boss', label: 'Screw Boss / Pillar' },
+] as const;
 
 /**
  * Deterministic worst-case population spec: every tolerance at the band edge
@@ -180,6 +214,7 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
         sourceStatus: 'ready',
         sourceError: null,
         draft: null,
+        playbackDismissed: false,
         preview: null,
         previewStatus: 'idle',
         previewError: null,
@@ -336,6 +371,7 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
         stale: state.lastResult != null && action.requestKey !== state.resultRequestKey,
         runError: null,
         inflightRequestKey: action.requestKey,
+        playbackDismissed: false,
       };
     case 'ANALYZE_OK':
       if (action.version !== state.requestVersion) return state;
@@ -354,6 +390,7 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
           ...state,
           runStatus: 'success',
           lastResult: action.result,
+          feaResult: action.result.fea ?? null,
           resultRequestKey: action.requestKey,
           stale: state.lastResult != null && !inputsMatch,
           runError: null,
@@ -478,11 +515,13 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
       delete rest.population;
       const nextState: ProjectState = {
         ...state,
+        explode: 0,
         mode: 'exploration',
         stale: state.lastResult != null,
         runStatus:
           state.project !== null || state.preview?.supported === true ? 'loading' : 'idle',
         runError: null,
+        playbackDismissed: false,
         draft: {
           ...rest,
           mode: 'exploration',
@@ -519,6 +558,25 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
         return { ...state, project: state.draft, draft: null, stale: state.lastResult != null };
       }
       return state;
+    case 'LEAVE_TEST':
+      // Results (incl. the FEA field) stay visible, but the render mode is
+      // reset so the model returns to normal materials; only the test draft
+      // and the drop playback are dismissed.
+      return {
+        ...state,
+        draft: null,
+        playbackDismissed: true,
+        dropPlaying: false,
+        renderMode: 'default',
+        stale: false,
+        runStatus: 'idle',
+        runError: null,
+        requestVersion: state.requestVersion + 1,
+      };
+    case 'SET_RENDER_MODE':
+      return { ...state, renderMode: action.mode };
+    case 'SET_DROP_PLAYING':
+      return { ...state, dropPlaying: action.playing };
     case 'SET_THEME':
       return { ...state, theme: action.theme };
     case 'SET_TAB':
@@ -537,6 +595,15 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
         objectMaterials[action.objectId] = action.materialKey;
       }
       return { ...state, objectMaterials, stale: state.lastResult != null };
+    }
+    case 'SET_OBJECT_CLASSIFICATION': {
+      const objectClassifications = { ...state.objectClassifications };
+      if (action.role === null) {
+        delete objectClassifications[action.objectId];
+      } else {
+        objectClassifications[action.objectId] = action.role;
+      }
+      return { ...state, objectClassifications, stale: state.lastResult != null };
     }
     case 'SET_DEFAULT_MATERIAL':
       if (typeof window !== 'undefined') {
@@ -564,7 +631,11 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
     case 'SET_WEBGL_ERROR':
       return { ...state, webglError: action.message };
     case 'SET_CONTROL_OPEN':
-      return { ...state, controlOpen: action.open };
+      return {
+        ...state,
+        controlOpen: action.open,
+        controlMode: action.mode ?? (action.open ? state.controlMode : 'settings'),
+      };
     case 'RUN_STUDY':
       // Explicit feedback instead of a silent no-op: launching without
       // geometry or while a mesh is still being parsed cannot run.
@@ -635,7 +706,7 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
         stale: state.lastResult != null,
         runStatus:
           state.project !== null || state.preview?.supported === true ? 'loading' : 'idle',
-        runError: null,
+        playbackDismissed: false,
         draft: {
           ...rest,
           mode: 'exploration',
@@ -704,10 +775,16 @@ export const initialState: ProjectState = {
   webglError: null,
   previewRequestVersion: 0,
   controlOpen: false,
+  controlMode: 'settings',
   runNonce: 0,
   objectMaterials: {},
+  objectClassifications: {},
   defaultMaterialKey: loadPersistedDefaultMaterial(),
   partGeometry: null,
+  renderMode: 'default',
+  feaResult: null,
+  playbackDismissed: false,
+  dropPlaying: false,
   skipAutoRun: false,
 };
 
@@ -732,6 +809,7 @@ function resetGeometryView(state: ProjectState): ProjectState {
     isolatedId: null,
     visibility: {},
     objectMaterials: {},
+    objectClassifications: {},
     partGeometry: null,
   };
 }

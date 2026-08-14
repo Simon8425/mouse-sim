@@ -8,6 +8,8 @@ import {
   createObjectGroup,
   worldBoundsForGeometry,
   disposeObjectGroup,
+  applyFeaPlateField,
+  plateStressShape,
 } from '../scene/geometryFactory';
 import {
   IDENTITY_TRANSFORM,
@@ -17,6 +19,7 @@ import {
   type FrustumGeometryJson,
   type MeshGeometryJson,
   type CompoundGeometryJson,
+  type FeaResult,
 } from '../api/contracts';
 
 describe('geometryFactory Three.js integration and parity', () => {
@@ -142,6 +145,41 @@ describe('geometryFactory Three.js integration and parity', () => {
     expect(geom.getAttribute('normal')).toBeDefined();
   });
 
+  it('carries zero-initialized FEA attributes on mesh geometry', () => {
+    const meshGeom: MeshGeometryJson = {
+      type: 'mesh',
+      vertices: [
+        [0, 0, 0],
+        [1, 0, 0],
+        [0, 1, 0],
+        [1, 1, 0],
+      ],
+      triangles: [
+        [0, 1, 2],
+        [1, 3, 2],
+      ],
+      units: 'm',
+      transform: IDENTITY_TRANSFORM,
+    };
+
+    const group = createObjectGroup({ id: 'fea-mesh', geometry: meshGeom });
+    const mesh = group.children[0] as THREE.Mesh;
+    const geom = mesh.geometry as THREE.BufferGeometry;
+
+    const damage = geom.getAttribute('aDamage');
+    const displacement = geom.getAttribute('aDisplacement');
+    expect(damage).toBeDefined();
+    expect(displacement).toBeDefined();
+    expect(damage!.itemSize).toBe(1);
+    expect(displacement!.itemSize).toBe(3);
+    expect(damage!.count).toBe(4);
+    expect(displacement!.count).toBe(4);
+    expect(Array.from(damage!.array as Float32Array)).toEqual([0, 0, 0, 0]);
+    expect(Array.from(displacement!.array as Float32Array)).toEqual([
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+  });
+
   it('skips empty, non-finite, and out-of-range mesh buffers safely', () => {
     const emptyMesh: MeshGeometryJson = {
       type: 'mesh',
@@ -235,6 +273,86 @@ describe('geometryFactory Three.js integration and parity', () => {
     disposeObjectGroup(group);
     expect(spyGeomDispose).toHaveBeenCalled();
     expect(spyMatDispose).not.toHaveBeenCalled();
+  });
+});
+
+describe('plateStressShape', () => {
+  it('peaks at the plate center and vanishes at the free-edge midpoints', () => {
+    const a = 0.1;
+    const b = 0.06;
+    const center = plateStressShape(a / 2, b / 2, a, b);
+    expect(center).toBeGreaterThan(0);
+    // Free-edge midpoints (x=0 or y=0): sin(0) term -> ~0 stress.
+    expect(plateStressShape(0, b / 2, a, b)).toBeCloseTo(0, 3);
+    expect(plateStressShape(a / 2, 0, a, b)).toBeCloseTo(0, 3);
+    // Monotone decay from the center along the mid-line.
+    const mid = plateStressShape(a / 2, b / 4, a, b);
+    expect(mid).toBeGreaterThan(0);
+    expect(mid).toBeLessThan(center);
+  });
+});
+
+describe('applyFeaPlateField', () => {
+  it('fills aDamage for attribute-less primitive geometry', () => {
+    const geometry = new THREE.BoxGeometry(0.1, 0.06, 0.04);
+    geometry.setAttribute(
+      'aDamage',
+      new THREE.BufferAttribute(new Float32Array(geometry.attributes.position.count), 1),
+    );
+    geometry.setAttribute(
+      'aDisplacement',
+      new THREE.BufferAttribute(new Float32Array(geometry.attributes.position.count * 3), 3),
+    );
+    const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial());
+    const fea: FeaResult = {
+      computed: true,
+      peak: {
+        object_id: 'box',
+        vertex_index: 0,
+        location_model_m: [0, 0, 0],
+        damage: 0.5,
+        stress_pa: 1e7,
+        stress_mpa: 10,
+      },
+      yield_stress_pa: 2e7,
+      safety_factor: 2,
+      impact_window_s: 0.05,
+      dent_threshold: 0.7,
+      tear_threshold: 0.92,
+      objects: [],
+      procedural: [],
+      assumptions: [],
+      flags: [],
+    };
+    expect(applyFeaPlateField(mesh, fea)).toBe(true);
+    const damage = geometry.getAttribute('aDamage').array as Float32Array;
+    // Every box vertex is a corner at the same |x|,|y| -> same damage,
+    // close to but not exceeding min(1, peak/yield) = 0.5.
+    for (let i = 0; i < damage.length; i += 1) {
+      expect(damage[i]).toBeGreaterThan(0.4);
+      expect(damage[i]).toBeLessThanOrEqual(0.5);
+    }
+    // r168 needsUpdate is a write-only setter; the version bump proves the upload flag ran.
+    expect((geometry.getAttribute('aDamage') as THREE.BufferAttribute).version).toBeGreaterThan(0);
+  });
+
+  it('returns false for unusable field data', () => {
+    const geometry = new THREE.BoxGeometry(0.1, 0.06, 0.04);
+    const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial());
+    const fea = {
+      computed: true,
+      peak: null,
+      yield_stress_pa: 0,
+      safety_factor: null,
+      impact_window_s: 0.05,
+      dent_threshold: 0.7,
+      tear_threshold: 0.92,
+      objects: [],
+      procedural: [],
+      assumptions: [],
+      flags: [],
+    } as unknown as FeaResult;
+    expect(applyFeaPlateField(mesh, fea)).toBe(false);
   });
 });
 

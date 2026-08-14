@@ -15,9 +15,9 @@ import math
 TEMPERATURE_CYCLES_PER_DAY = 1
 DELTA_TEMPERATURE_K = 30
 TRANSPORT_VIBRATION_G_RMS = 3.0
-# Drop energy reference: ~0.1 kg mouse in a 0.5 m free fall
-# (0.1 * 9.81 * 0.5 = 0.4905 J, rounded to 0.49 J).
-DROP_ENERGY_REFERENCE_J = 0.49
+# Drop energy reference: 0.06 kg ultralight mouse in a 0.5 m free fall
+# (0.06 * 9.80665 * 0.5 = 0.2942 J, rounded to 0.29 J).
+DROP_ENERGY_REFERENCE_J = 0.29
 DAYS_PER_YEAR = 365.0
 
 PROFILE_KEYS = ("esports_fps", "esports_moba", "productivity", "general")
@@ -84,7 +84,7 @@ PROFILE_CATALOG = {
 ASSUMPTIONS = (
     "clicks are sustained average rates; burst clicking (8-12 clicks/s) is "
     "represented through the daily average",
-    "drop energy reference 0.49 J per drop (0.5 m free fall of a ~0.1 kg mouse)",
+    "drop energy reference 0.29 J per drop (0.5 m free fall of a 0.06 kg ultralight mouse)",
     "temperature cycle 30 K/day and 3 g rms transport vibration are screening "
     "values (ISTA 3A class)",
 )

@@ -16,7 +16,7 @@ from mouse_sim import (
     load_geometry,
     mass_properties,
 )
-from mouse_sim.importers import GeometryLoadResult
+from mouse_sim.importers import GeometryLoadResult, repair_open_mesh
 
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
 
@@ -278,6 +278,68 @@ class SampleFileImportTests(unittest.TestCase):
         self.assertEqual(len(result.geometry.vertices), 3)
         self.assertEqual(result.geometry.triangles, ((0, 1, 2), (0, 1, 2)))
 
+
+    def test_obj_requires_explicit_units(self):
+        with self.assertRaises(UnitError):
+            load_geometry(self.OBJ, fmt="obj")
+
+
+class MeshRepairTests(unittest.TestCase):
+    CUBE_VERTICES = [
+        (-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
+        (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1),
+    ]
+    CUBE_TRIANGLES = [
+        (0, 2, 1), (0, 3, 2), (4, 5, 6), (4, 6, 7),
+        (0, 1, 5), (0, 5, 4), (1, 2, 6), (1, 6, 5),
+        (2, 3, 7), (2, 7, 6), (3, 0, 4), (3, 4, 7),
+    ]
+
+    def _unwelded_cube(self):
+        """A cube where every triangle carries its own vertex copies (the
+        classic STL export shape: 36 vertices, open topology)."""
+        vertices = []
+        triangles = []
+        for triangle in self.CUBE_TRIANGLES:
+            start = len(vertices)
+            vertices.extend(self.CUBE_VERTICES[index] for index in triangle)
+            triangles.append((start, start + 1, start + 2))
+        return TriangleMesh(vertices, triangles)
+
+    def test_weld_repair_stitches_open_seams_into_closed_mesh(self):
+        mesh = self._unwelded_cube()
+        self.assertFalse(mesh.diagnostics().safe_for_mass_properties)
+        repaired, diagnostics = repair_open_mesh(mesh)
+        self.assertIsNot(repaired, mesh)
+        self.assertTrue(repaired.diagnostics().safe_for_mass_properties)
+        self.assertEqual(len(repaired.vertices), 8)
+        self.assertEqual(len(repaired.triangles), 12)
+        self.assertAlmostEqual(repaired.volume(), 8.0)
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(diagnostics[0].code, "mesh_weld_repair")
+        self.assertEqual(diagnostics[0].severity, "info")
+
+    def test_repair_leaves_closed_and_unweldable_meshes_untouched(self):
+        closed = TriangleMesh(self.CUBE_VERTICES, self.CUBE_TRIANGLES)
+        repaired, diagnostics = repair_open_mesh(closed)
+        self.assertIs(repaired, closed)
+        self.assertEqual(diagnostics, ())
+
+        flat = TriangleMesh([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [(0, 1, 2)])
+        repaired, diagnostics = repair_open_mesh(flat)
+        self.assertIs(repaired, flat)
+        self.assertEqual(diagnostics, ())
+
+    def test_repair_only_accepted_when_topology_certifies_mass(self):
+        # A genuinely open single-sided surface cannot be stitched: welding
+        # changes nothing, so no repair is claimed.
+        vertices = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0.5, 0.5, 1)]
+        triangles = [(4, 1, 2), (4, 2, 3), (4, 3, 0), (4, 0, 1)]
+        mesh = TriangleMesh(vertices, triangles)
+        repaired, diagnostics = repair_open_mesh(mesh)
+        self.assertIs(repaired, mesh)
+        self.assertEqual(diagnostics, ())
+
     def test_faceted_step_parses(self):
         path = os.path.join(FIXTURES, "faceted_cube.step")
         result = load_geometry(path)
@@ -513,11 +575,6 @@ class SampleFileImportTests(unittest.TestCase):
                 stream.write(b"ISO-10303-21;\nHEADER;\nENDSEC;\nEND-ISO-10303-21;")
             with self.assertRaises(ValueError):
                 load_geometry(path)
-
-    def test_obj_requires_explicit_units(self):
-        with self.assertRaises(UnitError):
-            load_geometry(self.OBJ, fmt="obj")
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,10 +25,8 @@ export function fitCameraToBounds(
 
   const radius = Math.max(Math.sqrt(dx * dx + dy * dy + dz * dz) / 2, 1e-4);
   const fovRad = (camera.fov * Math.PI) / 180;
-  // Aggressive close-up framing (2x closer than the original fit): the model
-  // dominates the viewport, with a low vantage point (z component 0.40) so
-  // the view reads close to floor level.
-  const dist = (radius / Math.tan(fovRad / 2)) * 0.26 + radius * 0.01;
+  // Outzoomed framing: comfortable distance so the entire model and surroundings are visible.
+  const dist = (radius / Math.tan(fovRad / 2)) * 0.65 + radius * 0.1;
 
   camera.position.set(
     cx + dist * 0.7071,
@@ -52,7 +50,7 @@ export function applyCameraPreset(
   center: Vec3,
   radius: number,
 ): void {
-  const d = radius * 0.6 + 1e-4;
+  const d = radius * 1.1 + 1e-4;
   const [cx, cy, cz] = center;
 
   switch (preset) {

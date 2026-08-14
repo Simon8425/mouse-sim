@@ -108,6 +108,108 @@ describe('projectStore state reducer and selectors', () => {
     expect(state.stale).toBe(true);
   });
 
+  it('SET_RENDER_MODE updates renderMode without touching staleness', () => {
+    let state = reducer(initialState, {
+      type: 'LOAD_BASELINE_OK',
+      project: mockBaselineProject,
+      name: 'mouse_baseline',
+    });
+    state = reducer(state, { type: 'ANALYZE_START', version: 1, requestKey: 'k1' });
+    state = reducer(state, { type: 'ANALYZE_OK', version: 1, requestKey: 'k1', result: mockPipelineResult });
+    expect(state.renderMode).toBe('default');
+
+    state = reducer(state, { type: 'SET_RENDER_MODE', mode: 'yield' });
+    expect(state.renderMode).toBe('yield');
+    expect(state.stale).toBe(false);
+    expect(state.lastResult).toEqual(mockPipelineResult);
+
+    state = reducer(state, { type: 'SET_RENDER_MODE', mode: 'fea' });
+    expect(state.renderMode).toBe('fea');
+    expect(state.stale).toBe(false);
+  });
+
+  it('SET_DROP_PLAYING tracks the playback state and LEAVE_TEST resets it', () => {
+    let state = reducer(initialState, {
+      type: 'LOAD_BASELINE_OK',
+      project: mockBaselineProject,
+      name: 'mouse_baseline',
+    });
+    expect(state.dropPlaying).toBe(false);
+    state = reducer(state, { type: 'SET_DROP_PLAYING', playing: true });
+    expect(state.dropPlaying).toBe(true);
+    state = reducer(state, { type: 'SET_DROP_PLAYING', playing: false });
+    expect(state.dropPlaying).toBe(false);
+
+    state = reducer(state, {
+      type: 'RUN_DROP_TEST',
+      test: 'drop',
+      config: { height_m: 0.75, surface: 'concrete', drop_count: 1, orientation: 'flat' },
+    });
+    state = reducer(state, { type: 'SET_DROP_PLAYING', playing: true });
+    state = reducer(state, { type: 'LEAVE_TEST' });
+    expect(state.dropPlaying).toBe(false);
+  });
+
+  it('ANALYZE_OK captures the fea field into feaResult', () => {
+    const feaResult = {
+      computed: true,
+      peak: {
+        object_id: 'shell',
+        vertex_index: 7,
+        location_model_m: [0.01, 0.02, 0.03] as [number, number, number],
+        damage: 0.85,
+        stress_pa: 4.8e7,
+        stress_mpa: 48.0,
+      },
+      yield_stress_pa: 5.6e7,
+      safety_factor: 1.17,
+      impact_window_s: 0.3,
+      dent_threshold: 0.7,
+      tear_threshold: 0.92,
+      objects: [
+        {
+          object_id: 'shell',
+          vertex_count: 4,
+          damage: [0.1, 0.85, 0.3, 0.05],
+          displacement: [
+            [0, 0, 0],
+            [0, 0, -0.0004],
+            [0, 0, 0],
+            [0, 0, 0],
+          ],
+          stress_pa: [1e6, 4.8e7, 3e6, 5e5],
+        },
+      ],
+      procedural: [],
+      assumptions: [],
+      flags: [],
+    };
+    let state = reducer(initialState, {
+      type: 'LOAD_BASELINE_OK',
+      project: mockBaselineProject,
+      name: 'mouse_baseline',
+    });
+    state = reducer(state, { type: 'ANALYZE_START', version: 1, requestKey: 'k1' });
+    state = reducer(state, {
+      type: 'ANALYZE_OK',
+      version: 1,
+      requestKey: 'k1',
+      result: { ...mockPipelineResult, fea: feaResult },
+    });
+    expect(state.feaResult).toEqual(feaResult);
+    expect(state.feaResult?.peak?.stress_mpa).toBe(48.0);
+
+    // A result without an fea field clears it.
+    state = reducer(state, { type: 'ANALYZE_START', version: 2, requestKey: 'k2' });
+    state = reducer(state, {
+      type: 'ANALYZE_OK',
+      version: 2,
+      requestKey: 'k2',
+      result: mockPipelineResult,
+    });
+    expect(state.feaResult).toBeNull();
+  });
+
   it('does not mark stale when re-running the SAME request', () => {
     let state = reducer(initialState, {
       type: 'LOAD_BASELINE_OK',
@@ -1135,6 +1237,76 @@ describe('mission control store actions and selectors', () => {
     const config = state.draft?.drop_simulation as Record<string, unknown>;
     expect(config.spin_rps).toBe(0);
     expect(config.mass_kg).toBeUndefined();
+  });
+
+  it('clears active test and returns to normal resting mode with LEAVE_TEST', () => {
+    let state = reducer(initialState, {
+      type: 'LOAD_BASELINE_OK',
+      project: mockBaselineProject,
+      name: 'mouse_baseline',
+    });
+    state = reducer(state, {
+      type: 'RUN_DROP_TEST',
+      test: 'drop',
+      config: { height_m: 0.75, surface: 'concrete', drop_count: 1, orientation: 'flat' },
+    });
+    expect(state.draft?.drop_simulation).toBeDefined();
+
+    state = reducer(state, { type: 'SET_RENDER_MODE', mode: 'yield' });
+    expect(state.renderMode).toBe('yield');
+
+    state = reducer(state, { type: 'LEAVE_TEST' });
+    expect(state.draft).toBeNull();
+    expect(state.stale).toBe(false);
+    expect(state.runStatus).toBe('idle');
+    expect(state.playbackDismissed).toBe(true);
+    expect(state.renderMode).toBe('default');
+  });
+
+  it('LEAVE_TEST keeps results and the FEA field for the normal-mode preview', () => {
+    const feaResult = {
+      computed: true,
+      peak: null,
+      yield_stress_pa: 5.6e7,
+      safety_factor: 1.17,
+      impact_window_s: 0.3,
+      dent_threshold: 0.7,
+      tear_threshold: 0.92,
+      objects: [],
+      procedural: [],
+      assumptions: [],
+      flags: [],
+    };
+    let state = reducer(initialState, {
+      type: 'LOAD_BASELINE_OK',
+      project: mockBaselineProject,
+      name: 'mouse_baseline',
+    });
+    state = reducer(state, { type: 'ANALYZE_START', version: 1, requestKey: 'k1' });
+    state = reducer(state, {
+      type: 'ANALYZE_OK',
+      version: 1,
+      requestKey: 'k1',
+      result: { ...mockPipelineResult, fea: feaResult },
+    });
+    expect(state.lastResult).not.toBeNull();
+    expect(state.feaResult).toEqual(feaResult);
+
+    state = reducer(state, { type: 'LEAVE_TEST' });
+    expect(state.lastResult).toEqual({ ...mockPipelineResult, fea: feaResult });
+    expect(state.feaResult).toEqual(feaResult);
+    expect(state.playbackDismissed).toBe(true);
+    expect(state.stale).toBe(false);
+    expect(state.runStatus).toBe('idle');
+
+    // A fresh test launch re-arms the playback (and disables the preview).
+    state = reducer(state, {
+      type: 'RUN_DROP_TEST',
+      test: 'drop',
+      config: { height_m: 0.75, surface: 'concrete', drop_count: 1, orientation: 'flat' },
+    });
+    expect(state.playbackDismissed).toBe(false);
+    expect(state.lastResult).toEqual({ ...mockPipelineResult, fea: feaResult });
   });
 
   it('builds a cheap deterministic watcher key from the analysis request', () => {

@@ -23,9 +23,12 @@ Formulas covered (each stated in the test docstring):
                         compression duration t = (pi/2)*sqrt(m/k)
                         (impact.py linear branch, see docstrings below).
 7.  Beams/plate:        w = F*L^3/(3*E*I); w = 5*q*L^4/(384*E*I);
-                        w_1 = 16*p/(D*pi^6*(1/a^2 + 1/b^2)^2) (Navier order 1).
+                        w_1 = 16*p/(D*pi^6*(1/a^2 + 1/b^2)^2) (Navier order 1);
+                        located point loads (Roark): SS w(x0) =
+                        P*x0^2*(L-x0)^2/(3*E*I*L); cantilever w(a) = P*a^3/(3*E*I).
 8.  Stress:             sigma = M*c/I; sigma = beta*p*a^2/t^2,
-                        beta = 0.2874; 100-term Navier double sum.
+                        beta = 0.2874; 100-term Navier double sum over the
+                        interior 3x3 grid; tau = 1.5*V/A (max_shear_pa).
 9.  Units:              1 N = 1 kg*m/s^2; g0 = 9.80665 vs 9.81 (documented).
 """
 
@@ -448,6 +451,66 @@ class StructuralDeformationTests(unittest.TestCase):
         expected = 16.0 * p / (D * math.pi ** 6 * (1.0 / (a * a) + 1.0 / (b * b)) ** 2)
         self.assertAlmostEqual(result.max_displacement_m, expected, places=8)
 
+    def test_ss_point_load_at_offset_matches_roark(self):
+        """Simply supported beam, point load P at x0 (Roark Table 8.1 case 4).
+
+        Reactions R1 = P*(L-x0)/L, R2 = P*x0/L; deflection at the load
+        point w(x0) = P*x0^2*(L-x0)^2/(3*E*I*L); max shear
+        V = max(R1, R2).  Verified against Roark's formulas for a
+        concentrated intermediate load.
+        """
+        P, L, E, I, A = 10.0, 0.1, 200e9, 1e-8, 1e-4
+        x0 = 0.03
+        b = L - x0
+        result = beam_response("simply_supported_point", L_m=L, E_pa=E, I_m4=I,
+                               A_m2=A, nu=0.3, force_n=P, location_m=x0,
+                               section_modulus_m3=1e-6)
+        expected_w = P * x0 * x0 * b * b / (3.0 * E * I * L)
+        self.assertAlmostEqual(result.max_displacement_m, expected_w, places=12)
+        self.assertAlmostEqual(result.reactions["R1"], P * b / L, places=12)
+        self.assertAlmostEqual(result.reactions["R2"], P * x0 / L, places=12)
+        self.assertAlmostEqual(result.max_shear_pa, 1.5 * max(P * b / L, P * x0 / L) / A, places=12)
+        # sigma = M/Z with Mmax = P*x0*(L-x0)/L (shear term negligible).
+        moment = P * x0 * b / L
+        sigma = moment / 1e-6
+        tau = 1.5 * P * max(x0, b) / L / A
+        self.assertAlmostEqual(result.max_stress_pa,
+                               math.sqrt(sigma ** 2 + 3.0 * tau ** 2), places=6)
+
+    def test_cantilever_point_load_at_offset_matches_roark(self):
+        """Cantilever, point load P at distance a from the fixed end.
+
+        Roark (Tables 8.1.1-8.1.2): Mmax = P*a at the support, deflection at
+        the load point w(a) = P*a^3/(3*E*I), reaction moment M1 = -P*a.
+        """
+        P, L, E, I, A = 10.0, 0.1, 200e9, 1e-8, 1e-4
+        a = 0.04
+        result = beam_response("cantilever_point", L_m=L, E_pa=E, I_m4=I,
+                               A_m2=A, nu=0.3, force_n=P, location_m=a,
+                               section_modulus_m3=1e-6)
+        expected_w = P * a ** 3 / (3.0 * E * I)
+        self.assertAlmostEqual(result.max_displacement_m, expected_w, places=12)
+        self.assertAlmostEqual(result.reactions["R1"], P, places=12)
+        self.assertAlmostEqual(result.reactions["M1"], -P * a, places=12)
+        self.assertAlmostEqual(result.max_shear_pa, 1.5 * P / A, places=12)
+        sigma = P * a / 1e-6
+        tau = 1.5 * P / A
+        self.assertAlmostEqual(result.max_stress_pa,
+                               math.sqrt(sigma ** 2 + 3.0 * tau ** 2), places=6)
+
+    def test_ss_uniform_beam_max_shear_matches_analytic(self):
+        """tau_max = 1.5*V_max/A with V_max = q*L/2, exact.
+
+        Simply supported beam under uniform q: the maximum shear force is
+        q*L/2 at the supports and the documented shear proxy is
+        tau = 1.5*V/A (parabolic distribution over a rectangular section).
+        """
+        q, L, A = 100.0, 0.1, 1e-4
+        result = beam_response("simply_supported_uniform", L_m=L, E_pa=200e9,
+                               I_m4=1e-8, A_m2=A, nu=0.3, q_n_per_m=q)
+        expected = 1.5 * (q * L / 2.0) / A
+        self.assertAlmostEqual(result.max_shear_pa, expected, places=12)
+
 
 class StressTests(unittest.TestCase):
     """Item 8: bending and plate stress vs closed forms."""
@@ -508,20 +571,13 @@ class StressTests(unittest.TestCase):
         """Reported plate stress vs the 100-term Navier double sum, 0.5%.
 
         physics.py reports max_stress_pa as the von Mises maximum over the
-        fixed 5x5 grid (stress from moment resultants of the truncated
-        Navier series).  The reference here is the same quantity computed
-        independently: the test's own 100-term double sum (m,n = 1..99 odd)
-        evaluated on the same grid, maximizing the von Mises stress.  At the
-        pipeline cap order (series_order=49) the solver matches the
-        independent series within 0.5%.
-
-        Note on the classical coefficient: for the truncated series the grid
-        maximum sits at the CORNER grid point (x = 0, y = 0), where the
-        moment-resultant stress from the slowly-converging corner series
-        exceeds the center value; the classical coefficient
-        sigma = 0.2874*p*a^2/t^2 describes the CENTER and therefore does not
-        match the reported corner-peaked value (the default order-9 report
-        is 0.56% below the converged corner value).
+        INTERIOR 3x3 grid nodes (i,j = 1..3; the 16 boundary nodes carry an
+        idealized-SSSS corner twisting-moment artifact that over-reports the
+        uniform-load peak by ~17%).  The reference here is the same quantity
+        computed independently: the test's own 100-term double sum
+        (m,n = 1..99 odd) evaluated on the same interior grid, maximizing
+        the von Mises stress.  At the pipeline cap order (series_order=49)
+        the solver matches the independent series within 0.5%.
         """
         a = b = 0.1
         t = 0.001
@@ -550,8 +606,8 @@ class StressTests(unittest.TestCase):
                         mxy[j][i] += coeff * alpha * beta * math.cos(alpha * x) * cosy
         best = 0.0
         factor = 6.0 / (t * t)
-        for j in range(5):
-            for i in range(5):
+        for j in (1, 2, 3):
+            for i in (1, 2, 3):
                 mx = -(D * mxx[j][i] + nu * D * myy[j][i])
                 my = -(nu * D * mxx[j][i] + D * myy[j][i])
                 txy = D * (1.0 - nu) * mxy[j][i]
@@ -563,6 +619,27 @@ class StressTests(unittest.TestCase):
         self.assertLessEqual(abs(converged.max_stress_pa - best) / best, 0.005)
         default = shell_panel_response(a, b, t, E, nu, p)
         self.assertLessEqual(abs(default.max_stress_pa - best) / best, 0.01)
+
+    def test_plate_reported_stress_matches_classical_center_coefficient(self):
+        """Reported max_stress_pa matches sigma = 0.2874*p*a^2/t^2, 1%.
+
+        The interior-grid maximum for a uniformly loaded simply supported
+        square panel (nu = 0.3) IS the classical center value
+        (Roark coefficient beta = 0.2874).  At the default order 9 the
+        truncated series is 0.14% above the classical value; at order 49 it
+        is 0.03% below.  The corner twisting-moment artifact is reported
+        separately as corner_twisting_vm_pa and is strictly larger.
+        """
+        a = b = 0.1
+        t = 0.001
+        p = 5000.0
+        classical = 0.2874 * p * a ** 2 / t ** 2
+        for order in (9, 49):
+            result = shell_panel_response(a, b, t, 2.3e9, 0.3, p, series_order=order)
+            self.assertLessEqual(
+                abs(result.max_stress_pa - classical) / classical, 0.01, order
+            )
+            self.assertGreater(result.corner_twisting_vm_pa, result.max_stress_pa)
 
 
 class UnitConsistencyTests(unittest.TestCase):

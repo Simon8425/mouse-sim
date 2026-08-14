@@ -118,8 +118,111 @@ class MeshAndImportTests(unittest.TestCase):
 
         open_mesh = TriangleMesh([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [(0, 1, 2)])
         self.assertFalse(open_mesh.diagnostics().closed)
+
+    def test_envelope_properties_for_open_three_dimensional_mesh(self):
+        # Cube with the top face removed: open, but spans 3D extent.
+        vertices = [
+            (-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
+            (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1),
+        ]
+        triangles = [
+            (0, 2, 1), (0, 3, 2),
+            (0, 1, 5), (0, 5, 4),
+            (1, 2, 6), (1, 6, 5),
+            (2, 3, 7), (2, 7, 6),
+            (3, 0, 4), (3, 4, 7),
+        ]
+        mesh = TriangleMesh(vertices, triangles)
+        self.assertFalse(mesh.diagnostics().closed)
+        envelope = mesh.envelope_properties()
+        self.assertIsNotNone(envelope)
+        self.assertTrue(envelope.estimated)
+        self.assertFalse(envelope.closed)
+        self.assertAlmostEqual(envelope.volume_m3, 8.0 * 0.5)
+        self.assertEqual(envelope.centroid_m, (0.0, 0.0, 0.0))
+        self.assertIn("envelope_volume_estimate", envelope.diagnostics)
+        weighted = envelope.with_density(1000.0)
+        self.assertAlmostEqual(weighted["mass_kg"], 4000.0)
+
+    def test_open_mesh_volume_centroid_and_properties_are_none_masked(self):
+        # G2 audit fix: an open mesh must NOT hand out divergence-theorem
+        # pseudo volume/centroid as solid values (the open cube previously
+        # reported volume() = 6.6667 and centroid() = (0, 0, -0.15) instead
+        # of the certified values None / None).
+        vertices = [
+            (-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
+            (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1),
+        ]
+        triangles = [
+            (0, 2, 1), (0, 3, 2),
+            (0, 1, 5), (0, 5, 4),
+            (1, 2, 6), (1, 6, 5),
+            (2, 3, 7), (2, 7, 6),
+            (3, 0, 4), (3, 4, 7),
+        ]
+        mesh = TriangleMesh(vertices, triangles)
+        self.assertFalse(mesh.diagnostics().safe_for_mass_properties)
+        self.assertIsNone(mesh.volume())
+        self.assertIsNone(mesh.centroid())
+        props = mesh.geometric_properties()
+        self.assertIsNone(props.volume_m3)
+        self.assertIsNone(props.centroid_m)
+        self.assertIsNone(props.inertia_tensor_unit_density)
+        self.assertFalse(props.closed)
+        self.assertIn("boundary_edges", props.diagnostics)
+        # The raw signed integral stays available as DIAGNOSTIC data only.
+        self.assertAlmostEqual(mesh.diagnostics().signed_volume_m3, 20.0 / 3.0)
+        self.assertAlmostEqual(mesh.signed_volume(), 20.0 / 3.0)
+        # The disclosed envelope estimate still carries the fallback values.
+        envelope = mesh.envelope_properties()
+        self.assertIsNotNone(envelope)
+        self.assertAlmostEqual(envelope.volume_m3, 4.0)
+        # A flat single-triangle surface is masked the same way.
+        flat = TriangleMesh([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [(0, 1, 2)])
+        self.assertIsNone(flat.volume())
+        self.assertIsNone(flat.centroid())
+        self.assertIsNone(flat.geometric_properties().volume_m3)
+        # Closed meshes are unaffected: certified values still returned.
+        closed = cube_mesh()
+        self.assertAlmostEqual(closed.volume(), 8.0)
+        self.assertEqual(closed.centroid(), (0.0, 0.0, 0.0))
+        self.assertAlmostEqual(closed.geometric_properties().volume_m3, 8.0)
+
+    def test_compound_with_open_mesh_child_is_none_masked(self):
+        # A compound containing an unsafe mesh cannot certify solid values
+        # either: the None masking propagates through the aggregation.
+        vertices = [
+            (-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
+            (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1),
+        ]
+        triangles = [
+            (0, 2, 1), (0, 3, 2),
+            (0, 1, 5), (0, 5, 4),
+            (1, 2, 6), (1, 6, 5),
+            (2, 3, 7), (2, 7, 6),
+            (3, 0, 4), (3, 4, 7),
+        ]
+        open_mesh = TriangleMesh(vertices, triangles)
+        compound = Compound((Box((2.0, 2.0, 2.0)), open_mesh))
+        self.assertIsNone(compound.volume())
+        self.assertIsNone(compound.centroid())
+        props = compound.geometric_properties()
+        self.assertIsNone(props.volume_m3)
+        self.assertIsNone(props.centroid_m)
         with self.assertRaises(ValueError):
-            open_mesh.inertia_tensor(1.0)
+            compound.inertia_tensor(1.0)
+        # Fully closed compounds are unaffected.
+        closed = Compound((Box((2.0, 2.0, 2.0)), cube_mesh()))
+        self.assertAlmostEqual(closed.volume(), 16.0)
+
+    def test_envelope_properties_none_for_safe_and_flat_meshes(self):
+        self.assertIsNone(cube_mesh().envelope_properties())
+        flat = TriangleMesh([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [(0, 1, 2)])
+        self.assertIsNone(flat.envelope_properties())
+        collinear = TriangleMesh([(0, 0, 0), (1, 0, 0), (2, 0, 0)], [(0, 1, 2)])
+        self.assertIsNone(collinear.envelope_properties())
+        with self.assertRaises(ValueError):
+            flat.inertia_tensor(1.0)
 
     def test_json_obj_ascii_binary_and_step_imports(self):
         json_result = load_geometry(json.dumps({

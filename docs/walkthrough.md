@@ -166,8 +166,11 @@ python3 -S -m unittest discover -s tests -p 'test_*.py'
   arbitrary STEP assemblies use FreeCAD/OCCT to preserve placements, colors, holes, voids, and
   curved surfaces in a deterministic GLB display asset. The display mesh is tessellated, not CAD-
   exact; the original STEP remains the source of truth. There is no cloud deployment.
-- **Point loads flagged**: point loads set `POINT_LOAD_SINGULARITY` and mark the response
-  approximate — local contact stress is not resolved.
+- **Point loads flagged**: point loads set `POINT_LOAD_SINGULARITY` and
+  `POINT_LOAD_STRESS_ORDER_DEPENDENT` and mark the response approximate — the moment
+  series is truncation-dependent at the load point, so the reported stress is an
+  order-bounded estimate (effective smearing radius ≈ a/(2·order)) and point-load
+  safety factors do not gate acceptance.
 - **Manifest has no `run_id`**: the run manifest intentionally omits it (top-level only), by design
   of `_build_manifest`.
 - Closed-form surrogates remain screening tools; real FEM, explicit dynamics, and topology

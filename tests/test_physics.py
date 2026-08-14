@@ -3,6 +3,7 @@ import math
 from dataclasses import replace
 import unittest
 
+import mouse_sim.physics as physics_module
 from mouse_sim.errors import UnitError
 from mouse_sim.materials import builtin_materials
 from mouse_sim.physics import (
@@ -10,15 +11,25 @@ from mouse_sim.physics import (
     INVALID_LOAD_LOCATION,
     INVALID_LOAD_VALUE,
     INVALID_POISSON_RATIO,
+    INVALID_TEMPERATURE_K,
+    MISSING_BEAM_DIMENSION,
+    MISSING_LOAD_MAGNITUDE,
+    MISSING_ORTHOTROPIC_E2,
     MOUSE_LOAD_TEMPLATES,
     NUMERIC_OVERFLOW,
     POINT_LOAD_SINGULARITY,
+    POINT_LOAD_STRESS_ORDER_DEPENDENT,
     SCREENING_SURROGATE_MODEL_ID,
     SERIES_NOT_CONVERGED,
     SMALL_DEFLECTION_VIOLATED,
+    SOLVER_EVALUATION_ERROR,
     THIN_SHELL_OUT_OF_RANGE,
     UNDERCONSTRAINED_REACTIONS,
+    UNKNOWN_BEAM_SUPPORT,
+    UNKNOWN_LOAD_KIND,
     UNSUPPORTED_ANISOTROPY,
+    UNSUPPORTED_STIFFNESS_REDUCTION,
+    USAGE_TEMPERATURE_OUT_OF_RANGE,
     SolverCapabilities,
     beam_response,
     preflight_structural_case,
@@ -299,6 +310,60 @@ class OrthotropicShellTests(unittest.TestCase):
         self.assertIn(UNSUPPORTED_ANISOTROPY, res.flags)
         self.assertEqual(res.validity, "approximate")
 
+    def directional_material(self, E2, E1=2.3e9, nu12=0.35):
+        return {
+            "young_modulus_pa": E1,
+            "poissons_ratio": nu12,
+            "young_modulus_transverse_pa": E2,
+            "young_modulus_thickness_pa": E2,
+            "shear_modulus_xy_pa": E1 / (2.0 * (1.0 + nu12)),
+            "shear_modulus_thickness_pa": E1 / (2.0 * (1.0 + nu12)),
+            "poissons_ratio_xy": nu12,
+            "poissons_ratio_xz": nu12,
+        }
+
+    def test_halving_E2_changes_deflection_and_stress(self):
+        # Audit finding S2: the orthotropic D22 must be built from E2, never
+        # silently replaced by D11.  Halving E2 (same E1, G12, nu12) softens
+        # the panel in the 2-direction: the exact full-CLT center-deflection
+        # ratio is ~1.32 (+32%) for this case (the audit's ~50% estimate was
+        # a rough single-term Navier bound); both documented directions:
+        # deflection INCREASES, center stress DECREASES because D12 drops.
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        load = {"kind": "pressure", "magnitude_pa": 1000.0}
+        full = solve_load_case(load, structure, self.directional_material(2.3e9))
+        half = solve_load_case(load, structure, self.directional_material(1.15e9))
+        ratio = half.max_displacement_m / full.max_displacement_m
+        self.assertGreater(ratio, 1.25)
+        self.assertLess(ratio, 1.45)
+        stress_ratio = half.max_stress_pa / full.max_stress_pa
+        self.assertGreater(stress_ratio, 0.90)
+        self.assertLess(stress_ratio, 0.97)
+        self.assertEqual(full.validity, "valid")
+        self.assertEqual(half.validity, "valid")
+        self.assertNotIn(MISSING_ORTHOTROPIC_E2, half.flags)
+
+    def test_missing_E2_with_anisotropy_supported_flags_new_constant(self):
+        abs_mat = builtin_materials()["ABS"]
+        flagged = replace(abs_mat, anisotropy_supported=True)
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        res = solve_load_case({"kind": "pressure", "magnitude_pa": 1000.0}, structure, flagged)
+        self.assertIn(MISSING_ORTHOTROPIC_E2, res.flags)
+        self.assertIn(UNSUPPORTED_ANISOTROPY, res.flags)
+        self.assertEqual(res.validity, "approximate")
+        self.assertTrue(any("E2" in item and "missing" in item for item in res.assumptions))
+        # The isotropic E1 fallback is explicit, never a silent E2=E1 claim.
+        self.assertTrue(any("not assumed equal to E1" in item for item in res.assumptions))
+
+    def test_partial_directional_data_without_E2_flags(self):
+        material = {"young_modulus_pa": 2e9, "poissons_ratio": 0.35,
+                    "shear_modulus_xy_pa": 8e8, "poissons_ratio_xy": 0.35}
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        res = solve_load_case({"kind": "pressure", "magnitude_pa": 1000.0}, structure, material)
+        self.assertIn(MISSING_ORTHOTROPIC_E2, res.flags)
+        self.assertEqual(res.validity, "approximate")
+        self.assertTrue(any("E2" in item and "missing" in item for item in res.assumptions))
+
 
 class TemperatureDeratingTests(unittest.TestCase):
     """Audit finding: linear modulus/allowable derating above 293.15 K with
@@ -336,6 +401,73 @@ class TemperatureDeratingTests(unittest.TestCase):
                               builtin_materials()["ABS"])
         self.assertEqual(res.validity, "approximate")
         self.assertIn("usage temperature outside continuous-use range", res.validity_reasons)
+
+    def test_abs_at_600k_flagged_finite_never_crashes(self):
+        # Audit finding S3: the linear derating factor went negative at
+        # 600 K (E = -0.88 GPa) and solve_load_case raised "E_pa must be
+        # positive" with no try/except.  The factor is now clamped at the
+        # 0.1 floor and the dispatch never lets a ValueError escape.
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002,
+                     "temperature_k": 600.0}
+        res = solve_load_case({"kind": "pressure", "magnitude_pa": 1000.0}, structure,
+                              builtin_materials()["ABS"])
+        self.assertIsNotNone(res.max_displacement_m)
+        self.assertTrue(math.isfinite(res.max_displacement_m))
+        self.assertTrue(math.isfinite(res.max_stress_pa))
+        self.assertEqual(res.validity, "approximate")
+        self.assertIn("usage temperature outside continuous-use range", res.validity_reasons)
+        self.assertNotIn(NUMERIC_OVERFLOW, res.flags)
+        self.assertTrue(any("clamped at floor 0.1" in item for item in res.assumptions))
+
+    def test_derating_factor_floor_plateau(self):
+        # The floor temperature for ABS (k = 0.0045) is
+        # 293.15 + (1 - 0.1)/0.0045 = 493.15 K; at and beyond it the factor
+        # is pinned at 0.1, so 493.15 K and 600 K produce identical
+        # stiffness.
+        load = {"kind": "pressure", "magnitude_pa": 1000.0}
+        at_floor = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002,
+                    "temperature_k": 493.15}
+        beyond = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002,
+                  "temperature_k": 600.0}
+        floor_res = solve_load_case(load, at_floor, builtin_materials()["ABS"])
+        hot_res = solve_load_case(load, beyond, builtin_materials()["ABS"])
+        self.assertAlmostEqual(floor_res.max_displacement_m, hot_res.max_displacement_m, places=9)
+        self.assertAlmostEqual(floor_res.max_stress_pa, hot_res.max_stress_pa, places=9)
+
+    def test_derating_skipped_reason_for_unknown_material(self):
+        # Audit finding E5: a mapping payload without name/family/key has no
+        # derating coefficient; the skip is disclosed instead of silent.
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002,
+                     "temperature_k": 373.15}
+        material = {"young_modulus_pa": 2e9, "poissons_ratio": 0.35}
+        res = solve_load_case({"kind": "pressure", "magnitude_pa": 1000.0}, structure, material)
+        self.assertIn("temperature derating skipped", " ".join(res.validity_reasons))
+        self.assertEqual(res.validity, "approximate")
+
+    def test_dict_and_definition_derate_consistently(self):
+        # Audit finding E5: the Mapping branch used to skip derating entirely
+        # (name/family/material_key were never extracted), so preflight and
+        # solve disagreed.  A flat dict carrying the catalog identity must
+        # now derate exactly like the MaterialDefinition.
+        definition = builtin_materials()["ABS"]
+        as_dict = {
+            "name": "ABS",
+            "family": "thermoplastic",
+            "young_modulus_pa": 2.3e9,
+            "poissons_ratio": 0.35,
+            "tensile_allowable_pa": 20e6,
+            "continuous_use_temperature_min_k": 233.15,
+            "continuous_use_temperature_max_k": 363.15,
+        }
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002,
+                     "temperature_k": 373.15}
+        load = {"kind": "pressure", "magnitude_pa": 1000.0}
+        from_dict = solve_load_case(load, structure, as_dict)
+        from_def = solve_load_case(load, structure, definition)
+        self.assertAlmostEqual(from_dict.max_displacement_m, from_def.max_displacement_m, places=12)
+        self.assertAlmostEqual(from_dict.max_stress_pa, from_def.max_stress_pa, places=12)
+        self.assertAlmostEqual(from_dict.safety_factor, from_def.safety_factor, places=12)
+        self.assertIn("temperature derating applied", " ".join(from_dict.validity_reasons))
 
 
 class FeatureStressConcentrationTests(unittest.TestCase):
@@ -637,6 +769,363 @@ class NumericOverflowGuardTests(unittest.TestCase):
         response = shell_panel_response(0.1, 0.1, 0.002, 2e9, 0.35, 1000.0)
         self.assertEqual(response.validity, "valid")
         self.assertNotIn(NUMERIC_OVERFLOW, response.flags)
+
+
+class InteriorStressPeakTests(unittest.TestCase):
+    """Audit finding S4: max_stress_pa is the interior 3x3 grid maximum; the
+    corner twisting-moment von Mises value is a separate diagnostic."""
+
+    def test_uniform_shell_reports_interior_peak_location(self):
+        res = shell_panel_response(0.1, 0.1, 0.002, 2e9, 0.35, 1000.0)
+        x, y, z = res.peak_location_m
+        self.assertAlmostEqual(x, 0.05, places=6)
+        self.assertAlmostEqual(y, 0.05, places=6)
+        self.assertAlmostEqual(abs(z), 0.001, places=6)
+        self.assertIsNotNone(res.corner_twisting_vm_pa)
+        self.assertGreater(res.corner_twisting_vm_pa, res.max_stress_pa)
+
+    def test_point_load_peak_location_is_interior(self):
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        material = {"young_modulus_pa": 2e9, "poissons_ratio": 0.35}
+        res = solve_load_case({"kind": "force", "force_n": 5.0, "point_load": True},
+                              structure, material)
+        x, y, z = res.peak_location_m
+        self.assertGreaterEqual(x, 0.025)
+        self.assertLessEqual(x, 0.075)
+        self.assertGreaterEqual(y, 0.025)
+        self.assertLessEqual(y, 0.075)
+        self.assertIsNotNone(res.corner_twisting_vm_pa)
+
+    def test_new_diagnostic_fields_serialize(self):
+        shell = shell_panel_response(0.1, 0.1, 0.002, 2e9, 0.35, 1000.0)
+        beam = beam_response("cantilever_point", L_m=0.1, E_pa=200e9, I_m4=1e-8,
+                             A_m2=1e-4, nu=0.3, force_n=10.0)
+        for response in (shell, beam):
+            data = response.to_dict()
+            self.assertIn("max_shear_pa", data)
+            self.assertIn("corner_twisting_vm_pa", data)
+            self.assertIn("peak_location_m", data)
+            json.dumps(data)
+
+
+class PointLoadOrderDependenceTests(unittest.TestCase):
+    """Audit finding S1: point-load stress is series-truncation dependent and
+    must be disclosed as unsuitable for acceptance."""
+
+    def test_point_load_stress_order_dependent_flag_and_assumption(self):
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        material = {"young_modulus_pa": 2e9, "poissons_ratio": 0.35}
+        res = solve_load_case({"kind": "force", "force_n": 5.0, "point_load": True},
+                              structure, material)
+        self.assertIn(POINT_LOAD_SINGULARITY, res.flags)
+        self.assertIn(POINT_LOAD_STRESS_ORDER_DEPENDENT, res.flags)
+        self.assertTrue(any(
+            "order-truncation dependent" in item and "not suitable for acceptance" in item
+            for item in res.assumptions
+        ))
+        self.assertEqual(res.validity, "approximate")
+
+    def test_point_load_preflight_carries_order_caveat(self):
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        material = {"young_modulus_pa": 2e9, "poissons_ratio": 0.35}
+        issues = preflight_structural_case(
+            {"kind": "force", "force_n": 5.0, "point_load": True}, structure, material
+        )
+        codes = [item["code"] for item in issues]
+        self.assertIn(POINT_LOAD_SINGULARITY, codes)
+        self.assertIn(POINT_LOAD_STRESS_ORDER_DEPENDENT, codes)
+
+
+class BeamDisclosureTests(unittest.TestCase):
+    """Audit findings S5/S6: max_shear_pa, the non-co-located VM caveat, and
+    support/location disclosure for beams."""
+
+    def beam_structure(self, **overrides):
+        structure = {"type": "beam", "L_m": 0.1, "I_m4": 1e-8, "A_m2": 1e-4,
+                     "section_modulus_m3": 1e-6, "support": "cantilever"}
+        structure.update(overrides)
+        return structure
+
+    def test_beam_max_shear_matches_analytic(self):
+        res = beam_response("simply_supported_uniform", L_m=0.1, E_pa=200e9,
+                            I_m4=1e-8, A_m2=1e-4, nu=0.3, q_n_per_m=100.0)
+        expected = 1.5 * (100.0 * 0.1 / 2.0) / 1e-4
+        self.assertAlmostEqual(res.max_shear_pa, expected, places=12)
+
+    def test_beam_vm_non_colocated_assumption(self):
+        res = beam_response("cantilever_point", L_m=0.1, E_pa=200e9, I_m4=1e-8,
+                            A_m2=1e-4, nu=0.3, force_n=10.0)
+        self.assertTrue(any("non-co-located" in item for item in res.assumptions))
+        self.assertTrue(any("max_shear_pa reports" in item for item in res.assumptions))
+
+    def test_support_missing_defaults_to_cantilever_with_assumption(self):
+        structure = self.beam_structure()
+        del structure["support"]
+        material = {"young_modulus_pa": 200e9, "poissons_ratio": 0.3}
+        res = solve_load_case({"kind": "force", "force_n": 10.0}, structure, material)
+        q = 10.0 / 0.1
+        expected = q * 0.1 ** 4 / (8.0 * 200e9 * 1e-8)
+        self.assertAlmostEqual(res.max_displacement_m, expected, places=12)
+        self.assertTrue(any(
+            "support unspecified: defaulted to cantilever" in item for item in res.assumptions
+        ))
+        # The same disclosure applies on the pressure path.
+        pressure_structure = {"type": "beam", "L_m": 0.1, "I_m4": 1e-8, "A_m2": 1e-4,
+                              "section_modulus_m3": 1e-6, "width_m": 0.05}
+        pressure = solve_load_case({"kind": "pressure", "magnitude_pa": 1000.0},
+                                   pressure_structure, material)
+        self.assertTrue(any(
+            "support unspecified: defaulted to cantilever" in item
+            for item in pressure.assumptions
+        ))
+
+    def test_ss_beam_point_load_location_honored(self):
+        structure = self.beam_structure(support="simply_supported")
+        material = {"young_modulus_pa": 200e9, "poissons_ratio": 0.3}
+        x0 = 0.03
+        load = {"kind": "force", "force_n": 10.0, "point_load": True, "location": (x0, 0.0)}
+        res = solve_load_case(load, structure, material)
+        b = 0.1 - x0
+        expected = 10.0 * x0 * x0 * b * b / (3.0 * 200e9 * 1e-8 * 0.1)
+        self.assertAlmostEqual(res.max_displacement_m, expected, places=12)
+        self.assertAlmostEqual(res.reactions["R1"], 10.0 * b / 0.1, places=12)
+        self.assertAlmostEqual(res.reactions["R2"], 10.0 * x0 / 0.1, places=12)
+        self.assertTrue(any("x0 = 0.03" in item for item in res.assumptions))
+
+    def test_cantilever_beam_point_load_location_honored(self):
+        structure = self.beam_structure(support="cantilever")
+        material = {"young_modulus_pa": 200e9, "poissons_ratio": 0.3}
+        load = {"kind": "force", "force_n": 10.0, "point_load": True, "location": 0.04}
+        res = solve_load_case(load, structure, material)
+        expected = 10.0 * 0.04 ** 3 / (3.0 * 200e9 * 1e-8)
+        self.assertAlmostEqual(res.max_displacement_m, expected, places=12)
+        self.assertAlmostEqual(res.reactions["M1"], -10.0 * 0.04, places=12)
+        self.assertAlmostEqual(res.reactions["R1"], 10.0, places=12)
+
+    def test_beam_point_load_default_location_disclosed(self):
+        structure = self.beam_structure(support="cantilever")
+        material = {"young_modulus_pa": 200e9, "poissons_ratio": 0.3}
+        res = solve_load_case({"kind": "force", "force_n": 10.0, "point_load": True},
+                              structure, material)
+        self.assertTrue(any("free tip" in item and "no location specified" in item
+                            for item in res.assumptions))
+
+    def test_beam_point_load_location_out_of_span_rejected(self):
+        structure = self.beam_structure(support="simply_supported")
+        material = {"young_modulus_pa": 200e9, "poissons_ratio": 0.3}
+        load = {"kind": "force", "force_n": 10.0, "point_load": True, "location": (0.2, 0.0)}
+        res = solve_load_case(load, structure, material)
+        self.assertEqual(res.validity, "inconclusive")
+        self.assertIn(INVALID_LOAD_LOCATION, res.flags)
+
+
+class PreflightBeamAndLoadTests(unittest.TestCase):
+    """Audit finding S7: preflight mirrors solve_load_case validation."""
+
+    def test_preflight_beam_missing_dims_produce_issues(self):
+        structure = {"type": "beam", "L_m": 0.1, "support": "cantilever"}
+        material = {"young_modulus_pa": 200e9, "poissons_ratio": 0.3}
+        issues = preflight_structural_case({"kind": "force", "force_n": 10.0},
+                                           structure, material)
+        codes = [item["code"] for item in issues]
+        self.assertIn(MISSING_BEAM_DIMENSION, codes)
+        messages = " ".join(item["message"] for item in issues)
+        self.assertIn("I_m4", messages)
+        self.assertIn("A_m2", messages)
+        self.assertEqual(issues[0]["severity"], "error")
+
+    def test_preflight_beam_pressure_requires_width(self):
+        structure = {"type": "beam", "L_m": 0.1, "I_m4": 1e-8, "A_m2": 1e-4}
+        material = {"young_modulus_pa": 200e9, "poissons_ratio": 0.3}
+        issues = preflight_structural_case({"kind": "pressure", "magnitude_pa": 1000.0},
+                                           structure, material)
+        codes = [item["code"] for item in issues]
+        self.assertIn(MISSING_BEAM_DIMENSION, codes)
+        self.assertIn("width_m", " ".join(item["message"] for item in issues))
+
+    def test_preflight_mapping_magnitude_accepted(self):
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        material = {"young_modulus_pa": 2e9, "poissons_ratio": 0.35}
+        issues = preflight_structural_case(
+            {"kind": "pressure", "magnitude_pa": {"value": 1.0, "unit": "kPa"}},
+            structure, material,
+        )
+        codes = [item["code"] for item in issues]
+        self.assertNotIn(MISSING_LOAD_MAGNITUDE, codes)
+        self.assertNotIn(INVALID_LOAD_UNITS, codes)
+
+    def test_preflight_unknown_load_kind_issue(self):
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        material = {"young_modulus_pa": 2e9, "poissons_ratio": 0.35}
+        issues = preflight_structural_case({"kind": "shear", "force_n": 1.0},
+                                           structure, material)
+        self.assertIn(UNKNOWN_LOAD_KIND, [item["code"] for item in issues])
+
+    def test_preflight_temperature_out_of_range_issue(self):
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002,
+                     "temperature_k": 453.15}
+        material = {"young_modulus_pa": 2e9, "poissons_ratio": 0.35, "name": "ABS",
+                    "continuous_use_temperature_min_k": 233.15,
+                    "continuous_use_temperature_max_k": 363.15}
+        issues = preflight_structural_case({"kind": "pressure", "magnitude_pa": 1000.0},
+                                           structure, material)
+        self.assertIn(USAGE_TEMPERATURE_OUT_OF_RANGE, [item["code"] for item in issues])
+
+
+class DistinctFlagEmissionTests(unittest.TestCase):
+    """Audit finding F11: the overloaded UNSUPPORTED_STIFFNESS_REDUCTION flag
+    is supplemented by distinct constants, both emitted for compatibility."""
+
+    def test_missing_beam_dimension_emits_both_flags(self):
+        structure = {"type": "beam", "L_m": 0.1, "A_m2": 1e-4}
+        material = {"young_modulus_pa": 200e9, "poissons_ratio": 0.3}
+        res = solve_load_case({"kind": "force", "force_n": 10.0}, structure, material)
+        self.assertIn(MISSING_BEAM_DIMENSION, res.flags)
+        self.assertIn(UNSUPPORTED_STIFFNESS_REDUCTION, res.flags)
+        self.assertEqual(res.validity, "inconclusive")
+
+    def test_missing_load_magnitude_emits_both_flags(self):
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        material = {"young_modulus_pa": 2e9, "poissons_ratio": 0.35}
+        res = solve_load_case({"kind": "pressure"}, structure, material)
+        self.assertIn(MISSING_LOAD_MAGNITUDE, res.flags)
+        self.assertIn(UNSUPPORTED_STIFFNESS_REDUCTION, res.flags)
+
+    def test_unknown_load_kind_emits_both_flags(self):
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        material = {"young_modulus_pa": 2e9, "poissons_ratio": 0.35}
+        res = solve_load_case({"kind": "shear", "force_n": 1.0}, structure, material)
+        self.assertIn(UNKNOWN_LOAD_KIND, res.flags)
+        self.assertIn(UNSUPPORTED_STIFFNESS_REDUCTION, res.flags)
+        self.assertEqual(res.validity, "inconclusive")
+
+
+class DeterminismTests(unittest.TestCase):
+    """Outputs must be byte-deterministic across repeated runs."""
+
+    def test_solve_load_case_outputs_identical_across_runs(self):
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002,
+                     "temperature_k": 600.0}
+        material = builtin_materials()["ABS"]
+        load = {"kind": "force", "force_n": 5.0, "point_load": True}
+        first = solve_load_case(load, structure, material).to_dict()
+        second = solve_load_case(load, structure, material).to_dict()
+        self.assertEqual(first, second)
+
+
+class NeverCrashContractTests(unittest.TestCase):
+    """Audit finding S3: solve_load_case must never let a ValueError escape."""
+
+    def test_injected_solver_failure_converts_to_flagged_inconclusive(self):
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        material = {"young_modulus_pa": 2e9, "poissons_ratio": 0.35}
+        original = physics_module.shell_panel_response
+
+        def boom(*args, **kwargs):
+            raise ValueError("injected dispatch failure")
+
+        physics_module.shell_panel_response = boom
+        try:
+            res = solve_load_case({"kind": "pressure", "magnitude_pa": 1000.0},
+                                  structure, material)
+        finally:
+            physics_module.shell_panel_response = original
+        self.assertEqual(res.validity, "inconclusive")
+        self.assertIn(SOLVER_EVALUATION_ERROR, res.flags)
+        self.assertTrue(any("injected dispatch failure" in item for item in res.assumptions))
+        json.dumps(res.to_dict())
+
+
+class VerificationRegressionTests(unittest.TestCase):
+    """Regression tests for the independent verification pass (physics.py)."""
+
+    def _beam_structure(self, **overrides):
+        structure = {
+            "type": "beam",
+            "L_m": 0.1,
+            "I_m4": 1e-11,
+            "A_m2": 1e-4,
+            "section_modulus_m3": 1e-6,
+        }
+        structure.update(overrides)
+        return structure
+
+    def test_material_definition_with_none_properties_never_crashes(self):
+        # Verification MEDIUM finding: MaterialDefinition(properties=None)
+        # raised AttributeError out of solve_load_case and preflight,
+        # violating the never-crash contract.
+        definition = replace(builtin_materials()["ABS"], properties=None)
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        res = solve_load_case({"kind": "pressure", "magnitude_pa": 1000.0},
+                              structure, definition)
+        self.assertIn(UNSUPPORTED_STIFFNESS_REDUCTION, res.flags)
+        issues = preflight_structural_case({"kind": "pressure", "magnitude_pa": 1000.0},
+                                           structure, definition)
+        codes = [issue["code"] for issue in issues]
+        self.assertIn(UNSUPPORTED_STIFFNESS_REDUCTION, codes)
+
+    def test_material_snapshot_nested_properties_unwrapped(self):
+        # A MaterialDefinition.to_dict() snapshot nests the property payload
+        # under "properties" with Quantity encodings; the Mapping branch must
+        # unwrap it so stiffness and derating are identical to the definition.
+        definition = builtin_materials()["ABS"]
+        snapshot = definition.to_dict()
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002,
+                     "temperature_k": 373.15}
+        load = {"kind": "pressure", "magnitude_pa": 1000.0}
+        from_snapshot = solve_load_case(load, structure, snapshot)
+        from_definition = solve_load_case(load, structure, definition)
+        self.assertNotIn(UNSUPPORTED_STIFFNESS_REDUCTION, from_snapshot.flags)
+        self.assertAlmostEqual(
+            from_snapshot.max_displacement_m, from_definition.max_displacement_m, places=12
+        )
+
+    def test_missing_section_modulus_flagged_not_silent(self):
+        structure = self._beam_structure()
+        del structure["section_modulus_m3"]
+        res = solve_load_case({"kind": "force", "force_n": 1.0}, structure,
+                              {"young_modulus_pa": 2e9, "poissons_ratio": 0.35})
+        self.assertIn(MISSING_BEAM_DIMENSION, res.flags)
+        self.assertTrue(any("section_modulus_m3 missing" in item for item in res.assumptions))
+        issues = preflight_structural_case({"kind": "force", "force_n": 1.0}, structure,
+                                           {"young_modulus_pa": 2e9, "poissons_ratio": 0.35})
+        self.assertTrue(any(issue["code"] == MISSING_BEAM_DIMENSION for issue in issues))
+
+    def test_non_numeric_temperature_flagged_not_silent(self):
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002,
+                     "temperature_k": "hot"}
+        res = solve_load_case({"kind": "pressure", "magnitude_pa": 1000.0},
+                              structure, {"young_modulus_pa": 2e9, "poissons_ratio": 0.35})
+        self.assertIn(INVALID_TEMPERATURE_K, res.flags)
+        self.assertTrue(any("derating skipped" in item for item in res.assumptions))
+        issues = preflight_structural_case({"kind": "pressure", "magnitude_pa": 1000.0},
+                                           structure, {"young_modulus_pa": 2e9, "poissons_ratio": 0.35})
+        self.assertTrue(any(issue["code"] == INVALID_TEMPERATURE_K for issue in issues))
+
+    def test_magnitude_with_unit_but_no_value_is_missing(self):
+        structure = {"type": "shell_panel", "a_m": 0.1, "b_m": 0.1, "t_m": 0.002}
+        res = solve_load_case({"kind": "pressure", "magnitude_pa": {"unit": "Pa"}},
+                              structure, {"young_modulus_pa": 2e9, "poissons_ratio": 0.35})
+        self.assertIn(MISSING_LOAD_MAGNITUDE, res.flags)
+
+    def test_unknown_beam_support_disclosed(self):
+        structure = self._beam_structure(support="hinged")
+        res = solve_load_case({"kind": "force", "force_n": 1.0}, structure,
+                              {"young_modulus_pa": 2e9, "poissons_ratio": 0.35})
+        self.assertIn(UNKNOWN_BEAM_SUPPORT, res.flags)
+        self.assertTrue(any("hinged" in item for item in res.assumptions))
+        issues = preflight_structural_case({"kind": "force", "force_n": 1.0}, structure,
+                                           {"young_modulus_pa": 2e9, "poissons_ratio": 0.35})
+        self.assertTrue(any(issue["code"] == UNKNOWN_BEAM_SUPPORT for issue in issues))
+
+    def test_single_sided_temperature_range_enforced(self):
+        # Only the max continuous-use bound present; T beyond it must flag.
+        from mouse_sim.physics import _material_props, _usage_temperature_out_of_range
+        _, _, _, info = _material_props({
+            "young_modulus_pa": 2e9, "poissons_ratio": 0.35,
+            "continuous_use_temperature_max_k": 343.15,
+        }, 353.15)
+        self.assertTrue(_usage_temperature_out_of_range(info))
 
 
 if __name__ == "__main__":

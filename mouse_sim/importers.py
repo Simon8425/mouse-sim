@@ -8,8 +8,66 @@ import struct
 from typing import Any, Mapping, Optional, Tuple
 
 from .errors import UnitError
-from .geometry import TriangleMesh, geometry_from_dict
+from .geometry import TriangleMesh, edge_topology, geometry_from_dict
 from .units import normalize_unit, unit_dimension
+
+# Content-addressed cache of parsed + repaired mesh geometry.  The pipeline
+# re-parses and re-certifies the same uploaded geometry on every analyze
+# request (a 46-part, 257k-triangle STEP assembly takes ~34 s of
+# self-intersection certification per run); the geometry dict is immutable
+# and ``geometry_from_dict`` + ``repair_open_mesh`` are pure, so caching the
+# repaired mesh (whose diagnostics caches are warm) is deterministic and
+# safe.  Bounded so server memory stays flat; eviction only costs a re-parse.
+from collections import OrderedDict
+from threading import RLock
+
+# Sized for several full multi-part assemblies at once (a 46-part model
+# needs 46 entries); each entry holds one part's parsed mesh.
+_GEOMETRY_CACHE_MAX_ENTRIES = 512
+_geometry_cache = OrderedDict()
+_geometry_cache_lock = RLock()
+
+
+def _geometry_cache_get(key):
+    with _geometry_cache_lock:
+        if key not in _geometry_cache:
+            return None
+        _geometry_cache.move_to_end(key)
+        return _geometry_cache[key]
+
+
+def _geometry_cache_put(key, value):
+    with _geometry_cache_lock:
+        _geometry_cache[key] = value
+        _geometry_cache.move_to_end(key)
+        while len(_geometry_cache) > _GEOMETRY_CACHE_MAX_ENTRIES:
+            _geometry_cache.popitem(last=False)
+
+
+def parse_and_repair_geometry(geometry_data, units=None):
+    """Parse a geometry dict and weld-repair it, caching the result.
+
+    Returns ``(geometry, repair_diagnostics)`` like
+    :func:`repair_open_mesh` (``repair_diagnostics`` is empty when no repair
+    was applied).  The result is cached by the geometry dict's canonical
+    content hash, so repeat analyzes of the same uploaded model skip the
+    expensive parse + weld + self-intersection certification entirely.  The
+    cache is bounded and process-local; eviction only re-runs the (pure,
+    deterministic) computation.
+    """
+    from .canonical import sha256_content
+
+    key = sha256_content(geometry_data)
+    cached = _geometry_cache_get(key)
+    if cached is not None:
+        geometry, repair_diagnostics = cached
+        return geometry, tuple(repair_diagnostics)
+    geometry = geometry_from_dict(geometry_data, units=units)
+    repair_diagnostics = ()
+    if isinstance(geometry, TriangleMesh):
+        geometry, repair_diagnostics = repair_open_mesh(geometry)
+    _geometry_cache_put(key, (geometry, tuple(repair_diagnostics)))
+    return geometry, tuple(repair_diagnostics)
 
 
 @dataclass(frozen=True)
@@ -1785,6 +1843,139 @@ def _mesh_diagnostics(mesh):
     return tuple(values)
 
 
+# Seam-stitching weld tolerance as a fraction of the mesh's own diagonal.
+# STEP/STL tessellation often duplicates the vertices along an intended seam
+# by a small numerical difference; welding anything closer than this
+# tolerance closes the seam without risking distinct geometry (typically
+# 1 um on a 100 mm part).
+MESH_WELD_TOLERANCE_FRACTION = 1e-5
+
+# Meshes above this triangle count skip the weld-repair attempt: the edge
+# passes and candidate diagnostics would cost seconds on multi-hundred-
+# thousand-triangle flattened assemblies for (usually) no seam-stitching
+# gain.  The envelope mass fallback still applies to them.
+MESH_REPAIR_TRIANGLE_LIMIT = 250000
+
+
+def _weld_vertices(vertices, triangles, tolerance):
+    """Merge vertices closer than ``tolerance`` (union-find over a hash grid)."""
+    if not vertices or tolerance <= 0.0:
+        return list(vertices), list(triangles)
+    origin = (min(vertex[0] for vertex in vertices), min(vertex[1] for vertex in vertices), min(vertex[2] for vertex in vertices))
+    parent = list(range(len(vertices)))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(first, second):
+        root_first, root_second = find(first), find(second)
+        if root_first != root_second:
+            parent[root_second] = root_first
+
+    def cell_key(vertex):
+        return (
+            int(math.floor((vertex[0] - origin[0]) / tolerance)),
+            int(math.floor((vertex[1] - origin[1]) / tolerance)),
+            int(math.floor((vertex[2] - origin[2]) / tolerance)),
+        )
+
+    grid = {}
+    for index, vertex in enumerate(vertices):
+        grid.setdefault(cell_key(vertex), []).append(index)
+    for index, vertex in enumerate(vertices):
+        cx, cy, cz = cell_key(vertex)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    for candidate in grid.get((cx + dx, cy + dy, cz + dz), ()):
+                        if candidate <= index:
+                            continue
+                        other = vertices[candidate]
+                        if all(abs(vertex[axis] - other[axis]) <= tolerance for axis in range(3)):
+                            union(index, candidate)
+    remap = {}
+    welded = []
+    for index in range(len(vertices)):
+        root = find(index)
+        if root not in remap:
+            remap[root] = len(welded)
+            welded.append(vertices[index])
+    rebuilt = []
+    for triangle in triangles:
+        mapped = tuple(remap[find(index)] for index in triangle)
+        if len(set(mapped)) == 3:
+            rebuilt.append(mapped)
+    return welded, rebuilt
+
+
+def repair_open_mesh(mesh):
+    """Attempt a conservative seam-stitch weld on an open triangle mesh.
+
+    Welding only merges vertices already coincident within a small tolerance
+    (a fraction of the mesh diagonal) — it never fabricates geometry.  The
+    repaired mesh is accepted ONLY when its topology then certifies safe
+    solid mass properties; otherwise the original mesh is returned untouched
+    (with no repair claim).  Returns ``(geometry, repair_diagnostics)`` where
+    ``geometry`` is the repaired mesh or the original, and diagnostics are
+    empty unless a repair was actually applied.
+    """
+    if not isinstance(mesh, TriangleMesh):
+        return mesh, ()
+    # Edge-level precheck only: a mesh that is clearly open at the edge
+    # level needs no full diagnostic pass on the ORIGINAL — the welded
+    # candidate's diagnostics below are the certification, and the original's
+    # self-intersection sweep is wasted work when the mesh is open (real
+    # tessellated shells are open; the sweep is the dominant cost of the
+    # drop-test pipeline on a 46-part STEP assembly).  A mesh that is closed
+    # at the edge level is checked as-is first (the historical fast path).
+    boundary, nonmanifold, degenerate, inconsistent = edge_topology(mesh.vertices, mesh.triangles)
+    if not (boundary or nonmanifold or degenerate or inconsistent):
+        if mesh.diagnostics().safe_for_mass_properties:
+            return mesh, ()
+        # Edge-closed but unsafe (e.g. degenerate, inconsistent winding, or
+        # self-intersecting): no weld can fix those, so there is nothing to
+        # repair.
+        return mesh, ()
+    # Bounded cost: oversized flattened assemblies are never weld-candidates.
+    if len(mesh.triangles) > MESH_REPAIR_TRIANGLE_LIMIT:
+        return mesh, ()
+    bounds = mesh.bounds()
+    size = bounds.size
+    diagonal = math.sqrt(sum(item * item for item in size)) if all(item > 0.0 for item in size) else 0.0
+    if diagonal <= 0.0:
+        return mesh, ()
+    tolerance = max(1e-12, diagonal * MESH_WELD_TOLERANCE_FRACTION)
+    welded, rebuilt = _weld_vertices(mesh.vertices, mesh.triangles, tolerance)
+    if len(welded) == len(mesh.vertices) and len(rebuilt) == len(mesh.triangles):
+        return mesh, ()
+    # Cheap edge-level precheck on the raw welded arrays (no components,
+    # nesting, or self-intersection sweeps): most genuinely open shells stay
+    # open after welding, and only a candidate that is closed at the edge
+    # level is worth a full diagnostic pass for certification.
+    boundary, nonmanifold, degenerate, inconsistent = edge_topology(welded, rebuilt)
+    if boundary or nonmanifold or degenerate or inconsistent:
+        return mesh, ()
+    repaired = TriangleMesh(welded, rebuilt, units=mesh.units, transform=mesh.transform)
+    diagnostics = repaired.diagnostics()
+    if not diagnostics.safe_for_mass_properties:
+        return mesh, ()
+    details = {
+        "merged_vertices": str(len(mesh.vertices) - len(welded)),
+        "removed_degenerate_triangles": str(len(mesh.triangles) - len(rebuilt)),
+        "tolerance_m": "{:.6g}".format(tolerance),
+        "boundary_edges_after": str(diagnostics.boundary_edges),
+    }
+    return repaired, (_diagnostic(
+        "mesh_weld_repair",
+        "info",
+        "open mesh seams were stitched by welding coincident vertices; mass properties are now certified",
+        **details,
+    ),)
+
+
 def load_geometry(
     path_or_bytes,
     fmt="auto",
@@ -1835,13 +2026,15 @@ def load_geometry(
         return _result(geometry, "json", payload_units, source_name, payload=payload, diagnostics=_mesh_diagnostics(geometry) if isinstance(geometry, TriangleMesh) else ())
     if format_name == "obj":
         geometry, diagnostics = _parse_obj(data, source_units)
-        return _result(geometry, "obj", source_units, source_name, diagnostics=tuple(diagnostics) + _mesh_diagnostics(geometry))
+        geometry, repair_diagnostics = repair_open_mesh(geometry)
+        return _result(geometry, "obj", source_units, source_name, diagnostics=tuple(diagnostics) + _mesh_diagnostics(geometry) + repair_diagnostics)
     if format_name == "stl":
         if _looks_binary_stl(data):
             geometry = _parse_binary_stl(data, source_units)
         else:
             geometry = _parse_ascii_stl(data, source_units)
-        return _result(geometry, "stl", source_units, source_name, diagnostics=_mesh_diagnostics(geometry))
+        geometry, repair_diagnostics = repair_open_mesh(geometry)
+        return _result(geometry, "stl", source_units, source_name, diagnostics=_mesh_diagnostics(geometry) + repair_diagnostics)
     if format_name == "step":
         from .step_kernel import (
             StepKernelFailure,
@@ -1911,25 +2104,27 @@ def load_geometry(
                     diagnostics=tuple(failure_diagnostics),
                     unsupported=True,
                 )
+            geometry, repair_diagnostics = repair_open_mesh(geometry) if isinstance(geometry, TriangleMesh) else (geometry, ())
             mesh_diagnostics = _mesh_diagnostics(geometry) if isinstance(geometry, TriangleMesh) else ()
             return _result(
                 geometry,
                 "step",
                 step_units,
                 source_name,
-                diagnostics=tuple(kernel_diagnostics) + mesh_diagnostics,
+                diagnostics=tuple(kernel_diagnostics) + mesh_diagnostics + repair_diagnostics,
                 display_asset=display_asset,
             )
 
         geometry, step_units, diagnostics = _parse_step(data)
         unsupported = geometry is None
+        geometry, repair_diagnostics = repair_open_mesh(geometry) if isinstance(geometry, TriangleMesh) else (geometry, ())
         mesh_diagnostics = _mesh_diagnostics(geometry) if isinstance(geometry, TriangleMesh) else ()
         return _result(
             geometry,
             "step",
             step_units,
             source_name,
-            diagnostics=tuple(diagnostics) + mesh_diagnostics,
+            diagnostics=tuple(diagnostics) + mesh_diagnostics + repair_diagnostics,
             unsupported=unsupported,
         )
     if format_name == "mesh":
@@ -1939,4 +2134,4 @@ def load_geometry(
     raise ValueError("unsupported geometry format: {!r}".format(format_name))
 
 
-__all__ = ["ImportDiagnostic", "GeometryLoadResult", "load_geometry", "geometry_from_dict"]
+__all__ = ["ImportDiagnostic", "GeometryLoadResult", "load_geometry", "geometry_from_dict", "repair_open_mesh"]

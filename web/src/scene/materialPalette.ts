@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { decorateForFea, type FeaUniforms } from './feaStressShader';
 
 export type QualityTier = 'ultra' | 'high' | 'medium' | 'low';
 export type PaletteKey = 'shell' | 'pcb' | 'battery' | 'metal' | 'skate' | 'default';
@@ -81,4 +82,64 @@ export class MaterialPalette {
     }
     this.materials.clear();
   }
+}
+
+/**
+ * Per-geometry cache of FEA-decorated material clones.
+ *
+ * Decoration via onBeforeCompile must NEVER be applied to a SHARED palette
+ * material: damage data is per-vertex but the hook (and its defines) is
+ * material-level, so decorating the shared instance would leak state across
+ * every object that uses it. Instead each decoration owns a CLONE
+ * (`userData.owned = true`, `userData.feaSource = base`), so the shared
+ * palette stays pristine and the existing owned-resource disposal convention
+ * (disposeObjectGroup) releases the clone correctly.
+ *
+ * The clone is cached per (geometry, base) pair. `clear()` forgets the cache
+ * (the runtime agent calls it on mode switches back to default); it does NOT
+ * dispose clones — disposal stays with the scene's owned-resource path.
+ */
+export class FeaMaterialCache {
+  private entries = new WeakMap<
+    THREE.BufferGeometry,
+    { base: THREE.MeshStandardMaterial; clone: THREE.MeshStandardMaterial }
+  >();
+
+  get(
+    base: THREE.MeshStandardMaterial,
+    geometry: THREE.BufferGeometry,
+    uniforms?: FeaUniforms,
+  ): THREE.MeshStandardMaterial {
+    // Attribute-less geometry (analytic primitives) is still decorated: the
+    // shader evaluates the same Gaussian procedurally from the uniforms,
+    // which keeps heatmaps consistent across the whole assembly.
+    const existing = this.entries.get(geometry);
+    if (existing && existing.base === base) return existing.clone;
+
+    const clone = base.clone();
+    clone.userData.owned = true;
+    clone.userData.feaSource = base;
+    decorateForFea(clone, geometry, uniforms);
+    this.entries.set(geometry, { base, clone });
+    return clone;
+  }
+
+  clear(): void {
+    this.entries = new WeakMap();
+  }
+}
+
+const globalFeaMaterialCache = new FeaMaterialCache();
+
+/**
+ * Convenience wrapper over a module-level FeaMaterialCache: returns the same
+ * material instance when the geometry is not FEA-capable, else the decorated
+ * owned clone. Cached per geometry so repeated calls are cheap.
+ */
+export function feaDecoratedMaterial(
+  base: THREE.MeshStandardMaterial,
+  geometry: THREE.BufferGeometry,
+  uniforms?: FeaUniforms,
+): THREE.MeshStandardMaterial {
+  return globalFeaMaterialCache.get(base, geometry, uniforms);
 }

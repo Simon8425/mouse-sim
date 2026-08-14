@@ -10,7 +10,7 @@ export interface TopBarProps {
 }
 
 export function TopBar(props: TopBarProps): React.ReactElement {
-  const { state } = useProjectStore();
+  const { state, dispatch } = useProjectStore();
   const sourceReadyLabel = selectSourceLabel(state);
 
   let sourceLabel: string;
@@ -28,14 +28,13 @@ export function TopBar(props: TopBarProps): React.ReactElement {
     <header className="top-bar">
       <div className="top-bar__brand">
         <svg className="top-bar__logo-icon" width="14" height="14" viewBox="0 0 16 16" fill="none">
-          <rect width="16" height="16" fill="var(--text-primary)" />
-          <path d="M3 13L13 3" stroke="var(--on-primary)" strokeWidth="2" />
+          <rect width="16" height="16" rx="3" fill="var(--text-primary)" />
+          <path d="M4 12L12 4" stroke="var(--bg-primary)" strokeWidth="2" strokeLinecap="round" />
         </svg>
         <h1 className="top-bar__app-name">Mouse Sim</h1>
       </div>
 
       <div className="top-bar__meta-item">
-        <span className="top-bar__meta-label">Model</span>
         <span className="top-bar__meta-value" title={sourceLabel}>
           {sourceLabel}
         </span>
@@ -46,6 +45,16 @@ export function TopBar(props: TopBarProps): React.ReactElement {
       <RunStatus />
 
       <div className="top-bar__actions">
+        <button
+          type="button"
+          className="btn btn--primary"
+          aria-label="Run Population analysis (10k units)"
+          title="Run 10,000-unit Monte Carlo population drop simulation"
+          disabled={state.runStatus === 'loading' || state.runStatus === 'running'}
+          onClick={() => dispatch({ type: 'RUN_POPULATION' })}
+        >
+          Population (10k)
+        </button>
         <button
           type="button"
           className={`btn${state.navOpen ? ' is-active' : ''}`}

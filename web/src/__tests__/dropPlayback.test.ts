@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { floorCorrectionForModel, resolveDropSample, rotatedBoundsMinZ } from '../scene/sceneRuntime';
+import {
+  exactModelLowestZ,
+  floorCorrectionForModel,
+  impactWindowProgress,
+  resolveDropSample,
+  rotatedBoundsMinZ,
+} from '../scene/sceneRuntime';
 import { resolveActiveDrop } from '../scene/SceneViewport';
 import type { DropSimulationDrop, DropTrajectorySample } from '../api/contracts';
 import * as THREE from 'three';
@@ -99,6 +105,66 @@ describe('rotatedBoundsMinZ', () => {
   it('falls back to the static minimum for non-finite quaternions', () => {
     const q = new THREE.Quaternion(Number.NaN, 0, 0, 1);
     expect(rotatedBoundsMinZ(MIN, MAX, q)).toBeCloseTo(-0.03, 10);
+  });
+});
+
+describe('exactModelLowestZ', () => {
+  const BOX_VERTICES: [number, number, number][] = [
+    [-0.05, -0.05, -0.03], [0.05, -0.05, -0.03], [-0.05, 0.05, -0.03], [0.05, 0.05, -0.03],
+    [-0.05, -0.05, 0.05], [0.05, -0.05, 0.05], [-0.05, 0.05, 0.05], [0.05, 0.05, 0.05],
+  ];
+
+  it('is exact for the identity orientation', () => {
+    expect(exactModelLowestZ(BOX_VERTICES, new THREE.Quaternion())).toBeCloseTo(-0.03, 10);
+  });
+
+  it('rests flush where the conservative AABB bound over-lifts', () => {
+    // An octahedron (like a rounded mouse shell) has EMPTY AABB corners: the
+    // rotated AABB corner hull dips below every real vertex, so the
+    // conservative clamp over-lifts. The exact vertex bound stays flush.
+    const r = 0.05;
+    const OCTA: [number, number, number][] = [
+      [r, 0, 0], [-r, 0, 0], [0, r, 0], [0, -r, 0], [0, 0, r], [0, 0, -r],
+    ];
+    const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 4);
+    const exact = exactModelLowestZ(OCTA, q);
+    const conservative = rotatedBoundsMinZ(
+      [-r, -r, -r],
+      [r, r, r],
+      q,
+    );
+    // The exact lowest point is ABOVE the conservative bound (never below),
+    // so clamping with it leaves the model flush instead of floating.
+    expect(exact).toBeGreaterThan(conservative);
+    expect(exact).toBeCloseTo(-r / Math.SQRT2, 8);
+    expect(conservative).toBeCloseTo(-r * Math.SQRT2, 8);
+  });
+
+  it('returns Infinity for empty vertices or non-finite quaternions', () => {
+    expect(exactModelLowestZ([], new THREE.Quaternion())).toBe(Infinity);
+    expect(exactModelLowestZ(BOX_VERTICES, new THREE.Quaternion(Number.NaN, 0, 0, 1))).toBe(Infinity);
+  });
+});
+
+describe('impactWindowProgress', () => {
+  it('is 0 before the impact and 1 after the window elapses', () => {
+    expect(impactWindowProgress(0.2, 0.3, 0.3)).toBe(0);
+    expect(impactWindowProgress(0.3, 0.3, 0.3)).toBe(0);
+    expect(impactWindowProgress(0.6, 0.3, 0.3)).toBe(1);
+    expect(impactWindowProgress(5, 0.3, 0.3)).toBe(1);
+  });
+
+  it('interpolates linearly through the window', () => {
+    expect(impactWindowProgress(0.45, 0.3, 0.3)).toBeCloseTo(0.5, 8);
+    expect(impactWindowProgress(0.39, 0.3, 0.3)).toBeCloseTo(0.3, 8);
+  });
+
+  it('returns 0 for missing or non-positive window durations', () => {
+    expect(impactWindowProgress(0.5, 0.3, 0)).toBe(0);
+    expect(impactWindowProgress(0.5, 0.3, -1)).toBe(0);
+    expect(impactWindowProgress(0.5, 0.3, Number.NaN)).toBe(0);
+    expect(impactWindowProgress(Number.NaN, 0.3, 0.3)).toBe(0);
+    expect(impactWindowProgress(0.5, Number.NaN, 0.3)).toBe(0);
   });
 });
 

@@ -1,5 +1,12 @@
 import * as THREE from 'three';
-import type { Vec3, GeometryJson, RigidTransformJson, CompoundGeometryJson } from '../api/contracts';
+import type {
+  Vec3,
+  GeometryJson,
+  RigidTransformJson,
+  CompoundGeometryJson,
+  FeaObjectField,
+  FeaResult,
+} from '../api/contracts';
 import { IDENTITY_TRANSFORM } from '../api/contracts';
 import { paletteKeyForComponent, type PaletteKey, type QualityTier } from './materialPalette';
 
@@ -186,6 +193,21 @@ export function createObjectGroup(entry: ObjectSceneEntry, opts?: FactoryOptions
     return mat;
   }
 
+  /**
+   * Attach the zero-filled FEA vertex attributes (aDamage/aDisplacement) to a
+   * primitive geometry so the decorated shader compiles with the attribute
+   * path and applyFeaPlateField() can fill real values — mirrors the 'mesh'
+   * case which attaches them at build time.
+   */
+  function attachFeaAttributes(geometry: THREE.BufferGeometry): void {
+    const vertexCount = geometry.attributes.position.count;
+    geometry.setAttribute('aDamage', new THREE.BufferAttribute(new Float32Array(vertexCount), 1));
+    geometry.setAttribute(
+      'aDisplacement',
+      new THREE.BufferAttribute(new Float32Array(vertexCount * 3), 3),
+    );
+  }
+
   function buildMesh(geometry: GeometryJson): THREE.Mesh | null {
     if (!isSafeGeometry(geometry) || geometry.type === 'compound') return null;
     if (geometry.type === 'mesh' && (geometry.vertices.length === 0 || geometry.triangles.length === 0)) {
@@ -222,11 +244,13 @@ export function createObjectGroup(entry: ObjectSceneEntry, opts?: FactoryOptions
         case 'box': {
           const size = geometry.size as Vec3;
           createdGeometry = new THREE.BoxGeometry(size[0], size[1], size[2]);
+          attachFeaAttributes(createdGeometry);
           mesh = new THREE.Mesh(createdGeometry, material);
           break;
         }
         case 'sphere': {
           createdGeometry = new THREE.SphereGeometry(geometry.radius, sphereSegments, sphereRings);
+          attachFeaAttributes(createdGeometry);
           mesh = new THREE.Mesh(createdGeometry, material);
           break;
         }
@@ -240,6 +264,7 @@ export function createObjectGroup(entry: ObjectSceneEntry, opts?: FactoryOptions
           geometryCyl.rotateX(Math.PI / 2);
           geometryCyl.translate(0, 0, geometry.height / 2);
           createdGeometry = geometryCyl;
+          attachFeaAttributes(createdGeometry);
           mesh = new THREE.Mesh(createdGeometry, material);
           break;
         }
@@ -252,6 +277,7 @@ export function createObjectGroup(entry: ObjectSceneEntry, opts?: FactoryOptions
           geometryCone.rotateX(Math.PI / 2);
           geometryCone.translate(0, 0, geometry.height / 2);
           createdGeometry = geometryCone;
+          attachFeaAttributes(createdGeometry);
           mesh = new THREE.Mesh(createdGeometry, material);
           break;
         }
@@ -265,6 +291,7 @@ export function createObjectGroup(entry: ObjectSceneEntry, opts?: FactoryOptions
           geometryFrustum.rotateX(Math.PI / 2);
           geometryFrustum.translate(0, 0, geometry.height / 2);
           createdGeometry = geometryFrustum;
+          attachFeaAttributes(createdGeometry);
           mesh = new THREE.Mesh(createdGeometry, material);
           break;
         }
@@ -279,17 +306,29 @@ export function createObjectGroup(entry: ObjectSceneEntry, opts?: FactoryOptions
           const bufferGeometry = new THREE.BufferGeometry();
           createdGeometry = bufferGeometry;
           bufferGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-          const indexFlat: number[] = [];
-          for (const triangle of geometry.triangles) {
-            indexFlat.push(triangle[0], triangle[1], triangle[2]);
-          }
+          const triangleCount = geometry.triangles.length;
           const vertexCount = vertices.length;
-          if (vertexCount <= 65535) {
-            bufferGeometry.setIndex(new THREE.BufferAttribute(new Uint16Array(indexFlat), 1));
-          } else {
-            bufferGeometry.setIndex(new THREE.BufferAttribute(new Uint32Array(indexFlat), 1));
+          const indices =
+            vertexCount <= 65535
+              ? new Uint16Array(triangleCount * 3)
+              : new Uint32Array(triangleCount * 3);
+          for (let i = 0; i < triangleCount; i += 1) {
+            const tri = geometry.triangles[i];
+            indices[i * 3] = tri[0];
+            indices[i * 3 + 1] = tri[1];
+            indices[i * 3 + 2] = tri[2];
           }
+          bufferGeometry.setIndex(new THREE.BufferAttribute(indices, 1));
           bufferGeometry.computeVertexNormals();
+          // FEA per-vertex attributes (~16 bytes/vertex): zero-filled damage
+          // (itemSize 1) and displacement (itemSize 3). They exist on ALL
+          // meshes so the decorated FEA shader always compiles and renders
+          // identically until applyFeaObjectField() writes real values.
+          bufferGeometry.setAttribute('aDamage', new THREE.BufferAttribute(new Float32Array(vertexCount), 1));
+          bufferGeometry.setAttribute(
+            'aDisplacement',
+            new THREE.BufferAttribute(new Float32Array(vertexCount * 3), 3),
+          );
           bufferGeometry.computeBoundingSphere();
           mesh = new THREE.Mesh(bufferGeometry, material);
           if (opts?.wireframe) {
@@ -456,6 +495,59 @@ function localBoundsOf(geometry: GeometryJson): Bounds | null {
 }
 
 /**
+ * Exact world-frame vertices of a geometry (meshes: every vertex transformed
+ * by the full parent/child chain; analytic primitives and unknown shapes:
+ * the 8 transformed AABB corners, which are conservative for curved shapes
+ * like spheres).  Used by the drop playback floor clamp to rest the model
+ * flush on the ground instead of floating on a conservative AABB bound.
+ */
+export function worldVerticesForGeometry(geometry: GeometryJson): Vec3[] {
+  const collected: Vec3[] = [];
+  collectWorldVertices(geometry, new THREE.Matrix4(), collected);
+  return collected;
+}
+
+function collectWorldVertices(geometry: unknown, parent: THREE.Matrix4, out: Vec3[]): void {
+  if (!isSafeGeometry(geometry)) return;
+  if (geometry.type === 'compound') {
+    if (!hasSafeTransform(geometry.transform)) return;
+    const matrix = new THREE.Matrix4().multiplyMatrices(parent, pythonTransformToMatrix4(geometry.transform));
+    if (!matrix.elements.every(isFiniteNumber)) return;
+    for (const child of geometry.children) {
+      collectWorldVertices(child, matrix, out);
+    }
+    return;
+  }
+  const matrix = new THREE.Matrix4().multiplyMatrices(parent, pythonTransformToMatrix4(geometry.transform));
+  if (!matrix.elements.every(isFiniteNumber)) return;
+  if (geometry.type === 'mesh') {
+    const vertices = geometry.vertices as Vec3[];
+    if (vertices.length === 0) return;
+    const point = new THREE.Vector3();
+    const stride = Math.max(1, Math.floor(vertices.length / 250));
+    for (let i = 0; i < vertices.length; i += stride) {
+      const vertex = vertices[i];
+      point.set(vertex[0], vertex[1], vertex[2]).applyMatrix4(matrix);
+      if (isFiniteNumber(point.x) && isFiniteNumber(point.y) && isFiniteNumber(point.z)) {
+        out.push([point.x, point.y, point.z]);
+      }
+    }
+    return;
+  }
+  const local = localBoundsOf(geometry);
+  if (!local) return;
+  for (let i = 0; i < 8; i += 1) {
+    const x = i & 1 ? local.max[0] : local.min[0];
+    const y = i & 2 ? local.max[1] : local.min[1];
+    const z = i & 4 ? local.max[2] : local.min[2];
+    const p = new THREE.Vector3(x, y, z).applyMatrix4(matrix);
+    if (isFiniteNumber(p.x) && isFiniteNumber(p.y) && isFiniteNumber(p.z)) {
+      out.push([p.x, p.y, p.z]);
+    }
+  }
+}
+
+/**
  * Dispose every owned resource under the group (geometries unconditionally,
  * materials only when marked owned) and detach the group from its parent.
  */
@@ -474,4 +566,163 @@ export function disposeObjectGroup(group: THREE.Object3D): void {
     }
   });
   group.removeFromParent();
+}
+
+/**
+ * Write a backend FeaObjectField into the mesh's `aDamage`/`aDisplacement`
+ * attributes (set once per result, not per frame; `needsUpdate` is flagged
+ * unconditionally). Returns false when the field's vertex_count does not match
+ * the geometry, or when the attributes are missing — the caller then falls
+ * back to the procedural path.
+ */
+export function applyFeaObjectField(mesh: THREE.Mesh, field: FeaObjectField): boolean {
+  const geometry = mesh.geometry;
+  const damage = geometry.getAttribute('aDamage');
+  const displacement = geometry.getAttribute('aDisplacement');
+  if (
+    !(damage instanceof THREE.BufferAttribute) ||
+    !(displacement instanceof THREE.BufferAttribute)
+  ) {
+    return false;
+  }
+  if (field.vertex_count !== damage.count || field.vertex_count !== displacement.count) {
+    return false;
+  }
+  const damageArray = damage.array as Float32Array;
+  const displacementArray = displacement.array as Float32Array;
+  for (let i = 0; i < field.vertex_count; i += 1) {
+    damageArray[i] = field.damage[i] ?? 0;
+    const offset = i * 3;
+    const d = field.displacement[i];
+    displacementArray[offset] = d ? d[0] : 0;
+    displacementArray[offset + 1] = d ? d[1] : 0;
+    displacementArray[offset + 2] = d ? d[2] : 0;
+  }
+  damage.needsUpdate = true;
+  displacement.needsUpdate = true;
+  return true;
+}
+
+/**
+ * Collect every `isMesh` descendant of a scene object group, in traversal
+ * order — the mesh list the runtime agent walks to apply FEA fields.
+ */
+/**
+ * Normalized von Mises bending-stress shape of a simply-supported rectangular
+ * plate under uniform pressure (Navier series, odd terms 1..15), mirrored
+ * 1:1 from the backend's `mouse_sim/fea.py` plate display field. The shape is
+ * dimensionless: the isotropic plate stiffness (D, p, 6/t^2) cancels in the
+ * normalization, leaving only the panel dimensions a/b and Poisson's ratio.
+ * (x, y) are PANEL coordinates in [0, a] x [0, b]; the maximum sits at the
+ * panel center (a/2, b/2).
+ */
+export function plateStressShape(x: number, y: number, a: number, b: number): number {
+  const NAVIER_TERMS = [1, 3, 5, 7, 9, 11, 13, 15];
+  // Isotropic Poisson ratio used by the moment combination (D12 = nu*D,
+  // D66 = D*(1-nu)/2). The backend uses the resolved material's value; the
+  // shape difference over polymer materials is a few percent.
+  const NU = 0.35;
+  let mxx = 0;
+  let myy = 0;
+  let mxy = 0;
+  for (const m of NAVIER_TERMS) {
+    const alpha = (Math.PI * m) / a;
+    const alpha2 = alpha * alpha;
+    const sinx = Math.sin(alpha * x);
+    const cosx = Math.cos(alpha * x);
+    const mOverA = m / a;
+    for (const n of NAVIER_TERMS) {
+      const beta = (Math.PI * n) / b;
+      const beta2 = beta * beta;
+      const nOverB = n / b;
+      const den = mOverA ** 4 + 2 * (mOverA ** 2) * (nOverB ** 2) + nOverB ** 4;
+      const coeff = 1 / (m * n * den);
+      const s = sinx * Math.sin(beta * y);
+      mxx += coeff * alpha2 * s;
+      myy += coeff * beta2 * s;
+      mxy += coeff * alpha * beta * cosx * Math.cos(beta * y);
+    }
+  }
+  const mx = -(mxx + NU * myy);
+  const my = -(NU * mxx + myy);
+  // 2*D66 = D*(1-nu) for the isotropic plate (D66 = D*(1-nu)/2).
+  const txy = (1 - NU) * mxy;
+  return Math.sqrt(Math.max(0, mx * mx + my * my - mx * my + 3 * txy * txy));
+}
+
+/**
+ * Fill `aDamage` for geometry WITHOUT a backend per-vertex field (analytic
+ * primitives): evaluate the plate display field on the mesh's own local
+ * vertices, mapping the bounding box onto the panel domain exactly like the
+ * backend (`x_panel = a/2 + (x - cx) * a/x_extent`), with a = max extent,
+ * b = min extent. The damage is min(1, sigma_peak/yield * raw/rawCenter) so
+ * the contour peak equals the shell peak stress. The dent displacement stays
+ * zero here — the shader's procedural dent complement covers primitives.
+ * Returns false when the geometry/field data is unusable.
+ */
+export function applyFeaPlateField(mesh: THREE.Mesh, fea: FeaResult): boolean {
+  const geometry = mesh.geometry;
+  const damageAttr = geometry.getAttribute('aDamage');
+  const positionAttr = geometry.getAttribute('position');
+  if (
+    !(damageAttr instanceof THREE.BufferAttribute) ||
+    !(positionAttr instanceof THREE.BufferAttribute)
+  ) {
+    return false;
+  }
+  const peakPa = fea.peak?.stress_pa;
+  const yieldPa = fea.yield_stress_pa;
+  if (
+    typeof peakPa !== 'number' ||
+    !Number.isFinite(peakPa) ||
+    peakPa <= 0 ||
+    typeof yieldPa !== 'number' ||
+    !Number.isFinite(yieldPa) ||
+    yieldPa <= 0
+  ) {
+    return false;
+  }
+  const positions = positionAttr.array as Float32Array;
+  const count = positionAttr.count;
+  let xmin = Infinity;
+  let xmax = -Infinity;
+  let ymin = Infinity;
+  let ymax = -Infinity;
+  for (let i = 0; i < count; i += 1) {
+    const x = positions[i * 3];
+    const y = positions[i * 3 + 1];
+    if (x < xmin) xmin = x;
+    if (x > xmax) xmax = x;
+    if (y < ymin) ymin = y;
+    if (y > ymax) ymax = y;
+  }
+  const xExtent = xmax - xmin;
+  const yExtent = ymax - ymin;
+  if (!(xExtent > 0) || !(yExtent > 0)) return false;
+  const a = Math.max(xExtent, yExtent);
+  const b = Math.min(xExtent, yExtent);
+  const cx = (xmin + xmax) / 2;
+  const cy = (ymin + ymax) / 2;
+  const centerRaw = plateStressShape(a / 2, b / 2, a, b);
+  if (!(centerRaw > 0) || !Number.isFinite(centerRaw)) return false;
+  const peakDamage = peakPa / yieldPa;
+  const damageArray = damageAttr.array as Float32Array;
+  for (let i = 0; i < count; i += 1) {
+    const xPanel = a / 2 + (positions[i * 3] - cx) * (a / xExtent);
+    const yPanel = b / 2 + (positions[i * 3 + 1] - cy) * (b / yExtent);
+    const raw = plateStressShape(xPanel, yPanel, a, b);
+    const damage =
+      raw > 0 && Number.isFinite(raw) ? Math.min(1, peakDamage * (raw / centerRaw)) : 0;
+    damageArray[i] = damage;
+  }
+  damageAttr.needsUpdate = true;
+  return true;
+}
+
+export function objectMeshesFor(group: THREE.Object3D): THREE.Mesh[] {
+  const meshes: THREE.Mesh[] = [];
+  group.traverse((obj) => {
+    if ((obj as THREE.Mesh).isMesh) meshes.push(obj as THREE.Mesh);
+  });
+  return meshes;
 }

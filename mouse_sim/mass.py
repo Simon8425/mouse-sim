@@ -60,9 +60,15 @@ def _finite(value, label):
 class ObjectMassProperties:
     """Mass result for one object.
 
-    ``mass_status`` is one of ``calculated``, ``measured``, or ``unknown``.
-    Geometry-derived inertia is about ``center_of_mass_m``.  A missing
-    geometry or density never produces a guessed value.
+    ``mass_status`` is one of ``calculated``, ``estimated``, ``measured``, or
+    ``unknown``.  ``estimated`` marks a disclosed bounding-box envelope
+    computation for open geometry (never a certified solid) OR a CAD-calculated
+    value whose geometry certification is incomplete — a closed mesh above the
+    self-intersection sweep limit is reported ``self_intersection_unverified``
+    and demoted to ``estimated`` with completeness 0.5 instead of pretending
+    the solid was certified.  Geometry-derived inertia is about
+    ``center_of_mass_m``.  A missing geometry or density never produces a
+    guessed value.
     """
 
     object_id: str
@@ -281,8 +287,8 @@ def _override_value(value):
         uncertainty = value.get("uncertainty")
         value = value.get("mass", value.get("measured_mass", value))
     mass = _mass_quantity(value, "measured mass")
-    if mass < 0.0:
-        raise ValueError("measured mass must be non-negative")
+    if mass <= 0.0:
+        raise ValueError("measured mass must be positive")
     return mass, _uncertainty(uncertainty)
 
 
@@ -294,9 +300,24 @@ def _geometry_properties(geometry):
     except (AttributeError, ValueError) as exc:
         return None, ("geometry_mass_properties_unavailable: {}".format(exc),)
     diagnostics = tuple(getattr(value, "diagnostics", ()))
-    if not value.closed or value.centroid_m is None or value.inertia_tensor_unit_density is None:
-        return value, diagnostics + ("geometry_not_safe_for_mass_properties",)
-    return value, diagnostics
+    if value.closed and value.centroid_m is not None and value.inertia_tensor_unit_density is not None:
+        return value, diagnostics
+    # Open or otherwise unsafe mesh: fall back to a disclosed bounding-box
+    # envelope estimate when the geometry spans three-dimensional extent.
+    # The estimate is always flagged ``estimated`` and never masquerades as a
+    # certified solid (mass_status "estimated", completeness < 1).
+    envelope = getattr(geometry, "envelope_properties", None)
+    if callable(envelope):
+        try:
+            estimate = envelope()
+        except (AttributeError, ValueError, TypeError):
+            estimate = None
+        if estimate is not None and estimate.centroid_m is not None and estimate.inertia_tensor_unit_density is not None:
+            return estimate, diagnostics + (
+                "geometry_not_safe_for_mass_properties",
+                "mass_estimated_from_bounding_box",
+            )
+    return value, diagnostics + ("geometry_not_safe_for_mass_properties",)
 
 
 def _provenance(record):
@@ -341,6 +362,11 @@ def mass_properties(document, material_by_object, mass_overrides=None):
         volume = getattr(geometry_value, "volume_m3", None)
         center = getattr(geometry_value, "centroid_m", None)
         tensor_unit = getattr(geometry_value, "inertia_tensor_unit_density", None)
+        # A closed mesh above the self-intersection sweep limit never had its
+        # faces verified: the CAD-calculated path is demoted from "calculated"
+        # to the disclosed "estimated" vocabulary (completeness 0.5) with an
+        # explicit flag, mirroring the envelope fallback convention.
+        self_intersection_unverified = "self_intersection_unverified" in geometry_diagnostics
         try:
             override = _mapping_lookup(overrides, identifier)
             if override is None and isinstance(record, Mapping):
@@ -349,6 +375,7 @@ def mass_properties(document, material_by_object, mass_overrides=None):
         except ValueError as exc:
             diagnostics.append("invalid_mass_override: {}".format(exc))
             measured_mass, uncertainty = None, None
+        demoted_for_unverified_self_intersection = False
         if measured_mass is not None:
             mass = measured_mass
             status = "measured"
@@ -364,18 +391,22 @@ def mass_properties(document, material_by_object, mass_overrides=None):
             except (TypeError, ValueError) as exc:
                 density = None
                 diagnostics.append("density_unknown: {}".format(exc))
-            if density is not None and geometry_value is not None and geometry_value.closed and tensor_unit is not None and center is not None:
+            if density is not None and geometry_value is not None and (geometry_value.closed or geometry_value.estimated) and tensor_unit is not None and center is not None:
                 mass = density * volume
-                status = "calculated"
+                status = "estimated" if (getattr(geometry_value, "estimated", False) or self_intersection_unverified) else "calculated"
                 tensor = _tensor_scale(tensor_unit, density)
+                if self_intersection_unverified:
+                    demoted_for_unverified_self_intersection = True
+                    diagnostics.append("mass_estimated_self_intersection_unverified")
             else:
                 mass = None
                 status = "unknown"
                 tensor = None
-                if density is not None and geometry_value is not None and not geometry_value.closed:
+                if density is not None and geometry_value is not None and not geometry_value.closed and not getattr(geometry_value, "estimated", False):
                     diagnostics.append("closed_geometry_required_for_calculated_mass")
                 uncertainty = None
-        completeness = 1.0 if mass is not None and center is not None and tensor is not None else 0.5 if mass is not None else 0.0
+        estimated = bool(getattr(geometry_value, "estimated", False)) if geometry_value is not None else False
+        completeness = 0.5 if (estimated or demoted_for_unverified_self_intersection) else (1.0 if mass is not None and center is not None and tensor is not None else 0.5 if mass is not None else 0.0)
         object_result = ObjectMassProperties(
             identifier,
             mass,
@@ -405,6 +436,8 @@ def mass_properties(document, material_by_object, mass_overrides=None):
         status = "measured"
     elif all(item.mass_status == "calculated" for item in known):
         status = "calculated"
+    elif all(item.mass_status == "estimated" for item in known):
+        status = "estimated"
     else:
         status = "mixed"
     center_of_mass = None

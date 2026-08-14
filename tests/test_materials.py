@@ -16,6 +16,7 @@ from mouse_sim import (
 )
 from mouse_sim.materials import (
     builtin_materials,
+    fatigue_endurance_limit_pa,
     load_material_catalog,
     qualification_material_gates,
     resolve_assignments,
@@ -27,10 +28,10 @@ from mouse_sim.materials import (
 class MaterialCatalogTests(unittest.TestCase):
     def test_builtin_catalog_contains_mouse_materials_in_si(self):
         catalog = builtin_materials()
-        self.assertEqual(len(catalog), 12)
+        self.assertEqual(len(catalog), 17)
         self.assertEqual(
             set(catalog),
-            {"ABS", "PC", "PC/ABS", "POM", "nylon", "TPU", "FR4", "LiPo", "steel", "PTFE", "magnesium/aluminum", "default"},
+            {"ABS", "PC", "PC/ABS", "POM", "nylon", "TPU", "FR4", "LiPo", "steel", "PTFE", "magnesium/aluminum", "SLA_8001", "SLA_9000HE", "MJF_PA12_HP", "MJF_PA11_HP", "MJF_PA12S_HP", "default"},
         )
         self.assertIn("ABS", catalog)
         self.assertIn("pc/abs", catalog)
@@ -124,14 +125,14 @@ class MaterialCatalogTests(unittest.TestCase):
     def test_builtin_fatigue_and_use_range_fields(self):
         catalog = builtin_materials()
         cases = {
-            "ABS": (14e6, 6, 233.15, 363.15),
-            "PC": (25e6, 6, 233.15, 398.15),
-            "PC/ABS": (20e6, 6, 233.15, 373.15),
-            "POM": (30e6, 6, 233.15, 363.15),
+            "ABS": (14e6, 7, 233.15, 363.15),
+            "PC": (25e6, 8, 233.15, 398.15),
+            "PC/ABS": (20e6, 8, 233.15, 373.15),
+            "POM": (30e6, 10, 233.15, 363.15),
             "nylon": (20e6, 6, 233.15, 373.15),
             "FR4": (65e6, 10, 233.15, 403.15),
             "default": (14e6, 6, 233.15, 363.15),
-            "steel": (220e6, 5, 233.15, 473.15),
+            "steel": (180e6, 10, 233.15, 473.15),
         }
         for key, (fatigue, k, use_min, use_max) in cases.items():
             properties = catalog[key].properties
@@ -148,6 +149,122 @@ class MaterialCatalogTests(unittest.TestCase):
             self.assertIsNone(properties.fatigue_strength_at_1e6_pa, key)
             self.assertIsNone(properties.fatigue_exponent_k, key)
             self.assertIsNotNone(properties.continuous_use_temperature_min_k, key)
+
+    def test_builtin_steel_carries_endurance_limit_knee(self):
+        catalog = builtin_materials()
+        self.assertEqual(fatigue_endurance_limit_pa(catalog["steel"]), 180e6)
+        self.assertIsNone(fatigue_endurance_limit_pa(catalog["ABS"]))
+        self.assertIsNone(fatigue_endurance_limit_pa(catalog["FR4"]))
+        validate_material(catalog["steel"])
+
+    def test_every_builtin_fatigue_curve_respects_uts_bound(self):
+        # Audit E1: the Basquin law implies sigma(1e3) = sigma_ref*1000^(1/k);
+        # every built-in curve must keep that short-life point at or below
+        # 90% of the ultimate strength (physically possible and conservative).
+        catalog = builtin_materials()
+        for key, material in catalog.items():
+            properties = material.properties
+            anchor = properties.fatigue_strength_at_1e6_pa
+            exponent = properties.fatigue_exponent_k
+            uts = properties.ultimate_strength
+            if anchor is None or exponent is None:
+                continue
+            implied = anchor.value_si * 1000.0 ** (1.0 / exponent)
+            self.assertLessEqual(
+                implied,
+                0.9 * uts.value_si,
+                "{} curve implies sigma(1e3) = {:g} Pa > 0.9*UTS {:g} Pa".format(
+                    key, implied, 0.9 * uts.value_si
+                ),
+            )
+            self.assertLessEqual(implied, uts.value_si, key)
+            validate_material(material)
+
+    def test_catalog_validation_rejects_implausible_fatigue_curves(self):
+        # The old steel curve (220 MPa @ 1e6, slope 5) implied sigma(1e3) =
+        # 876 MPa against a 400 MPa UTS; validation must reject curves whose
+        # implied sigma(1e3) exceeds UTS (hard error) or sits in the
+        # 0.9*UTS..UTS band (no screening margin).
+        material = builtin_materials()["steel"]
+        over_uts = replace(
+            material,
+            properties=replace(
+                material.properties,
+                fatigue_strength_at_1e6_pa=Quantity.from_value(220e6, "Pa"),
+                fatigue_exponent_k=5,
+            ),
+        )
+        with self.assertRaises(ValidationError) as context:
+            validate_material(over_uts)
+        self.assertIn("exceeding the ultimate strength", " ".join(context.exception.errors))
+        near_uts = replace(
+            material,
+            properties=replace(
+                material.properties,
+                fatigue_strength_at_1e6_pa=Quantity.from_value(195e6, "Pa"),
+                fatigue_exponent_k=10,
+            ),
+        )
+        with self.assertRaises(ValidationError) as context:
+            validate_material(near_uts)
+        self.assertIn("exceeding 90% of the ultimate strength", " ".join(context.exception.errors))
+        nonpositive_k = replace(
+            material,
+            properties=replace(material.properties, fatigue_exponent_k=0),
+        )
+        with self.assertRaises(ValidationError):
+            validate_material(nonpositive_k)
+
+    def test_fatigue_endurance_limit_roundtrips_through_catalog_json(self):
+        payload = {
+            "materials": {
+                "Alloy": {
+                    "name": "Alloy",
+                    "properties": {
+                        "density": 7800,
+                        "young_modulus": 200e9,
+                        "poissons_ratio": 0.30,
+                        "yield_strength": 250e6,
+                        "ultimate_strength": 400e6,
+                        "tensile_allowable": 150e6,
+                        "compressive_allowable": 250e6,
+                        "shear_allowable": 100e6,
+                        "friction_coefficient": 0.45,
+                        "fatigue_strength_at_1e6_pa": 180e6,
+                        "fatigue_exponent_k": 10,
+                        "fatigue_endurance_limit_pa": 180e6,
+                    },
+                },
+                "Polymer": {
+                    "name": "Polymer",
+                    "properties": {
+                        "density": 1040,
+                        "young_modulus": 2.3e9,
+                        "poissons_ratio": 0.35,
+                        "yield_strength": 40e6,
+                        "ultimate_strength": 45e6,
+                        "tensile_allowable": 20e6,
+                        "compressive_allowable": 60e6,
+                        "shear_allowable": 25e6,
+                        "friction_coefficient": 0.35,
+                        "fatigue_strength_at_1e6_pa": 14e6,
+                        "fatigue_exponent_k": 7,
+                    },
+                },
+            }
+        }
+        catalog = load_material_catalog(json.dumps(payload))
+        self.assertEqual(fatigue_endurance_limit_pa(catalog["Alloy"]), 180e6)
+        self.assertIsNone(fatigue_endurance_limit_pa(catalog["Polymer"]))
+
+    def test_builtin_fr4_allowable_keeps_laminate_safety_factor(self):
+        # Audit LOW: FR-4 is a brittle laminate; a 2-2.5x factor between
+        # yield and tensile allowable is typical.  125 MPa gives SF 2.0.
+        properties = builtin_materials()["FR4"].properties
+        self.assertEqual(properties.tensile_allowable.value_si, 125e6)
+        self.assertAlmostEqual(
+            properties.yield_strength.value_si / properties.tensile_allowable.value_si, 2.0, places=6
+        )
 
     def test_builtin_fr4_carries_anisotropy_quartet(self):
         definition = builtin_materials()["FR4"]

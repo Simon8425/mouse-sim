@@ -1,8 +1,10 @@
 import tempfile
 import unittest
+from unittest import mock
 
 from mouse_sim import canonical_json
 from mouse_sim.cache import ArtifactCache
+from mouse_sim.mass import MassPropertiesResult
 from mouse_sim.pipeline import (
     ENGINE_VERSION,
     _ENGINE_BEHAVIOR_MODULES,
@@ -514,9 +516,10 @@ class QualificationIntegrityPipelineTests(unittest.TestCase):
             return run_pipeline(request)
 
         # Measured values close to the prediction at three independent
-        # heights pass the acceptance band (the fixture predicts ~187 g at
-        # 0.5 m, ~230 g at 0.75 m, ~266 g at 1.0 m on concrete).
-        plausible = run_correlation([(0.5, 190.0), (0.75, 233.0), (1.0, 269.0)])
+        # heights pass the acceptance band (the fixture predicts ~1377 g at
+        # 0.5 m, ~1758 g at 0.75 m, ~2091 g at 1.0 m on concrete under the
+        # default Hertz point-contact model).
+        plausible = run_correlation([(0.5, 1380.0), (0.75, 1760.0), (1.0, 2090.0)])
         self.assertEqual(plausible["errors"], [])
         correlation = plausible["correlation"]
         self.assertIsNotNone(correlation)
@@ -562,6 +565,47 @@ class QualificationIntegrityPipelineTests(unittest.TestCase):
         self.assertEqual(shell["critical_region_stability"]["stable"], True)
         self.assertTrue(shell["assumptions"])
 
+    def test_point_load_case_with_safe_factor_not_accepted_outright(self):
+        # S1 gate: a point-load structural case carries a series-order
+        # dependent peak stress (POINT_LOAD_SINGULARITY /
+        # POINT_LOAD_STRESS_ORDER_DEPENDENT); a safety factor >= 1.0 must
+        # NOT constitute a pass — the verdict is marginal/warn with a
+        # targeted reason entry.
+        request = mouse_project_request(
+            load_case={"kind": "force", "force": {"value": 5, "unit": "N"}, "point_load": True},
+            structure={"type": "shell_panel", "a_m": 0.06, "b_m": 0.04, "t_m": 0.002, "material": "ABS"},
+        )
+        result = run_pipeline(request)
+        self.assertEqual(result["errors"], [])
+        shell = result["shell"]
+        self.assertGreaterEqual(shell["min_safety_factor"], 1.0)
+        self.assertEqual(shell["classification"], "marginal")
+        self.assertEqual(shell["status"], "warn")
+        self.assertNotEqual(shell["classification"], "safe")
+        self.assertTrue(
+            any("POINT_LOAD_SINGULARITY" in item for item in shell["limitations"]),
+            shell["limitations"],
+        )
+        # The point-load flags are disclosed on the structural response and
+        # the point-load case never reaches high physical-model confidence.
+        response = result["structural"]["response"]
+        self.assertIn("POINT_LOAD_SINGULARITY", response["flags"])
+        self.assertIn("POINT_LOAD_STRESS_ORDER_DEPENDENT", response["flags"])
+        self.assertEqual(shell["physical_model_confidence"], "medium")
+
+    def test_point_load_case_below_one_still_fails(self):
+        # The S1 gate does not mask a genuine fail: sf < 1.0 dominates.
+        request = mouse_project_request(
+            load_case={"kind": "force", "force": {"value": 200, "unit": "N"}, "point_load": True},
+            structure={"type": "shell_panel", "a_m": 0.06, "b_m": 0.04, "t_m": 0.002, "material": "ABS"},
+        )
+        result = run_pipeline(request)
+        self.assertEqual(result["errors"], [])
+        shell = result["shell"]
+        self.assertLess(shell["min_safety_factor"], 1.0)
+        self.assertEqual(shell["classification"], "failed")
+        self.assertEqual(shell["status"], "fail")
+
     def test_shell_result_confidence_drops_with_assumed_mass(self):
         # Assumed mass (open tessellation) must downgrade the shell
         # confidence, not silently bake a fabricated mass into a high-
@@ -594,6 +638,32 @@ class QualificationIntegrityPipelineTests(unittest.TestCase):
         self.assertTrue(
             any("mass assumed" in limitation for limitation in shell["limitations"])
         )
+
+    def test_drop_simulation_assumed_mass_uses_ultralight_default(self):
+        # Modern ultralight gaming-mouse benchmark: with no mass properties
+        # the drop simulation falls back to 0.06 kg (60 g), not the legacy
+        # 0.1 kg default.
+        request = {
+            "schema_id": "gms.project/1",
+            "mode": "exploration",
+            "units": "m",
+            "objects": [
+                {
+                    "id": "shell",
+                    "geometry": {
+                        "type": "mesh",
+                        "vertices": [[0, 0, 0], [0.1, 0, 0], [0, 0.06, 0]],
+                        "triangles": [[0, 1, 2]],
+                        "units": "m",
+                    },
+                },
+            ],
+            "drop_simulation": {"height_m": 0.5},
+        }
+        result = run_pipeline(request)
+        codes = [item["code"] for item in result["issues"]]
+        self.assertIn("DROP_SIMULATION_MASS_ASSUMED", codes)
+        self.assertEqual(result["drop_simulation"]["model"]["mass_kg"], 0.06)
 
     def test_components_never_contaminate_shell_result(self):
         # Architectural invariant: the secondary component models must not
@@ -872,12 +942,143 @@ class DropSimulationPipelineTests(unittest.TestCase):
         self.assertNotIn("DROP_SIMULATION_MASS_ASSUMED", codes)
         self.assertNotIn("DROP_SIMULATION_INERTIA_APPROXIMATED", codes)
 
+    def test_drop_simulation_default_hertz_peak_force_in_band(self):
+        # The default drop-impact path must route through the nonlinear
+        # Hertz point-contact law (no explicit contact_stiffness_n_per_m):
+        # a ~60 g ABS shell from 1.25 m onto concrete must land in the
+        # physically expected 1.8-3.0 kN peak-force band (E_eff(ABS/concrete)
+        # ~ 2.4 GPa, R = 2.0 mm corner blend) — the old uncalibrated
+        # linear-spring default (1e5 N/m) under-predicted to ~350 N.
+        request = self._box_project()
+        request["objects"] = [
+            {
+                "id": "box",
+                "material": "ABS",
+                "geometry": {"type": "box", "size": [0.06, 0.04, 0.02], "units": "m"},
+            }
+        ]
+        request["impact"] = None
+        request["drop_simulation"] = {
+            "test": "drop",
+            "height_m": 1.25,
+            "surface": "concrete",
+            "drop_count": 1,
+            "orientation": "flat",
+        }
+        result = run_pipeline(request)
+        self.assertEqual(result["errors"], [])
+        simulation = result["drop_simulation"]
+        estimate = simulation["peak_force_estimate"]
+        self.assertEqual(simulation["contact_model"], "hertz_nonlinear")
+        self.assertIsNone(estimate["contact_stiffness_n_per_m"])
+        self.assertEqual(estimate["contact_radius_m"], 0.002)
+        force = simulation["peak_force_estimate_n"]
+        self.assertGreater(force, 1.8e3)
+        self.assertLess(force, 3.0e3)
+        # 1.8-3.0 kN on a ~60 g body is ~3000-5100 g (not 300-500 g): the
+        # reported g-peak must reflect F/(m*g).
+        mass_kg = estimate["mass_kg"]
+        accel_g = force / mass_kg / 9.80665
+        self.assertGreater(accel_g, 3.0e3)
+        self.assertLess(accel_g, 5.1e3)
+
+    def test_drop_simulation_explicit_stiffness_stays_linear(self):
+        # An explicit contact_stiffness_n_per_m keeps the calibrated linear
+        # spring: the override must still be honored exactly.
+        request = self._box_project()
+        request["impact"] = None
+        request["drop_simulation"] = {
+            "test": "drop",
+            "height_m": 0.5,
+            "surface": "concrete",
+            "drop_count": 1,
+            "orientation": "flat",
+            "contact_stiffness_n_per_m": 1e5,
+        }
+        result = run_pipeline(request)
+        self.assertEqual(result["errors"], [])
+        simulation = result["drop_simulation"]
+        self.assertEqual(simulation["contact_model"], "linear")
+        self.assertEqual(simulation["contact_stiffness_n_per_m"], 1e5)
+        self.assertIsNone(simulation["effective_modulus_pa"])
+
     def test_drop_simulation_mesh_mass_approximation_diagnostics(self):
         request = self._box_project()
         request["drop_simulation"] = {"height_m": 0.3}
         result = run_pipeline(request)
         codes = [item["code"] for item in result["issues"]]
         self.assertNotIn("DROP_SIMULATION_FAILED", codes)
+
+    def test_open_three_dimensional_mesh_uses_estimated_mass_and_density(self):
+        # STEP-like open shell with three-dimensional extent and NO material:
+        # the drop simulation must use a geometry-derived estimated mass (not
+        # the 0.1 kg dummy), the classification must resolve to "shell", and
+        # a classification-based density estimate must reach the mass model.
+        vertices = [
+            (0.0, 0.0, 0.0), (0.1, 0.0, 0.0), (0.1, 0.06, 0.0), (0.0, 0.06, 0.0),
+            (0.0, 0.0, 0.03), (0.1, 0.0, 0.03), (0.1, 0.06, 0.03), (0.0, 0.06, 0.03),
+        ]
+        triangles = [
+            (0, 2, 1), (0, 3, 2), (0, 1, 5), (0, 5, 4),
+            (1, 2, 6), (1, 6, 5), (2, 3, 7), (2, 7, 6), (3, 0, 4), (3, 4, 7),
+        ]
+        request = mouse_project_request(
+            objects=[{"id": "TD011-CE", "geometry": {"type": "mesh", "vertices": vertices, "triangles": triangles, "units": "m"}}],
+            drop_simulation={"height_m": 0.5},
+        )
+        result = run_pipeline(request)
+        codes = [item["code"] for item in result["issues"]]
+        self.assertNotIn("DROP_SIMULATION_MASS_ASSUMED", codes)
+        self.assertNotIn("DROP_SIMULATION_INERTIA_APPROXIMATED", codes)
+        self.assertIn("DEFAULT_MATERIAL_ASSIGNED", codes)
+        mass = result["mass"]
+        self.assertEqual(mass["mass_status"], "estimated")
+        self.assertGreater(mass["mass_kg"], 0.0)
+        self.assertIsNotNone(mass["center_of_mass_m"])
+        self.assertIsNotNone(mass["inertia_tensor_kg_m2"])
+        per_object = next(item for item in mass["objects"] if item["object_id"] == "TD011-CE")
+        self.assertEqual(per_object["mass_status"], "estimated")
+        self.assertTrue(any("mass_estimated_from_bounding_box" in d for d in per_object["diagnostics"]))
+        classification = result["validation"]["findings"]
+        self.assertFalse(any(item["code"] == "CLASSIFICATION_UNRESOLVED" for item in classification))
+        summary = next(item for item in result["geometry_summary"]["objects"] if item["object_id"] == "TD011-CE")
+        self.assertEqual(summary["density_source"], "classification_estimate")
+        self.assertAlmostEqual(summary["density_kg_m3"], 1040.0)
+        self.assertGreater(result["drop_simulation"]["peak"]["kinetic_energy_j"], 0.0)
+        # The estimated mass is a disclosed approximation: the shell verdict
+        # must not claim a certified SAFE result on it.
+        self.assertEqual(result["shell"]["classification"], "insufficient_evidence")
+
+    def test_mesh_weld_repair_certifies_mass_in_pipeline(self):
+        # An open mesh whose seams are duplicated vertices is stitched by the
+        # conservative weld repair; the pipeline then reports calculated mass
+        # instead of an envelope estimate.
+        cube = [
+            (-0.05, -0.03, -0.015), (0.05, -0.03, -0.015), (0.05, 0.03, -0.015), (-0.05, 0.03, -0.015),
+            (-0.05, -0.03, 0.015), (0.05, -0.03, 0.015), (0.05, 0.03, 0.015), (-0.05, 0.03, 0.015),
+        ]
+        faces = [
+            (0, 2, 1), (0, 3, 2), (4, 5, 6), (4, 6, 7),
+            (0, 1, 5), (0, 5, 4), (1, 2, 6), (1, 6, 5),
+            (2, 3, 7), (2, 7, 6), (3, 0, 4), (3, 4, 7),
+        ]
+        vertices = []
+        triangles = []
+        for face in faces:
+            start = len(vertices)
+            vertices.extend(cube[index] for index in face)
+            triangles.append([start, start + 1, start + 2])
+        request = mouse_project_request(
+            objects=[{"id": "case", "geometry": {"type": "mesh", "vertices": vertices, "triangles": triangles, "units": "m"}}],
+        )
+        result = run_pipeline(request)
+        self.assertEqual(result["errors"], [])
+        mass = result["mass"]
+        self.assertEqual(mass["mass_status"], "calculated")
+        self.assertGreater(mass["mass_kg"], 0.0)
+        summary = next(item for item in result["geometry_summary"]["objects"] if item["object_id"] == "case")
+        self.assertTrue(any("mesh_weld_repaired" in d for d in summary["diagnostics"]))
+        self.assertEqual(result["mass"]["mass_status"], "calculated")
 
     def test_drop_simulation_invalid_config_fails_cleanly(self):
         request = self._box_project()
@@ -887,6 +1088,93 @@ class DropSimulationPipelineTests(unittest.TestCase):
         codes = [item["code"] for item in result["issues"]]
         self.assertIn("DROP_SIMULATION_FAILED", codes)
         self.assertEqual(result["lifecycle_state"], "failed")
+
+    def test_drop_simulation_mass_override_rescales_cad_inertia(self):
+        # Physics-consistency audit: the drop_simulation.mass_kg override (the
+        # web UI's only drop-simulation override path) must rescale the
+        # CAD-derived inertia tensor by M_override / M_CAD so the integrator's
+        # rotational response matches the overridden translational mass.
+        request = self._box_project()
+        request["impact"] = None
+        request["drop_simulation"] = {"height_m": 0.5, "drop_count": 1, "mass_kg": 0.06}
+        result = run_pipeline(request)
+        self.assertEqual(result["errors"], [])
+        cad_mass = result["mass"]["mass_kg"]
+        cad_inertia = result["mass"]["inertia_tensor_kg_m2"]
+        self.assertIsNotNone(cad_mass)
+        self.assertIsNotNone(cad_inertia)
+        self.assertGreater(cad_mass, 1e-9)
+        scale = 0.06 / cad_mass
+        simulation = result["drop_simulation"]
+        model = simulation["model"]
+        self.assertEqual(simulation["inertia_source"], "mass_model")
+        self.assertAlmostEqual(model["mass_kg"], 0.06, places=6)
+        for row in range(3):
+            for col in range(3):
+                expected = scale * cad_inertia[row][col]
+                self.assertAlmostEqual(
+                    model["inertia_kg_m2"][row][col],
+                    expected,
+                    delta=max(1e-12, abs(expected) * 1e-9),
+                )
+        codes = [item["code"] for item in result["issues"]]
+        self.assertNotIn("DROP_SIMULATION_INERTIA_NOT_RESCALED", codes)
+
+    def test_drop_simulation_mass_override_equal_to_cad_mass_is_a_noop(self):
+        # An override identical to the mass-model mass must leave the CAD
+        # inertia bit-for-bit untouched (scale factor 1.0 -> no rescale).
+        baseline = run_pipeline(
+            self._box_project() | {"drop_simulation": {"height_m": 0.5}}
+        )
+        cad_mass = baseline["mass"]["mass_kg"]
+        overridden = run_pipeline(
+            self._box_project()
+            | {"drop_simulation": {"height_m": 0.5, "mass_kg": cad_mass}}
+        )
+        self.assertEqual(
+            overridden["drop_simulation"]["model"]["inertia_kg_m2"],
+            baseline["drop_simulation"]["model"]["inertia_kg_m2"],
+        )
+        self.assertEqual(
+            overridden["drop_simulation"]["model"]["mass_kg"],
+            baseline["drop_simulation"]["model"]["mass_kg"],
+        )
+
+    def test_drop_simulation_mass_override_without_cad_mass_is_disclosed_unscaled(self):
+        # Guard path: when the mass model provides a CAD inertia but no usable
+        # mass, the override cannot be reconciled — the run must disclose the
+        # inconsistency (DROP_SIMULATION_INERTIA_NOT_RESCALED) and leave the
+        # inertia unscaled, never crash and never scale silently.
+        fake_mass = MassPropertiesResult(
+            mass_kg=None,
+            mass_status="unknown",
+            center_of_mass_m=None,
+            inertia_tensor_kg_m2=(
+                (3.0e-5, 1.0e-6, 0.0),
+                (1.0e-6, 3.0e-5, 0.0),
+                (0.0, 0.0, 3.0e-5),
+            ),
+            uncertainty_kg=None,
+            completeness=0.0,
+        )
+        with mock.patch("mouse_sim.pipeline.mass.mass_properties", return_value=fake_mass):
+            result = run_pipeline(
+                self._box_project() | {"drop_simulation": {"height_m": 0.5, "mass_kg": 0.05}}
+            )
+        self.assertEqual(result["errors"], [])
+        codes = [item["code"] for item in result["issues"]]
+        self.assertIn("DROP_SIMULATION_INERTIA_NOT_RESCALED", codes)
+        simulation = result["drop_simulation"]
+        self.assertIsNotNone(simulation)
+        model = simulation["model"]
+        self.assertAlmostEqual(model["mass_kg"], 0.05, places=6)
+        for row in range(3):
+            for col in range(3):
+                self.assertAlmostEqual(
+                    model["inertia_kg_m2"][row][col],
+                    fake_mass.inertia_tensor_kg_m2[row][col],
+                    places=15,
+                )
 
     def test_drop_simulation_deterministic(self):
         first = run_pipeline(self._box_project() | {"drop_simulation": {"height_m": 0.4}})

@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { useEffect } from 'react';
@@ -181,8 +181,7 @@ describe('Settings modal', () => {
 
     expect(screen.getByRole('dialog', { name: 'Settings' })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Settings' })).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: 'Materials' })).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: 'Population analysis' })).toBeInTheDocument();
+    expect(screen.getByText('Default Material')).toBeInTheDocument();
     // Engine/API status is no longer surfaced in the settings panel.
     expect(screen.queryByRole('heading', { name: 'Engine status' })).not.toBeInTheDocument();
     expect(screen.queryByText(/API/)).not.toBeInTheDocument();
@@ -217,7 +216,7 @@ describe('Settings modal', () => {
     // The remaining cards still render; the physical-shell-validation
     // campaign editor is no longer part of Settings.
     expect(screen.queryByRole('heading', { name: 'Engine status' })).not.toBeInTheDocument();
-    expect(screen.getByText('Population analysis')).toBeInTheDocument();
+    expect(screen.getByText('3D Viewport Background')).toBeInTheDocument();
     expect(screen.queryByText('Physical Shell Validation')).not.toBeInTheDocument();
   });
 
@@ -226,7 +225,7 @@ describe('Settings modal', () => {
 
     expect(screen.queryByRole('radiogroup', { name: 'Model quality' })).toBeNull();
     expect(screen.queryByText('Model Quality')).toBeNull();
-    expect(screen.getByText('Materials')).toBeInTheDocument();
+    expect(screen.getByText('Default Material')).toBeInTheDocument();
   });
 
   it('renders the Default Material select and dispatches SET_DEFAULT_MATERIAL on change', async () => {
@@ -276,99 +275,31 @@ describe('Settings modal', () => {
     expect(defaultKeys[defaultKeys.length - 1]).toBe('ABS');
   });
 
-  it('dispatches RUN_POPULATION without worst_case from the Monte Carlo button', async () => {
-    const user = userEvent.setup();
-    let capturedDraft: Record<string, unknown> | null | undefined;
-    let runNonce = -1;
+  it('renders viewport background setting in Settings card', () => {
     renderPanel(
       [{ type: 'LOAD_BASELINE_OK', project: mockBaselineProject, name: 'mouse_baseline' }],
-      vi.fn(),
-      (state) => {
-        capturedDraft = state.draft;
-        runNonce = state.runNonce;
-      },
     );
 
-    expect(screen.getByText('Population analysis')).toBeInTheDocument();
+    expect(screen.getByText('3D Viewport Background')).toBeInTheDocument();
     expect(
-      screen.getByText(/Monte Carlo simulates 10,000 manufactured units/i),
+      screen.getByText('Switch middle 3D viewport canvas between Dark Studio and Pure White background.'),
     ).toBeInTheDocument();
-
-    const button = screen.getByRole('button', {
-      name: 'Run Monte Carlo population (10k units)',
-    });
-    expect(button).toBeEnabled();
-    await user.click(button);
-
-    await waitFor(() => {
-      expect(runNonce).toBe(1);
-    });
-    const population = capturedDraft?.population as Record<string, unknown>;
-    expect(population).toEqual({
-      sample_count: 10000,
-      profile: 'esports_fps',
-      lifespan_days: 730,
-    });
-    expect(population.worst_case).toBeUndefined();
   });
 
-  it('dispatches RUN_POPULATION with the deterministic worst_case spec from the worst-case button', async () => {
+  it('allows switching viewport background theme in Settings card', async () => {
     const user = userEvent.setup();
-    let capturedDraft: Record<string, unknown> | null | undefined;
-    let runNonce = -1;
+    let themeValue = 'dark';
     renderPanel(
       [{ type: 'LOAD_BASELINE_OK', project: mockBaselineProject, name: 'mouse_baseline' }],
       vi.fn(),
       (state) => {
-        capturedDraft = state.draft;
-        runNonce = state.runNonce;
+        themeValue = state.theme;
       },
     );
 
-    const button = screen.getByRole('button', { name: 'Run deterministic worst-case' });
-    expect(button).toBeEnabled();
-    await user.click(button);
-
-    await waitFor(() => {
-      expect(runNonce).toBe(1);
-    });
-    const population = capturedDraft?.population as Record<string, unknown>;
-    expect(population).toMatchObject({
-      sample_count: 10000,
-      profile: 'esports_fps',
-      lifespan_days: 730,
-    });
-    expect(population.worst_case).toEqual({
-      wall_thickness: 'min',
-      shell_modulus: 'min',
-      shell_strength: 'min',
-      shell_density: 'max',
-      com_offset: 'max',
-      drop_height: 2,
-      orientation: 'corner',
-    });
+    const bgSelect = screen.getByLabelText('3D Viewport Background');
+    expect(bgSelect).toHaveValue('light'); // default theme is light in initial state
+    await user.selectOptions(bgSelect, 'dark');
+    expect(themeValue).toBe('dark');
   });
-
-  it('disables both population buttons without geometry', () => {
-    renderPanel();
-    expect(
-      screen.getByRole('button', { name: 'Run Monte Carlo population (10k units)' }),
-    ).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Run deterministic worst-case' })).toBeDisabled();
-  });
-
-  it('disables the population buttons and shows the running label while analysis is running', () => {
-    renderPanel([
-      { type: 'LOAD_BASELINE_OK', project: mockBaselineProject, name: 'mouse_baseline' },
-      { type: 'ANALYZE_START', version: 1, requestKey: 'k1' },
-    ]);
-
-    expect(
-      screen.getByRole('button', { name: 'Run Monte Carlo population (10k units)' }),
-    ).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Run deterministic worst-case' })).toBeDisabled();
-    // Both population buttons show the running label.
-    expect(screen.getAllByText('Running…')).toHaveLength(2);
-  });
-
 });

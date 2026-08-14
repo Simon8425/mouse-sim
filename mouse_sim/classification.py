@@ -3,7 +3,9 @@
 Classification is topology-aware, not semantic inference.  In particular, a
 single fused or connected solid is never reported as semantically separated
 components merely because it has multiple faces, shells, or imported object
-names.
+names.  An open mesh that spans three-dimensional extent is classified as a
+``shell`` (a surface solid whose role is shape-derived), never as a certified
+solid; flat or degenerate open meshes remain unresolved ``surface``.
 """
 
 from dataclasses import dataclass
@@ -183,6 +185,15 @@ def _unwrap(value):
     return value, value
 
 
+def _mesh_has_three_dimensional_extent(mesh):
+    """True when the mesh's axis-aligned bounds span positive extent on all
+    three axes.  Flat surfaces and degenerate slivers return False: no
+    shell-like volume can be attributed to them."""
+    bounds = mesh.bounds()
+    size = bounds.size
+    return all(item > 0.0 for item in size)
+
+
 def _entries(objects):
     if isinstance(objects, Mapping):
         if "objects" in objects:
@@ -259,6 +270,15 @@ def _classify_one(identifier, raw):
             unresolved = True
             confidence = 0.35
             reasons.append("mesh is topologically closed but has diagnostics that prevent a safe solid conclusion")
+        elif _mesh_has_three_dimensional_extent(value):
+            # An open surface spanning real 3D extent is a shell-like part
+            # (case, cover, bracket): the shape resolves it as a shell, with
+            # the role and mass left as disclosed estimates.
+            component_type = "shell"
+            unresolved = False
+            confidence = 0.55
+            reasons.append("open mesh with three-dimensional extent describes a shell-like surface solid")
+            reasons.append("component role is assigned by bounding-box shape, not semantic naming")
         else:
             component_type = "surface"
             unresolved = True

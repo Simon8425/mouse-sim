@@ -243,7 +243,6 @@ describe('ResultsRail', () => {
     renderRail(null);
 
     expect(screen.getByText('No results yet')).toBeInTheDocument();
-    expect(screen.getByText(/Upload a model, choose a material, and run a test/)).toBeInTheDocument();
     expect(screen.queryByRole('tab')).not.toBeInTheDocument();
   });
 

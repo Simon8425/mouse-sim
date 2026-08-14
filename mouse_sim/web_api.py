@@ -72,6 +72,71 @@ _STEP_ASSET_PARTS_ROUTE_RE = re.compile(r"^/api/geometry/assets/([0-9a-f]{64})\.
 # re-registers.  Eviction only drops the registry entry.
 _STEP_ASSET_REGISTRY_CAP = 256
 
+# Background geometry warm-up: the first analyze of a freshly-uploaded model
+# spends most of its time certifying the geometry (parse + weld + exact
+# self-intersection sweep, ~30 s on a 46-part STEP assembly).  When an asset
+# is registered we kick off a SILENT daemon thread that pre-runs that
+# certification through the shared ``importers.parse_and_repair_geometry``
+# cache, so a later Run reuses the cached (certified) meshes and the request
+# completes in seconds.  No response payload or log changes: the warm-up
+# produces nothing observable.  If the user presses Run before the warm-up
+# finishes, the foreground pipeline simply computes normally (the request
+# waits, as before) and both paths share the same deterministic cache.
+_WARMUP_REGISTRY = {}
+_WARMUP_LOCK = threading.Lock()
+
+
+def _warmup_asset_geometry(asset_id, parts_path):
+    """Certify an asset's part geometry into the shared parse cache.
+
+    Runs in a daemon thread; never raises into the request path.  Only the
+    deterministic parse/repair/diagnostics work is performed — the result is
+    purely the shared geometry cache warming, so a later analyze request
+    reuses it transparently.
+    """
+    try:
+        from .importers import parse_and_repair_geometry
+
+        with parts_path.open("r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+        raw_parts = payload.get("parts") if isinstance(payload, dict) else None
+        if not isinstance(raw_parts, list):
+            return
+        for part in raw_parts:
+            if not isinstance(part, dict):
+                continue
+            geometry = part.get("geometry")
+            if isinstance(geometry, dict):
+                parse_and_repair_geometry(geometry, units=geometry.get("units", "m"))
+    except Exception:
+        # Warm-up is best-effort: a failure simply leaves the cache cold and
+        # the next analyze request computes normally (silent, no user impact).
+        return
+
+
+def _request_geometry_warmup(asset_id, parts_path):
+    """Start (or join) the background certification for one asset.
+
+    Deduplicated per asset_id: repeated registrations of the same model do
+    not stack warm-up threads.  Returns without waiting — the caller never
+    blocks on the warm-up.
+    """
+    with _WARMUP_LOCK:
+        if _WARMUP_REGISTRY.get(asset_id) is True:
+            return
+        _WARMUP_REGISTRY[asset_id] = True
+        # Bound the warm-up bookkeeping to the asset registry cap; evicted
+        # ids simply re-warm on the next registration.
+        while len(_WARMUP_REGISTRY) > _STEP_ASSET_REGISTRY_CAP:
+            _WARMUP_REGISTRY.pop(next(iter(_WARMUP_REGISTRY)), None)
+    thread = threading.Thread(
+        target=_warmup_asset_geometry,
+        args=(asset_id, parts_path),
+        name="geometry-warmup-{}".format(asset_id[:8]),
+        daemon=True,
+    )
+    thread.start()
+
 _STATIC_CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".htm": "text/html; charset=utf-8",
@@ -186,6 +251,11 @@ def register_step_asset(asset):
             oldest = next(iter(_STEP_ASSET_REGISTRY))
             _STEP_ASSET_REGISTRY.pop(oldest, None)
             _STEP_ASSET_PARTS_REGISTRY.pop(oldest, None)
+    if parts_path is not None:
+        # Silent background certification: pre-parse + pre-certify the part
+        # geometry so the first analyze of this model is fast.  Never blocks
+        # the upload response and never notifies the user.
+        _request_geometry_warmup(asset_id, parts_path)
     public = {
         "asset_id": asset_id,
         "url": "/api/geometry/assets/{}.glb".format(asset_id),

@@ -115,13 +115,20 @@ class ShellSafetyIsolationTests(unittest.TestCase):
         )
         self.assertEqual(result["errors"], [])
         by_id = {entry["component_id"]: entry for entry in component_entries(result)}
-        self.assertNotEqual(by_id["b"]["status"], "fail")
+        # Hertz-calibrated screening: the 0.75 m flat drop peaks at ~1758 g
+        # (vs the 500 g cell shock limit), so the battery fails on the
+        # mass-independent shock channel even though its mass clamps to zero.
+        self.assertEqual(by_id["b"]["status"], "fail")
+        self.assertEqual(
+            [f["code"] for f in by_id["b"].get("findings", [])],
+            ["BATTERY_SHOCK_EXCEEDED"],
+        )
         self.assertEqual(by_id["p"]["status"], "not_evaluated")
         self.assertEqual(by_id["a"]["status"], "not_evaluated")
         self.assertEqual(by_id["c"]["status"], "not_evaluated")
         self.assertEqual(shell_outputs(result), shell_outputs(base))
 
-    def test_extreme_battery_mass_verdicts_differ_shell_unchanged(self):
+    def test_extreme_battery_mass_fails_via_distinct_channels_shell_unchanged(self):
         base = run_pipeline(base_request())
         heavy = run_pipeline(
             base_request(components=[{"component_id": "b", "type": "battery", "mass_kg": 1.0}])
@@ -133,8 +140,19 @@ class ShellSafetyIsolationTests(unittest.TestCase):
         self.assertEqual(light["errors"], [])
         heavy_verdict = component_entries(heavy)[0]["status"]
         light_verdict = component_entries(light)[0]["status"]
-        self.assertNotEqual(heavy_verdict, light_verdict)
+        # Hertz-calibrated screening: both fail because the shock channel is
+        # mass-independent (accel_g ~1758 g vs the 500 g limit); the heavy cell
+        # additionally fails the crush channel, the light one does not.
         self.assertEqual(heavy_verdict, "fail")
+        self.assertEqual(light_verdict, "fail")
+        self.assertEqual(
+            [f["code"] for f in component_entries(heavy)[0].get("findings", [])],
+            ["BATTERY_CRUSH_RISK", "BATTERY_SHOCK_EXCEEDED"],
+        )
+        self.assertEqual(
+            [f["code"] for f in component_entries(light)[0].get("findings", [])],
+            ["BATTERY_SHOCK_EXCEEDED"],
+        )
         self.assertEqual(shell_outputs(heavy), shell_outputs(base))
         self.assertEqual(shell_outputs(light), shell_outputs(base))
 
@@ -178,7 +196,10 @@ class ShellSafetyIsolationTests(unittest.TestCase):
         entries = component_entries(with_components)
         self.assertEqual(len(entries), 2)
         self.assertEqual([entry["component_id"] for entry in entries], ["dup", "dup"])
-        self.assertNotEqual(entries[0]["status"], entries[1]["status"])
+        # Both cells fail the Hertz-calibrated shock channel (1758 g vs 500 g
+        # limit); the dedupe contract is that both entries are evaluated.
+        self.assertEqual(entries[0]["status"], "fail")
+        self.assertEqual(entries[1]["status"], "fail")
         self.assertEqual(shell_outputs(with_components), shell_outputs(base))
         with_population = run_pipeline(
             base_request(
@@ -203,8 +224,11 @@ class ShellSafetyIsolationTests(unittest.TestCase):
             base_request(components=[{"component_id": "b", "type": "battery", "mass_kg": 0.0}])
         )
         self.assertEqual(result["errors"], [])
-        status = component_entries(result)[0]["status"]
-        self.assertIn(status, ("pass", "not_evaluated"))
+        entry = component_entries(result)[0]
+        # The shock channel is mass-independent and the drop peaks at ~1758 g
+        # (Hertz-calibrated), far past the 500 g cell shock limit.
+        self.assertEqual(entry["status"], "fail")
+        self.assertEqual([f["code"] for f in entry.get("findings", [])], ["BATTERY_SHOCK_EXCEEDED"])
         self.assertEqual(shell_outputs(result), shell_outputs(base))
 
     def test_extreme_component_mass_fails_battery_shell_unchanged(self):

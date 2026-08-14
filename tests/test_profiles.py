@@ -230,6 +230,11 @@ class CombineUsageTests(unittest.TestCase):
 
 
 class AssumptionsTests(unittest.TestCase):
+    def test_drop_energy_reference_is_ultralight_default(self):
+        # 0.06 kg ultralight mouse in a 0.5 m free fall:
+        # 0.06 * 9.80665 * 0.5 = 0.2942 J, rounded to 0.29 J.
+        self.assertEqual(profiles.DROP_ENERGY_REFERENCE_J, 0.29)
+
     def test_assumptions_are_non_empty_and_documented(self):
         for key in profiles.PROFILE_KEYS:
             result = profiles.profile_usage(key)
@@ -239,7 +244,7 @@ class AssumptionsTests(unittest.TestCase):
                 self.assertIsInstance(assumption, str)
                 self.assertTrue(assumption)
             text = " ".join(result["assumptions"])
-            self.assertIn("0.49 J", text)
+            self.assertIn("0.29 J", text)
             self.assertIn("ISTA", text)
 
 

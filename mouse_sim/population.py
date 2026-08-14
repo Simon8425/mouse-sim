@@ -32,12 +32,16 @@ MIN_SAMPLE_COUNT = 100
 MAX_SAMPLE_COUNT = 100000
 PER_UNIT_FAILURES_CAP = 100
 WILSON_Z = 1.96
-# Screening linear-spring contact stiffness for the component load chain.
-# SCREENING VALUE, NOT CALIBRATED: measured effective contact stiffness for
-# plastic enclosures on rigid floors spans ~2e5-1e6 N/m, so this convention
-# under-predicts peak acceleration by up to ~3x; component shock verdicts
-# (battery/PCB/screw) are screening-only and should not be read as field
-# failure rates.  Overridable via config.contact_stiffness_n_per_m.
+# Default drop-impact contact model for the component load chain: the
+# nonlinear Hertz point-contact law (impact.estimate_impact with
+# effective_modulus_pa + contact_radius_m), with E_eff from the shell
+# material and the drop_sim.SURFACES floor table and a 2.0 mm corner
+# blend radius.  The legacy screening stiffness below is honored ONLY when
+# the user supplies contact_stiffness_n_per_m explicitly (calibrated
+# linear spring): its class values (plastic enclosures on rigid floors
+# span ~2e5-1e6 N/m) under-predict peak acceleration by up to ~3x, so it
+# is never the default.  Component shock verdicts (battery/PCB/screw) are
+# screening-only and should not be read as field failure rates.
 CONTACT_STIFFNESS_N_PER_M = 1e5
 LCG_MULTIPLIER = 2654435761
 LCG_INCREMENT = 0x9E3779B9
@@ -512,6 +516,7 @@ def _normalize_config(config, context, diagnostics=None):
         "drop_orientation",
         "components",
         "contact_stiffness_n_per_m",
+        "contact_radius_m",
         "worst_case",
     }
     unknown = sorted(set(source) - allowed)
@@ -577,16 +582,35 @@ def _normalize_config(config, context, diagnostics=None):
         raise ValueError(
             "config drop_orientation must be one of {}".format(", ".join(drop_sim.ORIENTATIONS))
         )
-    raw_stiffness = source.get("contact_stiffness_n_per_m", CONTACT_STIFFNESS_N_PER_M)
-    try:
-        contact_stiffness = float(raw_stiffness)
-    except (TypeError, ValueError):
-        raise ValueError("config contact_stiffness_n_per_m must be numeric")
-    if not math.isfinite(contact_stiffness) or contact_stiffness <= 0.0:
-        raise ValueError(
-            "config contact_stiffness_n_per_m must be a positive finite number "
-            "(got {!r})".format(raw_stiffness)
-        )
+    # The contact model defaults to the nonlinear Hertz point-contact law
+    # (contact_stiffness_n_per_m absent); an explicit value keeps the
+    # calibrated linear spring.
+    raw_stiffness = source.get("contact_stiffness_n_per_m")
+    contact_stiffness = None
+    if raw_stiffness is not None:
+        try:
+            contact_stiffness = float(raw_stiffness)
+        except (TypeError, ValueError):
+            raise ValueError("config contact_stiffness_n_per_m must be numeric")
+        if not math.isfinite(contact_stiffness) or contact_stiffness <= 0.0:
+            raise ValueError(
+                "config contact_stiffness_n_per_m must be a positive finite number "
+                "(got {!r})".format(raw_stiffness)
+            )
+    # Optional Hertz corner blend radius (default 2.0 mm applied in the
+    # contact resolution; an explicit value must be positive).
+    raw_radius = source.get("contact_radius_m")
+    contact_radius = None
+    if raw_radius is not None:
+        try:
+            contact_radius = float(raw_radius)
+        except (TypeError, ValueError):
+            raise ValueError("config contact_radius_m must be numeric")
+        if not math.isfinite(contact_radius) or contact_radius <= 0.0:
+            raise ValueError(
+                "config contact_radius_m must be a positive finite number "
+                "(got {!r})".format(raw_radius)
+            )
     return {
         "sample_count": sample_count,
         "profile": profile,
@@ -598,6 +622,7 @@ def _normalize_config(config, context, diagnostics=None):
         "drop_surface": drop_surface,
         "drop_orientation": drop_orientation,
         "contact_stiffness_n_per_m": contact_stiffness,
+        "contact_radius_m": contact_radius,
         "components": _normalize_components(source.get("components")),
         "worst_case": worst_case,
     }
@@ -701,7 +726,7 @@ def _apply_unit_dimensions(spec, params):
     return applied
 
 
-def _drop_summary(drop, height_m, effective_mass, surface, orientation, stiffness=None):
+def _drop_summary(drop, height_m, effective_mass, surface, orientation, contact_kwargs):
     peak = drop.get("peak") or {}
     first = (drop.get("drops") or [{}])[0]
     peak_speed = float(peak.get("impact_speed_m_s") or 0.0)
@@ -717,7 +742,7 @@ def _drop_summary(drop, height_m, effective_mass, surface, orientation, stiffnes
         effective_mass,
         velocity_m_s=v_capped,
         restitution=drop_sim.SURFACES[surface]["restitution"],
-        contact_stiffness_n_per_m=stiffness or CONTACT_STIFFNESS_N_PER_M,
+        **contact_kwargs,
     )
     accel_m_s2 = float(getattr(estimate, "peak_acceleration_m_s2", 0.0) or 0.0)
     return {
@@ -735,7 +760,29 @@ def _drop_summary(drop, height_m, effective_mass, surface, orientation, stiffnes
     }
 
 
-def _run_worst_case(config, context, usage, diagnostics):
+def _resolve_contact_model(config, context, diagnostics):
+    """Resolve the estimate_impact contact kwargs for population drops.
+
+    An explicit ``config.contact_stiffness_n_per_m`` keeps the calibrated
+    linear spring (the user's override); the DEFAULT is the nonlinear Hertz
+    point-contact law with E_eff from ``context.shell_hertz_pair`` and the
+    drop_sim.SURFACES floor table, and a corner blend radius defaulting to
+    ``impact.DEFAULT_CORNER_BLEND_RADIUS_M`` (2.0 mm).  A missing shell
+    material E/nu falls back to the generic polymer with a disclosed
+    diagnostic (never silent).  Returns ``(kwargs, model_label)``.
+    """
+    kwargs, label, disclosure = drop_sim.hertz_contact_kwargs(
+        context.get("shell_hertz_pair"),
+        config["drop_surface"],
+        explicit_stiffness_n_per_m=config.get("contact_stiffness_n_per_m"),
+        contact_radius_m=config.get("contact_radius_m"),
+    )
+    if disclosure is not None:
+        diagnostics.append(disclosure)
+    return kwargs, label
+
+
+def _run_worst_case(config, context, usage, diagnostics, contact_kwargs):
     """Deterministic worst-case analysis: every tolerance at its band edge.
 
     This is NOT a Monte Carlo tail observation — it is a single unit at the
@@ -830,7 +877,7 @@ def _run_worst_case(config, context, usage, diagnostics):
         effective_mass,
         config["drop_surface"],
         wc["orientation"],
-        stiffness=config["contact_stiffness_n_per_m"],
+        contact_kwargs,
     )
     restitution_scale_l, friction_scale_l, damage, _ = lifecycle.degradation_factors(usage)
     component_context = _component_context(
@@ -872,6 +919,11 @@ def _run_worst_case(config, context, usage, diagnostics):
         ),
         "physical-model confidence: screening (uncalibrated closed-form laws)",
     ]
+    if (
+        contact_kwargs.get("effective_modulus_pa") is not None
+        and config.get("contact_radius_m") is None
+    ):
+        assumptions.append(impact.DEFAULT_CORNER_BLEND_RADIUS_ASSUMPTION)
     if any_unevaluated:
         assumptions.append(
             "component analysis incomplete: unevaluated components are disclosed "
@@ -902,7 +954,7 @@ def _run_worst_case(config, context, usage, diagnostics):
         "analysis_incomplete": any_unevaluated,
         "assumptions": assumptions,
         "diagnostics": diagnostics + ["mode: deterministic worst-case (no Monte Carlo sampling)"],
-        "model": _model(config, context),
+        "model": _model(config, context, contact_kwargs),
     }
 
 
@@ -1094,7 +1146,7 @@ def _analyze_components(component_specs, component_context):
     return results
 
 
-def _process_unit(index, config, context):
+def _process_unit(index, config, context, contact_kwargs):
     base_seed = int(config["base_seed"])
     seed = (base_seed + index) & 0xFFFFFFFF
     tolerance_scale = config["tolerance_scale"]
@@ -1134,7 +1186,7 @@ def _process_unit(index, config, context):
     summary = _drop_summary(
         drop, config["drop_height_m"], effective_mass,
         config["drop_surface"], config["drop_orientation"],
-        stiffness=config.get("contact_stiffness_n_per_m"),
+        contact_kwargs,
     )
     component_context = _component_context(
         context, params, usage, damage, restitution_scale, friction_scale,
@@ -1314,11 +1366,11 @@ def _fold_unit(stats, record, params):
         shell_entry[4] += shell_failed
 
 
-def _process_chunk(indices, config, context):
+def _process_chunk(indices, config, context, contact_kwargs):
     stats = _empty_stats([spec.get("component_id") or spec["type"] for spec in config["components"]])
     units = []
     for index in indices:
-        record, params = _process_unit(index, config, context)
+        record, params = _process_unit(index, config, context, contact_kwargs)
         units.append(record)
         _fold_unit(stats, record, params)
     return {"units": units, "stats": stats}
@@ -1354,14 +1406,14 @@ def _process_pool_context():
         return None
 
 
-def _run_parallel(chunks, chunk_ranges, config, context, workers, diagnostics):
+def _run_parallel(chunks, chunk_ranges, config, context, workers, diagnostics, contact_kwargs):
     pool_context = _process_pool_context()
     if pool_context is None:
         return False
     try:
         with ProcessPoolExecutor(max_workers=workers, mp_context=pool_context) as executor:
             futures = [
-                executor.submit(_process_chunk, indices, config, context)
+                executor.submit(_process_chunk, indices, config, context, contact_kwargs)
                 for indices in chunk_ranges
             ]
             for future in futures:
@@ -1475,45 +1527,58 @@ def _per_unit_failures(per_unit_records):
     return records
 
 
-def _model(config, context):
+def _model(config, context, contact_kwargs):
+    assumptions = [
+        "per-unit output is a pure function of (unit_seed, config, context); units are "
+        "processed in fixed 64-unit chunks and merged in unit order, so worker count and "
+        "scheduling cannot affect the result",
+        "usage is profile-driven and identical for every unit; tolerance draws (including "
+        "skate thickness) do not change usage",
+        "drop mass/inertia/CoM variation uses the simulator unit-seed bands "
+        "(drop_sim._unit_variation); reported draws mirror the same LCG stream at "
+        "tolerance_scale = 1.0, and tolerance_scale = 0 runs the drop nominally",
+        "component failure models are deterministic screening estimates (platform "
+        "components_elec/components_mech analyzers when available, otherwise built-in "
+        "fallback models); battery placement offset and switch actuation force are "
+        "recorded but do not drive fallback verdicts",
+        "95% Wilson confidence interval with z = 1.96, clamped to [0, 1]",
+        "survival curve S(u) = fraction of units whose worst usage ratio (cycles/rating, "
+        "damage) has not yet been reached at usage fraction u (worst ratio >= u); the "
+        "curve is monotonic non-increasing",
+        "per-unit failure records are capped at 100 entries",
+        "component outcome vocabulary: pass/warn count as evaluated-and-non-failed; "
+        "fail counts as a failed unit; not_evaluated/unsupported/insufficient_evidence/"
+        "invalid_input are unevaluated — units with an unknown outcome (unevaluated "
+        "and not failed) are excluded from failure_rate, wilson_ci and the survival "
+        "curve and disclosed via units_unevaluated/evaluated_units/analysis_incomplete, "
+        "never silently counted as passing; failed units always count, even when "
+        "another component was unevaluated",
+    ]
+    if (
+        contact_kwargs.get("effective_modulus_pa") is not None
+        and config.get("contact_radius_m") is None
+    ):
+        assumptions.append(impact.DEFAULT_CORNER_BLEND_RADIUS_ASSUMPTION)
     return {
         "manufacturing_tolerances": [name for name, _ in MANUFACTURING_TOLERANCES],
         "drop": {
             "test": "drop",
-            "contact_stiffness_n_per_m": config.get("contact_stiffness_n_per_m", CONTACT_STIFFNESS_N_PER_M),
+            "contact_stiffness_n_per_m": config.get("contact_stiffness_n_per_m"),
+            "contact_radius_m": contact_kwargs.get("contact_radius_m"),
+            "effective_modulus_pa": contact_kwargs.get("effective_modulus_pa"),
             "drop_count": 1,
             "height_m": config["drop_height_m"],
             "surface": config["drop_surface"],
             "orientation": config["drop_orientation"],
-            "impact_model": "estimate_impact linear spring, k = 1e5 N/m",
+            "impact_model": (
+                "estimate_impact linear spring, k = {:.6g} N/m (explicit "
+                "override)".format(config["contact_stiffness_n_per_m"])
+                if config.get("contact_stiffness_n_per_m") is not None
+                else "estimate_impact Hertz nonlinear point contact (default)"
+            ),
             "restitution_source": "drop_sim.SURFACES[surface]",
         },
-        "assumptions": [
-            "per-unit output is a pure function of (unit_seed, config, context); units are "
-            "processed in fixed 64-unit chunks and merged in unit order, so worker count and "
-            "scheduling cannot affect the result",
-            "usage is profile-driven and identical for every unit; tolerance draws (including "
-            "skate thickness) do not change usage",
-            "drop mass/inertia/CoM variation uses the simulator unit-seed bands "
-            "(drop_sim._unit_variation); reported draws mirror the same LCG stream at "
-            "tolerance_scale = 1.0, and tolerance_scale = 0 runs the drop nominally",
-            "component failure models are deterministic screening estimates (platform "
-            "components_elec/components_mech analyzers when available, otherwise built-in "
-            "fallback models); battery placement offset and switch actuation force are "
-            "recorded but do not drive fallback verdicts",
-            "95% Wilson confidence interval with z = 1.96, clamped to [0, 1]",
-            "survival curve S(u) = fraction of units whose worst usage ratio (cycles/rating, "
-            "damage) has not yet been reached at usage fraction u (worst ratio >= u); the "
-            "curve is monotonic non-increasing",
-            "per-unit failure records are capped at 100 entries",
-            "component outcome vocabulary: pass/warn count as evaluated-and-non-failed; "
-            "fail counts as a failed unit; not_evaluated/unsupported/insufficient_evidence/"
-            "invalid_input are unevaluated — units with an unknown outcome (unevaluated "
-            "and not failed) are excluded from failure_rate, wilson_ci and the survival "
-            "curve and disclosed via units_unevaluated/evaluated_units/analysis_incomplete, "
-            "never silently counted as passing; failed units always count, even when "
-            "another component was unevaluated",
-        ],
+        "assumptions": assumptions,
     }
 
 
@@ -1575,7 +1640,7 @@ def _aggregate_diagnostics(config, context, total, per_unit_records):
     return lines
 
 
-def _assemble_result(config, context, total, per_unit_records, diagnostics):
+def _assemble_result(config, context, total, per_unit_records, diagnostics, contact_kwargs):
     n = config["sample_count"]
     units_failed = total["unit_failures"]
     units_unevaluated = total["unit_unevaluated"]
@@ -1672,7 +1737,7 @@ def _assemble_result(config, context, total, per_unit_records, diagnostics):
         "survival": _survival(total["ratio_bins"], total["survivors"], failure_denominator),
         "per_unit_failures": _per_unit_failures(per_unit_records),
         "total_component_failures": sum(total["component_failures"].values()),
-        "model": _model(config, context),
+        "model": _model(config, context, contact_kwargs),
         "diagnostics": diagnostics,
     }
 
@@ -1684,7 +1749,10 @@ def run_population(config, context):
     ``config``: sample_count (clamped to [100, 100000]), profile, lifespan_days,
     base_seed, workers, drop_height_m, drop_surface, drop_orientation,
     tolerance_scale, components (list of specs; default one spec per component
-    type), worst_case (deterministic corner analysis; see ``_run_worst_case``).
+    type), contact_stiffness_n_per_m (optional explicit linear-spring
+    override; the DEFAULT drop contact is the nonlinear Hertz point-contact
+    law), contact_radius_m (optional Hertz corner blend radius; default
+    2.0 mm), worst_case (deterministic corner analysis; see ``_run_worst_case``).
     ``context``: shared component context with mass_kg, inertia_kg_m2,
     support, materials, environment_temperature_k; drop/lifecycle are computed
     per unit.
@@ -1698,18 +1766,19 @@ def run_population(config, context):
     config = _normalize_config(config, context, config_diagnostics)
     usage = profile_usage(config["profile"], config["lifespan_days"])
     diagnostics = config_diagnostics + _base_diagnostics(config, context, usage)
+    contact_kwargs, _ = _resolve_contact_model(config, context, diagnostics)
     if config["worst_case"] is not None:
-        return _run_worst_case(config, context, usage, diagnostics)
+        return _run_worst_case(config, context, usage, diagnostics, contact_kwargs)
     chunk_ranges = [
         range(start, min(start + CHUNK_SIZE, config["sample_count"]))
         for start in range(0, config["sample_count"], CHUNK_SIZE)
     ]
     chunks = []
     if config["workers"] > 1:
-        _run_parallel(chunks, chunk_ranges, config, context, config["workers"], diagnostics)
+        _run_parallel(chunks, chunk_ranges, config, context, config["workers"], diagnostics, contact_kwargs)
     if not chunks:
         for indices in chunk_ranges:
-            chunks.append(_process_chunk(indices, config, context))
+            chunks.append(_process_chunk(indices, config, context, contact_kwargs))
     total = _empty_stats([spec["component_id"] for spec in config["components"]])
     per_unit_records = []
     for chunk in chunks:
@@ -1718,7 +1787,7 @@ def run_population(config, context):
     diagnostics.extend(
         _aggregate_diagnostics(config, context, total, per_unit_records)
     )
-    return _assemble_result(config, context, total, per_unit_records, diagnostics)
+    return _assemble_result(config, context, total, per_unit_records, diagnostics, contact_kwargs)
 
 
 __all__ = [

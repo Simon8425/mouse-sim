@@ -58,6 +58,26 @@ class NameSynonymClassificationTests(unittest.TestCase):
         self.assertEqual(item.component_type, "surface")
         self.assertTrue(item.unresolved)
 
+    def test_open_three_dimensional_mesh_classifies_as_shell(self):
+        vertices = [
+            (-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
+            (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1),
+        ]
+        triangles = [
+            (0, 2, 1), (0, 3, 2),
+            (0, 1, 5), (0, 5, 4),
+            (1, 2, 6), (1, 6, 5),
+            (2, 3, 7), (2, 7, 6),
+            (3, 0, 4), (3, 4, 7),
+        ]
+        mesh = TriangleMesh(vertices, triangles)
+        item = classify_objects({"TD011-CE": mesh})["TD011-CE"]
+        self.assertEqual(item.component_type, "shell")
+        self.assertFalse(item.unresolved)
+        self.assertGreater(item.confidence, 0.5)
+        self.assertTrue(any("three-dimensional extent" in reason for reason in item.reasons))
+        self.assertFalse(item.semantic_separation_claimed)
+
     def test_fused_object_never_claims_semantic_separation(self):
         item = classify_objects({"scroll": {"geometry": Box((1, 1, 1)), "fused": True}})["scroll"]
         self.assertTrue(item.unresolved)

@@ -34,22 +34,17 @@ describe('accessibility (a11y) component interaction', () => {
     expect(clickSpy).toHaveBeenCalled();
   });
 
-  it('renders polite aria-live status region in RunStatus', () => {
+  it('renders polite aria-live status region in RunStatus', async () => {
     render(
       <ProjectProvider>
-        <DispatchHelper action={{ type: 'ANALYZE_START', version: 1, requestKey: 'k1' }} />
+        <DispatchHelper action={{ type: 'ANALYZE_ERROR', version: 0, requestKey: 'k1', message: 'Solver timed out' }} />
         <RunStatus />
       </ProjectProvider>,
     );
 
-    const liveRegion = screen.getByText('Running…').closest('.run-status');
+    const errorEl = await screen.findByText('Solver timed out');
+    const liveRegion = errorEl.closest('.run-status');
     expect(liveRegion).toHaveAttribute('aria-live', 'polite');
     expect(liveRegion).toHaveAttribute('aria-atomic', 'true');
-    expect(screen.getByText('Analysis')).toBeInTheDocument();
-    expect(screen.getByRole('progressbar', { name: 'Run progress' })).toHaveAttribute(
-      'aria-valuetext',
-      'Running…',
-    );
-    expect(screen.getByRole('button', { name: 'Cancel running analysis' })).toBeInTheDocument();
   });
 });

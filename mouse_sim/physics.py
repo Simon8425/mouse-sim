@@ -19,13 +19,30 @@ NUMERIC_OVERFLOW = "NUMERIC_OVERFLOW"
 THIN_SHELL_OUT_OF_RANGE = "THIN_SHELL_OUT_OF_RANGE"
 SMALL_DEFLECTION_VIOLATED = "SMALL_DEFLECTION_VIOLATED"
 POINT_LOAD_SINGULARITY = "POINT_LOAD_SINGULARITY"
+POINT_LOAD_STRESS_ORDER_DEPENDENT = "POINT_LOAD_STRESS_ORDER_DEPENDENT"
 UNSUPPORTED_STIFFNESS_REDUCTION = "UNSUPPORTED_STIFFNESS_REDUCTION"
 UNSUPPORTED_ANISOTROPY = "UNSUPPORTED_ANISOTROPY"
+MISSING_ORTHOTROPIC_E2 = "MISSING_ORTHOTROPIC_E2"
 UNDERCONSTRAINED_REACTIONS = "UNDERCONSTRAINED_REACTIONS"
 INVALID_LOAD_UNITS = "INVALID_LOAD_UNITS"
 INVALID_LOAD_VALUE = "INVALID_LOAD_VALUE"
 INVALID_LOAD_LOCATION = "INVALID_LOAD_LOCATION"
 INVALID_POISSON_RATIO = "INVALID_POISSON_RATIO"
+MISSING_BEAM_DIMENSION = "MISSING_BEAM_DIMENSION"
+MISSING_LOAD_MAGNITUDE = "MISSING_LOAD_MAGNITUDE"
+UNKNOWN_LOAD_KIND = "UNKNOWN_LOAD_KIND"
+USAGE_TEMPERATURE_OUT_OF_RANGE = "USAGE_TEMPERATURE_OUT_OF_RANGE"
+SOLVER_EVALUATION_ERROR = "SOLVER_EVALUATION_ERROR"
+INVALID_TEMPERATURE_K = "INVALID_TEMPERATURE_K"
+UNKNOWN_BEAM_SUPPORT = "UNKNOWN_BEAM_SUPPORT"
+
+# Point-load stress from the truncated Navier series grows with series order
+# (the moment series at the load point diverges logarithmically); the flag is
+# emitted alongside POINT_LOAD_SINGULARITY with this disclosure.
+POINT_LOAD_STRESS_ORDER_ASSUMPTION = (
+    "point-load stress is order-truncation dependent (effective smearing"
+    " radius ~ a/(2*order)); not suitable for acceptance"
+)
 
 # The Navier double-sine series is capped so a hostile ``series_order``
 # cannot trigger an effectively unbounded loop; 49 keeps 25x25 terms, far
@@ -86,6 +103,9 @@ class StructuralResponse:
     max_stress_pa: Optional[float] = None
     max_stress_filtered_pa: Optional[float] = None
     filtered_location: Optional[Vector3] = None
+    max_shear_pa: Optional[float] = None
+    corner_twisting_vm_pa: Optional[float] = None
+    peak_location_m: Optional[Vector3] = None
     safety_factor: Optional[float] = None
     safety_factor_status: str = "not_available"
     feature_peak_stress_pa: Optional[float] = None
@@ -110,6 +130,9 @@ class StructuralResponse:
             "max_stress_pa": self.max_stress_pa,
             "max_stress_filtered_pa": self.max_stress_filtered_pa,
             "filtered_location": filtered,
+            "max_shear_pa": self.max_shear_pa,
+            "corner_twisting_vm_pa": self.corner_twisting_vm_pa,
+            "peak_location_m": None if self.peak_location_m is None else list(self.peak_location_m),
             "safety_factor": self.safety_factor,
             "safety_factor_status": self.safety_factor_status,
             "feature_peak_stress_pa": self.feature_peak_stress_pa,
@@ -250,6 +273,10 @@ def _beam_dims(structure):
 # Covestro / BASF / DuPont); materials without a coefficient are not derated.
 _FAMILY_DERATE_PER_K = {"generic_polymer": 0.0045}
 _DERATE_REFERENCE_TEMP_K = 293.15
+# The linear derating factor is clamped at this floor: beyond the temperature
+# where the raw factor would go negative the properties are held at
+# floor*E rather than producing negative (unphysical) stiffness.
+DERATE_FACTOR_FLOOR = 0.1
 
 
 def _derate_coefficient(name, family, material_key=None):
@@ -297,7 +324,13 @@ def _material_props(material, temperature_k=None):
     ``info`` carries directional (orthotropic) stiffness data, anisotropy
     flags, weld-line knockdown, continuous-use temperature range, and the
     linear derating coefficient; modulus and allowable are derated in place
-    when ``temperature_k`` is above the 293.15 K reference.
+    when ``temperature_k`` is above the 293.15 K reference.  All modulus
+    data (E1, E2, E3, G12, G13) and the allowable share the same derating
+    factor, clamped at :data:`DERATE_FACTOR_FLOOR` so elevated temperatures
+    can never produce negative stiffness.  Mapping payloads may carry the
+    catalog identity (``name``/``family``/``key``/``material_key``) used to
+    look the derating coefficient up; without it no derating is applied and
+    ``info["derating_skipped"]`` is set.
     """
     name = ""
     family = ""
@@ -309,6 +342,11 @@ def _material_props(material, temperature_k=None):
         material_key = str(material.meta.id).removeprefix("mat_").removesuffix("_v1")
         anisotropy_supported = material.anisotropy_supported
         material = material.properties
+        if material is None:
+            # A MaterialDefinition whose properties payload is missing: the
+            # Mapping branch below flags the missing stiffness instead of
+            # crashing (never-crash contract).
+            material = {}
     if isinstance(material, MaterialProperties):
         E = material.young_modulus.value_si if material.young_modulus is not None else None
         nu = material.poissons_ratio
@@ -323,6 +361,22 @@ def _material_props(material, temperature_k=None):
         use_min = material.continuous_use_temperature_min_k
         use_max = material.continuous_use_temperature_max_k
     else:
+        # A MaterialDefinition.to_dict() snapshot nests the property payload
+        # under "properties" with the dataclass field names and Quantity
+        # encodings ({"value_si": ..., "unit": ...}); unwrap it into the
+        # flat SI mapping the branch reads.
+        nested = material.get("properties")
+        if isinstance(nested, Mapping):
+            flat = dict(material)
+            for key, value in nested.items():
+                if key == "young_modulus":
+                    key = "young_modulus_pa"
+                elif key == "tensile_allowable":
+                    key = "tensile_allowable_pa"
+                if isinstance(value, Mapping) and "value_si" in value:
+                    value = value["value_si"]
+                flat.setdefault(key, value)
+            material = flat
         E = material.get("young_modulus_pa")
         if E is None:
             E = material.get("youngs_modulus_pa")
@@ -337,17 +391,43 @@ def _material_props(material, temperature_k=None):
         weld_line_factor = material.get("weld_line_factor")
         use_min = material.get("continuous_use_temperature_min_k")
         use_max = material.get("continuous_use_temperature_max_k")
+        # Mapping payloads carry the catalog identity in flat keys
+        # (name/family/material_key); without it the derating coefficient
+        # cannot be looked up and derating would be silently skipped while
+        # the MaterialDefinition path derates.
+        name = material.get("name", "")
+        family = material.get("family", "")
+        material_key = material.get("material_key") or material.get("key")
+        if material_key is None:
+            meta = material.get("meta")
+            if isinstance(meta, Mapping):
+                mid = meta.get("id")
+                if mid is not None:
+                    material_key = str(mid).removeprefix("mat_").removesuffix("_v1")
+        anisotropy_supported = bool(material.get("anisotropy_supported", False))
     directional = all(value is not None for value in (E2, E3, G12, nu12))
     k_derate = _derate_coefficient(name, family, material_key)
     derating_applied = False
+    factor_clamped = False
     if (
         temperature_k is not None
         and k_derate is not None
         and temperature_k > _DERATE_REFERENCE_TEMP_K
     ):
         factor = 1.0 - k_derate * (temperature_k - _DERATE_REFERENCE_TEMP_K)
+        if factor < DERATE_FACTOR_FLOOR:
+            factor = DERATE_FACTOR_FLOOR
+            factor_clamped = True
         if E is not None:
             E = E * factor
+        if E2 is not None:
+            E2 = E2 * factor
+        if E3 is not None:
+            E3 = E3 * factor
+        if G12 is not None:
+            G12 = G12 * factor
+        if G13 is not None:
+            G13 = G13 * factor
         if allowable is not None:
             allowable = allowable * factor
         derating_applied = True
@@ -367,6 +447,16 @@ def _material_props(material, temperature_k=None):
         "k_derate": k_derate,
         "temperature_k": temperature_k,
         "derating_applied": derating_applied,
+        "factor_clamped": factor_clamped,
+        "derating_skipped": (
+            temperature_k is not None
+            and temperature_k > _DERATE_REFERENCE_TEMP_K
+            and k_derate is None
+        ),
+        "E2_missing": E2 is None,
+        "partial_directional": E2 is None and any(
+            value is not None for value in (E3, G12, G13, nu12, nu13)
+        ),
     }
     return E, nu, allowable, info
 
@@ -381,7 +471,9 @@ def _load_magnitude(load, key, expected_dimension=None):
     value = load.get(key)
     if isinstance(value, Mapping):
         if "unit" in value:
-            return to_si(value.get("value", 0.0), value["unit"], expected_dimension)
+            if "value" not in value:
+                return None
+            return to_si(value["value"], value["unit"], expected_dimension)
         value = value.get("value")
     return value
 
@@ -391,17 +483,31 @@ def _isotropic_plate_stiffness(E, nu, t):
     return D, nu * D, D, D * (1.0 - nu) / 2.0
 
 
-def _orthotropic_plate_stiffness(E, nu12, G12, t):
+def _orthotropic_plate_stiffness(E, E2, nu12, G12, t):
     """Plate stiffnesses for a unidirectional/laminate orthotropic shell.
 
-    D11 = D22 = E1*t^3/(12*(1-nu12^2)), D12 = nu12*D11, D66 = G12*t^3/12
-    (classical lamination plate theory; E3/G13 enter only transverse shear,
-    which the thin-plate Kirchhoff model does not carry).
+    Classical lamination plate theory for a specially orthotropic lamina
+    (E3/G13 enter only transverse shear, which the thin-plate Kirchhoff
+    model does not carry):
+
+        nu21 = nu12*E2/E1
+        D11 = E1*t^3/(12*(1-nu12*nu21))
+        D22 = E2*t^3/(12*(1-nu12*nu21))
+        D12 = nu12*D22 = nu21*D11
+        D66 = G12*t^3/12
+
+    D22 reduces to D11 (and D12 to nu12*D11) exactly when E2 = E1, so the
+    orthotropic solver reduces to the isotropic one for E2 = E1 and the
+    isotropic-compatible shear modulus.  Callers must supply E2 from the
+    material's directional data; E2 may never be silently replaced by E1.
     """
-    D11 = E * t ** 3 / (12.0 * (1.0 - nu12 * nu12))
-    D12 = nu12 * D11
+    nu21 = nu12 * E2 / E
+    den = 1.0 - nu12 * nu21
+    D11 = E * t ** 3 / (12.0 * den)
+    D22 = E2 * t ** 3 / (12.0 * den)
+    D12 = nu12 * D22
     D66 = G12 * t ** 3 / 12.0
-    return D11, D12, D11, D66
+    return D11, D12, D22, D66
 
 
 def _shell_fields(a, b, t, E, nu, wmn, series_order, D11=None, D12=None, D22=None, D66=None):
@@ -435,9 +541,13 @@ def _shell_fields(a, b, t, E, nu, wmn, series_order, D11=None, D12=None, D22=Non
     stress = [[[0.0] * 5 for _ in range(5)] for _ in range(2)]
     for j in range(5):
         for i in range(5):
-            # Orthotropic moment resultants Mx = -(D11*kx + D12*ky),
-            # My = -(D12*kx + D22*ky), Mxy = 2*D66*kxy; reduce exactly to the
-            # isotropic forms for D11=D22=D, D12=nu*D, D66=D*(1-nu)/2.
+            # The accumulated mxx/myy/mxy fields are the NEGATED curvatures
+            # of the Navier series (mxx = -w,xx, myy = -w,yy, mxy = -w,xy),
+            # so the resultants below evaluate to
+            # Mx = +(D11*w,xx + D12*w,yy), My = +(D12*w,xx + D22*w,yy),
+            # Mxy = -2*D66*w,xy — the OPPOSITE sign of the usual Timoshenko
+            # convention Mx = -D*(w,xx + nu*w,yy).  Von Mises stress is
+            # sign-invariant, so the reported VM is unaffected.
             mx = -(D11 * mxx[j][i] + D12 * myy[j][i])
             my = -(D12 * mxx[j][i] + D22 * myy[j][i])
             txy = 2.0 * D66 * mxy[j][i]
@@ -472,19 +582,25 @@ def _box_filter(field):
     return filtered
 
 
-def _stress_peak(fields, t, a=None, b=None):
+def _stress_peak(fields, t, a=None, b=None, interior=False):
     """Peak von Mises stress and location in metres.
 
     Grid indices i,j are converted to physical coordinates with the plate
     dimensions ``a``, ``b`` when supplied (x = a*i/4, y = b*j/4, z in
-    metres); without dimensions the grid fractions are returned.
+    metres); without dimensions the grid fractions are returned.  With
+    ``interior=True`` only the interior 3x3 grid nodes (i,j in 1..3) are
+    considered: the boundary nodes carry an idealized simply-supported
+    corner artifact (Mx = My = 0 with Mxy != 0) whose twisting-moment von
+    Mises peak over-reports the panel by ~17% on a square panel; the
+    interior maximum is the classical center value for uniform loads.
     """
+    rows = (1, 2, 3) if interior else range(5)
     best = -1.0
     location = (0.0, 0.0, 0.0)
     for z in (0, 1):
         z_loc = t / 2.0 if z else -t / 2.0
-        for j in range(5):
-            for i in range(5):
+        for j in rows:
+            for i in rows:
                 value = fields[z][j][i]
                 if value > best:
                     best = value
@@ -502,12 +618,21 @@ def _shell_response(method_id, a, b, t, E, nu, w, stress, flags, assumptions,
                     validity, allowable_pa, reactions, force_residual,
                     moment_residual, unsupported, displacement_location=None):
     w_max, (gx, gy) = _grid_max(w)
-    raw, _ = _stress_peak(stress, t, a, b)
+    # Primary peak over the INTERIOR 3x3 nodes only (excludes the 16
+    # boundary nodes): the boundary carries an idealized-SSSS corner
+    # twisting-moment artifact that over-reports the uniform-load peak by
+    # ~17% on a square panel.  The corner twisting-moment von Mises value is
+    # kept as the corner_twisting_vm_pa diagnostic.
+    raw, raw_loc = _stress_peak(stress, t, a, b, interior=True)
     smoothed = [_box_filter(stress[z]) for z in (0, 1)]
     filtered, filtered_loc = _stress_peak(smoothed, t, a, b)
+    corner_twisting_vm_pa = 0.0
+    for j in (0, 4):
+        for i in (0, 4):
+            corner_twisting_vm_pa = max(corner_twisting_vm_pa, stress[0][j][i])
     if displacement_location is None:
         displacement_location = (a * gx, b * gy, 0.0)
-    # Safety factor uses the raw peak stress; the box-filtered value is
+    # Safety factor uses the interior peak stress; the box-filtered value is
     # reported separately as a screening diagnostic.
     factor, status = _safety(allowable_pa, raw)
     return StructuralResponse(
@@ -517,6 +642,8 @@ def _shell_response(method_id, a, b, t, E, nu, w, stress, flags, assumptions,
         max_stress_pa=raw,
         max_stress_filtered_pa=filtered,
         filtered_location=filtered_loc,
+        corner_twisting_vm_pa=corner_twisting_vm_pa,
+        peak_location_m=raw_loc,
         safety_factor=factor,
         safety_factor_status=status,
         reactions=reactions,
@@ -685,7 +812,7 @@ def _shell_point_load_response(a, b, t, E, nu, force_n, location, allowable_pa=N
 def _orthotropic_shell_stiffness(E, info, t):
     """Plate stiffnesses when the material carries directional data, else None."""
     if info.get("directional"):
-        return _orthotropic_plate_stiffness(E, info["nu12"], info["G12"], t)
+        return _orthotropic_plate_stiffness(E, info["E2"], info["nu12"], info["G12"], t)
     return None, None, None, None
 
 
@@ -705,6 +832,31 @@ def _feature_stress_concentration(load):
     else:
         k_t, q = 1.0, 0.0
     return 1.0 + q * (k_t - 1.0)
+
+
+def _usage_temperature_out_of_range(info):
+    """True when the operating temperature is beyond the continuous-use range.
+
+    The range is the material's stored continuous-use interval when present;
+    otherwise (or additionally) the linear-derating temperature at which the
+    factor would hit :data:`DERATE_FACTOR_FLOOR` marks the limit, matching
+    the floor clamping in ``_material_props``.
+    """
+    temperature_k = info.get("temperature_k")
+    if temperature_k is None:
+        return False
+    use_min = info.get("continuous_use_min_k")
+    use_max = info.get("continuous_use_max_k")
+    if use_min is not None and temperature_k < use_min:
+        return True
+    if use_max is not None and temperature_k > use_max:
+        return True
+    k_derate = info.get("k_derate")
+    if k_derate is not None:
+        floor_temperature = _DERATE_REFERENCE_TEMP_K + (1.0 - DERATE_FACTOR_FLOOR) / k_derate
+        if temperature_k > floor_temperature:
+            return True
+    return False
 
 
 def _disclose(result, info, allowable, shell, load=None):
@@ -730,6 +882,19 @@ def _disclose(result, info, allowable, shell, load=None):
             " (source: supplier modulus-vs-temperature curves)".format(temperature_k)
         )
         reasons.append("temperature derating applied at T={} K".format(temperature_k))
+        if info.get("factor_clamped"):
+            assumptions.append(
+                "temperature derating factor clamped at floor {}: beyond the"
+                " linear-derating validity the properties are held at the floor"
+                " (never negative)".format(DERATE_FACTOR_FLOOR)
+            )
+    if info.get("derating_skipped"):
+        assumptions.append(
+            "temperature derating skipped: no derating coefficient for this material"
+        )
+        reasons.append("temperature derating skipped: no derating coefficient for this material")
+    if _usage_temperature_out_of_range(info):
+        reasons.append("usage temperature outside continuous-use range")
     use_min = info.get("continuous_use_min_k")
     use_max = info.get("continuous_use_max_k")
     if (
@@ -738,7 +903,10 @@ def _disclose(result, info, allowable, shell, load=None):
         and use_max is not None
         and not (use_min <= temperature_k <= use_max)
     ):
-        reasons.append("usage temperature outside continuous-use range")
+        assumptions.append(
+            "usage temperature T={} K outside continuous-use range [{}, {}] K;"
+            " results approximate".format(temperature_k, use_min, use_max)
+        )
     anisotropy_supported = info.get("anisotropy_supported")
     if anisotropy_supported and (not shell or not info.get("directional")):
         flags.append(UNSUPPORTED_ANISOTROPY)
@@ -750,6 +918,15 @@ def _disclose(result, info, allowable, shell, load=None):
         reasons.append(
             "anisotropic material evaluated with an isotropic closed-form model"
         )
+    if info.get("E2_missing") and (
+        anisotropy_supported or info.get("partial_directional")
+    ):
+        flags.append(MISSING_ORTHOTROPIC_E2)
+        assumptions.append(
+            "orthotropic stiffness data incomplete: E2 (young_modulus_transverse_pa)"
+            " missing; isotropic E1-based path used (E2 not assumed equal to E1)"
+        )
+        reasons.append("E2 missing; orthotropic stiffness not applied, isotropic E1 fallback")
     weld = info.get("weld_line_factor")
     if (
         weld is not None
@@ -788,8 +965,18 @@ def _disclose(result, info, allowable, shell, load=None):
 
 
 def beam_response(load_type, L_m, E_pa, I_m4, A_m2, nu, force_n=None,
-                  q_n_per_m=None, section_modulus_m3=None, allowable_pa=None):
-    """Closed-form Euler-Bernoulli beam response for four load cases."""
+                  q_n_per_m=None, section_modulus_m3=None, allowable_pa=None,
+                  location_m=None):
+    """Closed-form Euler-Bernoulli beam response for four load cases.
+
+    ``location_m`` places a point load at a distance from the fixed end
+    (cantilever) or from the left support (simply supported); when omitted
+    the load is applied at the free tip / midspan.  The reported
+    ``max_stress_pa`` is a conservative von Mises bound combining the
+    extreme-fiber bending stress sigma = M/Z with the neutral-axis shear
+    proxy tau = 1.5*V/A (non-co-located); ``max_shear_pa`` reports tau
+    separately.
+    """
     L = _positive(L_m, "L_m")
     E = _positive(E_pa, "E_pa")
     I = _positive(I_m4, "I_m4")
@@ -806,17 +993,52 @@ def beam_response(load_type, L_m, E_pa, I_m4, A_m2, nu, force_n=None,
         raise ValueError("unknown load_type {!r}".format(load_type))
     shape, support = specs[load_type]
     cantilever = support == "cantilever"
+    x0 = None
     try:
         if shape == "point":
             if force_n is None:
                 raise ValueError("force_n required for a point load")
             P = _finite(force_n, "force_n")
-            deflection = P * L ** 3 / (3.0 * E * I) if cantilever else P * L ** 3 / (48.0 * E * I)
-            moment = P * L if cantilever else P * L / 4.0
-            shear = P if cantilever else P / 2.0
-            reactions = {"R1": P, "R2": 0.0} if cantilever else {"R1": P / 2.0, "R2": P / 2.0}
+            if location_m is None:
+                deflection = P * L ** 3 / (3.0 * E * I) if cantilever else P * L ** 3 / (48.0 * E * I)
+                moment = P * L if cantilever else P * L / 4.0
+                shear = P if cantilever else P / 2.0
+                reactions = {"R1": P, "R2": 0.0} if cantilever else {"R1": P / 2.0, "R2": P / 2.0}
+                formula = "w = P*L^3/(3*E*I), Mmax = P*L" if cantilever else "w = P*L^3/(48*E*I), Mmax = P*L/4"
+                location_note = (
+                    "point load applied at the free tip (no location specified)"
+                    if cantilever else
+                    "point load applied at midspan (no location specified)"
+                )
+            else:
+                x0 = _finite(location_m, "location_m")
+                if not 0.0 <= x0 <= L:
+                    raise ValueError("point load location must lie within the beam span")
+                if cantilever:
+                    # Roark (Tables 8.1.1-8.1.2): load P at distance a from
+                    # the fixed end: Mmax = P*a at the support, deflection at
+                    # the load point w(a) = P*a^3/(3*E*I).
+                    deflection = P * x0 ** 3 / (3.0 * E * I)
+                    moment = P * x0
+                    shear = P
+                    reactions = {"R1": P, "R2": 0.0}
+                    formula = ("point load at x0={:.6g} m: w(x0) = P*x0^3/(3*E*I),"
+                               " Mmax = P*x0 at support".format(x0))
+                else:
+                    # Roark (Tables 8.1.1-8.1.4): load P at x0 from the left
+                    # support: reactions P*(L-x0)/L and P*x0/L, Mmax =
+                    # P*x0*(L-x0)/L at x0, deflection at x0
+                    # w = P*x0^2*(L-x0)^2/(3*E*I*L).
+                    b = L - x0
+                    deflection = P * x0 * x0 * b * b / (3.0 * E * I * L)
+                    moment = P * x0 * b / L
+                    shear = P * max(x0, b) / L
+                    reactions = {"R1": P * b / L, "R2": P * x0 / L}
+                    formula = ("point load at x0={:.6g} m: w(x0) ="
+                               " P*x0^2*(L-x0)^2/(3*E*I*L), Mmax = P*x0*(L-x0)/L"
+                               " at x0".format(x0))
+                location_note = "point load location honored: x0 = {:.6g} m".format(x0)
             applied = P
-            formula = "w = P*L^3/(3*E*I), Mmax = P*L" if cantilever else "w = P*L^3/(48*E*I), Mmax = P*L/4"
         else:
             if q_n_per_m is None:
                 raise ValueError("q_n_per_m required for a uniform load")
@@ -827,6 +1049,7 @@ def beam_response(load_type, L_m, E_pa, I_m4, A_m2, nu, force_n=None,
             reactions = {"R1": q * L, "R2": 0.0} if cantilever else {"R1": q * L / 2.0, "R2": q * L / 2.0}
             applied = q * L
             formula = "w = q*L^4/(8*E*I), Mmax = q*L^2/2" if cantilever else "w = 5*q*L^4/(384*E*I), Mmax = q*L^2/8"
+            location_note = None
     except OverflowError:
         return _overflow_response(BEAM_METHOD)
     if cantilever:
@@ -840,12 +1063,22 @@ def beam_response(load_type, L_m, E_pa, I_m4, A_m2, nu, force_n=None,
     ) or any(not math.isfinite(value) for value in reactions.values()):
         return _overflow_response(BEAM_METHOD)
     factor, status = _safety(allowable_pa, vm)
-    peak_loc = (0.0, 0.0, 0.0) if cantilever else (L / 2.0, 0.0, 0.0)
-    tip_loc = (L, 0.0, 0.0) if cantilever else (L / 2.0, 0.0, 0.0)
+    if x0 is None:
+        peak_loc = (0.0, 0.0, 0.0) if cantilever else (L / 2.0, 0.0, 0.0)
+        tip_loc = (L, 0.0, 0.0) if cantilever else (L / 2.0, 0.0, 0.0)
+    else:
+        peak_loc = (0.0, 0.0, 0.0) if cantilever else (x0, 0.0, 0.0)
+        tip_loc = (x0, 0.0, 0.0)
     assumptions = BEAM_ASSUMPTIONS + (
         formula,
         "force balance via reactions: sum(R) = {:.6g} N; moment residual zero by statics".format(applied),
+        "max_stress_pa is a conservative von Mises bound: bending sigma = M/Z"
+        " (extreme fiber, tau = 0 there) combined with tau = 1.5*V/A (neutral"
+        " axis, sigma = 0 there); non-co-located stresses; max_shear_pa reports"
+        " tau separately",
     )
+    if location_note is not None:
+        assumptions = assumptions + (location_note,)
     return StructuralResponse(
         method_id=BEAM_METHOD,
         max_displacement_m=deflection,
@@ -853,6 +1086,8 @@ def beam_response(load_type, L_m, E_pa, I_m4, A_m2, nu, force_n=None,
         max_stress_pa=vm,
         max_stress_filtered_pa=vm,
         filtered_location=peak_loc,
+        max_shear_pa=tau,
+        peak_location_m=peak_loc,
         safety_factor=factor,
         safety_factor_status=status,
         reactions=reactions,
@@ -866,10 +1101,29 @@ def beam_response(load_type, L_m, E_pa, I_m4, A_m2, nu, force_n=None,
 
 
 def solve_load_case(load_case_dict, structure_dict, material_dict, fixtures=None, solver=None):
+    """Dispatch a load case to the appropriate closed-form surrogate.
+
+    Never raises: any ValueError escaping the dispatch is converted into a
+    flagged inconclusive response (``SOLVER_EVALUATION_ERROR``), preserving
+    the never-crash contract for hostile or degenerate inputs.
+    """
+    try:
+        return _solve_load_case(load_case_dict, structure_dict, material_dict, fixtures, solver)
+    except ValueError as exc:
+        return _blank_response(
+            (SOLVER_EVALUATION_ERROR,),
+            ("structural evaluation failed: {}".format(exc),),
+            validity="inconclusive",
+        )
+
+
+def _solve_load_case(load_case_dict, structure_dict, material_dict, fixtures=None, solver=None):
     """Dispatch a load case to the appropriate closed-form surrogate."""
     load = load_case_dict if isinstance(load_case_dict, Mapping) else {}
     structure = structure_dict if isinstance(structure_dict, Mapping) else {}
     material = material_dict if isinstance(material_dict, (Mapping, MaterialProperties, MaterialDefinition)) else {}
+    flags = []
+    assumptions = []
     temperature_k = structure.get("temperature_k")
     if temperature_k is None:
         temperature_k = load.get("temperature_k")
@@ -877,10 +1131,10 @@ def solve_load_case(load_case_dict, structure_dict, material_dict, fixtures=None
         try:
             temperature_k = _finite(temperature_k, "temperature_k")
         except (TypeError, ValueError):
+            flags.append(INVALID_TEMPERATURE_K)
+            assumptions.append("temperature_k not numeric; temperature derating skipped")
             temperature_k = None
     E, nu, allowable, info = _material_props(material, temperature_k)
-    flags = []
-    assumptions = []
     if E is None:
         flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
         assumptions.append("young modulus unavailable; stiffness cannot be computed")
@@ -916,6 +1170,7 @@ def solve_load_case(load_case_dict, structure_dict, material_dict, fixtures=None
         L, I, A, Z = _beam_dims(structure)
         for name, value in (("L_m", L), ("I_m4", I), ("A_m2", A)):
             if value is None:
+                flags.append(MISSING_BEAM_DIMENSION)
                 flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
                 assumptions.append("beam structure requires {}".format(name))
                 dims_ok = False
@@ -923,6 +1178,7 @@ def solve_load_case(load_case_dict, structure_dict, material_dict, fixtures=None
             try:
                 _positive(value, name)
             except ValueError as exc:
+                flags.append(MISSING_BEAM_DIMENSION)
                 flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
                 assumptions.append(str(exc))
                 dims_ok = False
@@ -931,13 +1187,18 @@ def solve_load_case(load_case_dict, structure_dict, material_dict, fixtures=None
             try:
                 _positive(Z, "section_modulus_m3")
             except ValueError as exc:
+                flags.append(MISSING_BEAM_DIMENSION)
                 flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
                 assumptions.append(str(exc))
                 dims_ok = False
+        if dims_ok and Z is None:
+            flags.append(MISSING_BEAM_DIMENSION)
+            assumptions.append("beam section_modulus_m3 missing; max stress not reported")
     if not dims_ok:
         return _blank_response(flags, assumptions)
     kind = load.get("kind")
     if kind is None:
+        flags.append(MISSING_LOAD_MAGNITUDE)
         flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
         return _blank_response(flags, assumptions + ["load_case_dict missing kind",])
     if kind == "pressure":
@@ -947,6 +1208,7 @@ def solve_load_case(load_case_dict, structure_dict, material_dict, fixtures=None
             flags.append(INVALID_LOAD_UNITS)
             return _blank_response(flags, assumptions + [str(exc)])
         if p is None:
+            flags.append(MISSING_LOAD_MAGNITUDE)
             flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
             return _blank_response(flags, assumptions + ["pressure load requires magnitude_pa",])
         try:
@@ -968,6 +1230,7 @@ def solve_load_case(load_case_dict, structure_dict, material_dict, fixtures=None
             L, I, A, Z = _beam_dims(structure)
             width = structure.get("width_m")
             if width is None:
+                flags.append(MISSING_BEAM_DIMENSION)
                 flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
                 return _blank_response(flags, assumptions + ["beam pressure load requires width_m",])
             try:
@@ -976,6 +1239,13 @@ def solve_load_case(load_case_dict, structure_dict, material_dict, fixtures=None
                 flags.append(INVALID_LOAD_VALUE)
                 return _blank_response(flags, assumptions + [str(exc)])
             support = structure.get("support", "cantilever")
+            if "support" not in structure:
+                assumptions.append("support unspecified: defaulted to cantilever (conservative)")
+            elif support not in ("cantilever", "simply_supported"):
+                flags.append(UNKNOWN_BEAM_SUPPORT)
+                assumptions.append(
+                    "unknown beam support {!r} mapped to simply_supported".format(support)
+                )
             beam_type = "cantilever_uniform" if support == "cantilever" else "simply_supported_uniform"
             result = beam_response(beam_type, L, E, I, A, nu, q_n_per_m=q,
                                    section_modulus_m3=Z, allowable_pa=allowable)
@@ -988,6 +1258,7 @@ def solve_load_case(load_case_dict, structure_dict, material_dict, fixtures=None
             flags.append(INVALID_LOAD_UNITS)
             return _blank_response(flags, assumptions + [str(exc)])
         if F is None:
+            flags.append(MISSING_LOAD_MAGNITUDE)
             flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
             return _blank_response(flags, assumptions + ["force load requires force_n",])
         try:
@@ -998,7 +1269,9 @@ def solve_load_case(load_case_dict, structure_dict, material_dict, fixtures=None
         point = bool(load.get("point_load", False))
         if point:
             flags.append(POINT_LOAD_SINGULARITY)
+            flags.append(POINT_LOAD_STRESS_ORDER_DEPENDENT)
             assumptions.append("point load singularity: local contact stress not resolved")
+            assumptions.append(POINT_LOAD_STRESS_ORDER_ASSUMPTION)
         if s_type == "shell_panel":
             a, b, t = _shell_dims(structure)
             D11, D12, D22, D66 = _orthotropic_shell_stiffness(E, info, t)
@@ -1035,10 +1308,37 @@ def solve_load_case(load_case_dict, structure_dict, material_dict, fixtures=None
         else:
             L, I, A, Z = _beam_dims(structure)
             support = structure.get("support", "cantilever")
+            if "support" not in structure:
+                assumptions.append("support unspecified: defaulted to cantilever (conservative)")
+            elif support not in ("cantilever", "simply_supported"):
+                flags.append(UNKNOWN_BEAM_SUPPORT)
+                assumptions.append(
+                    "unknown beam support {!r} mapped to simply_supported".format(support)
+                )
             if point:
                 beam_type = "cantilever_point" if support == "cantilever" else "simply_supported_point"
+                location_m = None
+                location = load.get("location")
+                if location is not None:
+                    if isinstance(location, (tuple, list)) and len(location) >= 1:
+                        location = location[0]
+                    elif isinstance(location, (tuple, list)):
+                        location = None
+                    if location is not None:
+                        try:
+                            location_m = _finite(location, "location")
+                        except (TypeError, ValueError) as exc:
+                            flags.append(INVALID_LOAD_LOCATION)
+                            return _blank_response(flags, assumptions + [str(exc)])
+                        if not 0.0 <= location_m <= L:
+                            flags.append(INVALID_LOAD_LOCATION)
+                            return _blank_response(
+                                flags,
+                                assumptions + ["point load location must lie within the beam span"],
+                            )
                 result = beam_response(beam_type, L, E, I, A, nu, force_n=F,
-                                       section_modulus_m3=Z, allowable_pa=allowable)
+                                       section_modulus_m3=Z, allowable_pa=allowable,
+                                       location_m=location_m)
             else:
                 q = F / L
                 assumptions.append(
@@ -1063,6 +1363,7 @@ def solve_load_case(load_case_dict, structure_dict, material_dict, fixtures=None
         flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
         assumptions.append("torque loads not supported by closed-form surrogate")
         return _blank_response(flags, assumptions, validity="inconclusive")
+    flags.append(UNKNOWN_LOAD_KIND)
     flags.append(UNSUPPORTED_STIFFNESS_REDUCTION)
     return _blank_response(flags, assumptions + ["unknown load kind {!r}".format(kind),])
 
@@ -1078,7 +1379,12 @@ def _merged(result, flags, assumptions):
 
 
 def preflight_structural_case(load_case_dict, structure_dict, material_dict, fixtures=None):
-    """Return preflight issues as (code, severity, message) dicts."""
+    """Return preflight issues as (code, severity, message) dicts.
+
+    Mirrors ``solve_load_case`` validation: shell AND beam dimensions,
+    unknown load kinds, Mapping-valued magnitudes (accepted like the
+    solver), and temperature-range issues.
+    """
     issues = []
     load = load_case_dict if isinstance(load_case_dict, Mapping) else {}
     structure = structure_dict if isinstance(structure_dict, Mapping) else {}
@@ -1109,7 +1415,68 @@ def preflight_structural_case(load_case_dict, structure_dict, material_dict, fix
                 "severity": "warning",
                 "message": "panel thickness exceeds 10% of span; thin-plate theory approximate",
             })
-    E, nu, _, _ = _material_props(material)
+    else:
+        L, I, A, Z = _beam_dims(structure)
+        for name, value in (("L_m", L), ("I_m4", I), ("A_m2", A)):
+            if value is None:
+                issues.append({
+                    "code": MISSING_BEAM_DIMENSION,
+                    "severity": "error",
+                    "message": "beam structure requires {}".format(name),
+                })
+                continue
+            try:
+                _positive(value, name)
+            except (TypeError, ValueError) as exc:
+                issues.append({
+                    "code": "INVALID_STRUCTURE_DIMENSION",
+                    "severity": "error",
+                    "message": str(exc),
+                })
+        if Z is not None:
+            try:
+                _positive(Z, "section_modulus_m3")
+            except (TypeError, ValueError) as exc:
+                issues.append({
+                    "code": "INVALID_STRUCTURE_DIMENSION",
+                    "severity": "error",
+                    "message": str(exc),
+                })
+        elif Z is None:
+            issues.append({
+                "code": MISSING_BEAM_DIMENSION,
+                "severity": "warning",
+                "message": "beam section_modulus_m3 missing; max stress will not be reported",
+            })
+        if load.get("kind") == "pressure" and structure.get("width_m") is None:
+            issues.append({
+                "code": MISSING_BEAM_DIMENSION,
+                "severity": "error",
+                "message": "beam pressure load requires width_m",
+            })
+        elif load.get("kind") == "pressure":
+            try:
+                _positive(structure.get("width_m"), "width_m")
+            except (TypeError, ValueError) as exc:
+                issues.append({
+                    "code": "INVALID_STRUCTURE_DIMENSION",
+                    "severity": "error",
+                    "message": str(exc),
+                })
+    temperature_k = structure.get("temperature_k")
+    if temperature_k is None:
+        temperature_k = load.get("temperature_k")
+    if temperature_k is not None:
+        try:
+            temperature_k = _finite(temperature_k, "temperature_k")
+        except (TypeError, ValueError):
+            issues.append({
+                "code": INVALID_TEMPERATURE_K,
+                "severity": "warning",
+                "message": "temperature_k not numeric; temperature derating skipped",
+            })
+            temperature_k = None
+    E, nu, _, info = _material_props(material, temperature_k)
     if E is None:
         issues.append({
             "code": UNSUPPORTED_STIFFNESS_REDUCTION,
@@ -1124,18 +1491,63 @@ def preflight_structural_case(load_case_dict, structure_dict, material_dict, fix
             "severity": "error",
             "message": str(exc),
         })
+    if _usage_temperature_out_of_range(info):
+        issues.append({
+            "code": USAGE_TEMPERATURE_OUT_OF_RANGE,
+            "severity": "warning",
+            "message": "usage temperature outside continuous-use range; results approximate",
+        })
     kind = load.get("kind")
-    if kind == "pressure" and load.get("magnitude_pa") is None:
-        issues.append({"code": "MISSING_LOAD_MAGNITUDE", "severity": "error",
-                       "message": "pressure load requires magnitude_pa"})
-    if kind == "force" and load.get("force_n") is None:
-        issues.append({"code": "MISSING_LOAD_MAGNITUDE", "severity": "error",
-                       "message": "force load requires force_n"})
+    if kind not in (None, "pressure", "force", "gravity", "torque"):
+        issues.append({
+            "code": UNKNOWN_LOAD_KIND,
+            "severity": "error",
+            "message": "unknown load kind {!r}".format(kind),
+        })
+    if s_type == "beam":
+        support = structure.get("support")
+        if support is not None and support not in ("cantilever", "simply_supported"):
+            issues.append({
+                "code": UNKNOWN_BEAM_SUPPORT,
+                "severity": "warning",
+                "message": "unknown beam support {!r} mapped to simply_supported".format(support),
+            })
+    if kind == "pressure":
+        try:
+            magnitude = _load_magnitude(load, "magnitude_pa", "pressure")
+        except UnitError as exc:
+            issues.append({
+                "code": INVALID_LOAD_UNITS,
+                "severity": "error",
+                "message": str(exc),
+            })
+            magnitude = None
+        if magnitude is None:
+            issues.append({"code": MISSING_LOAD_MAGNITUDE, "severity": "error",
+                           "message": "pressure load requires magnitude_pa"})
+    if kind == "force":
+        try:
+            magnitude = _load_magnitude(load, "force_n", "force")
+        except UnitError as exc:
+            issues.append({
+                "code": INVALID_LOAD_UNITS,
+                "severity": "error",
+                "message": str(exc),
+            })
+            magnitude = None
+        if magnitude is None:
+            issues.append({"code": MISSING_LOAD_MAGNITUDE, "severity": "error",
+                           "message": "force load requires force_n"})
     if load.get("point_load"):
         issues.append({
             "code": POINT_LOAD_SINGULARITY,
             "severity": "warning",
             "message": "point loads produce singular stress fields; treat results as approximate",
+        })
+        issues.append({
+            "code": POINT_LOAD_STRESS_ORDER_DEPENDENT,
+            "severity": "warning",
+            "message": POINT_LOAD_STRESS_ORDER_ASSUMPTION,
         })
     if not fixtures and kind in ("gravity", "torque"):
         issues.append({
@@ -1153,7 +1565,7 @@ MOUSE_LOAD_TEMPLATES = {
         "default_loads": {"kind": "pressure", "magnitude_pa": 1000.0,
                           "distribution": "uniform", "direction": (0, 0, -1)},
         "fixture_assumptions": "panel simply supported on all four edges",
-        "acceptance_notes": "accept when safety_factor >= 1.0 against tensile_allowable; recheck edge stress with a detailed model",
+        "acceptance_notes": "accept when safety_factor >= 1.2 against tensile_allowable (pipeline marginal threshold); recheck edge stress with a detailed model",
     },
     "side_grip": {
         "name": "Side grip squeeze",
@@ -1161,7 +1573,7 @@ MOUSE_LOAD_TEMPLATES = {
         "default_loads": {"kind": "force", "force_n": 8.0, "point_load": False,
                           "distribution": "uniform", "direction": (1, 0, 0)},
         "fixture_assumptions": "side walls fixed along the bottom edge",
-        "acceptance_notes": "watch combined bending plus shear; keep safety_factor >= 1.0",
+        "acceptance_notes": "watch combined bending plus shear; keep safety_factor >= 1.2 (pipeline marginal threshold)",
     },
     "button_press": {
         "name": "Button press",
@@ -1169,7 +1581,7 @@ MOUSE_LOAD_TEMPLATES = {
         "default_loads": {"kind": "force", "force_n": 5.0, "point_load": True,
                           "direction": (0, 0, -1)},
         "fixture_assumptions": "button pivot modeled as a simply supported edge",
-        "acceptance_notes": "flagged POINT_LOAD_SINGULARITY; verify local contact with a dedicated model",
+        "acceptance_notes": "flagged POINT_LOAD_SINGULARITY and POINT_LOAD_STRESS_ORDER_DEPENDENT; point-load stress is order-truncation dependent, not suitable for acceptance — verify local contact with a dedicated model and keep margin >= 1.2",
     },
     "torsion": {
         "name": "Torsion twist",
@@ -1194,13 +1606,19 @@ __all__ = [
     "BEAM_METHOD",
     "BEAM_UNSUPPORTED_FAILURE_MODES",
     "CLOSED_FORM_METHOD",
+    "DERATE_FACTOR_FLOOR",
     "INVALID_LOAD_LOCATION",
     "INVALID_LOAD_VALUE",
     "INVALID_LOAD_UNITS",
     "INVALID_POISSON_RATIO",
+    "MISSING_BEAM_DIMENSION",
+    "MISSING_LOAD_MAGNITUDE",
+    "MISSING_ORTHOTROPIC_E2",
     "MOUSE_LOAD_TEMPLATES",
     "NUMERIC_OVERFLOW",
     "POINT_LOAD_SINGULARITY",
+    "POINT_LOAD_STRESS_ORDER_ASSUMPTION",
+    "POINT_LOAD_STRESS_ORDER_DEPENDENT",
     "SCREENING_SURROGATE_MODEL_ID",
     "SERIES_NOT_CONVERGED",
     "SERIES_ORDER_CAP",
@@ -1208,12 +1626,15 @@ __all__ = [
     "SHELL_PANEL_METHOD",
     "SHELL_UNSUPPORTED_FAILURE_MODES",
     "SOLVER_CAPABILITIES",
+    "SOLVER_EVALUATION_ERROR",
     "SolverCapabilities",
     "StructuralResponse",
     "THIN_SHELL_OUT_OF_RANGE",
     "UNDERCONSTRAINED_REACTIONS",
+    "UNKNOWN_LOAD_KIND",
     "UNSUPPORTED_ANISOTROPY",
     "UNSUPPORTED_STIFFNESS_REDUCTION",
+    "USAGE_TEMPERATURE_OUT_OF_RANGE",
     "beam_response",
     "preflight_structural_case",
     "shell_panel_response",

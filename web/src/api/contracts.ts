@@ -1097,6 +1097,62 @@ export interface PopulationResult {
   model?: Record<string, unknown> | null;
 }
 
+/**
+ * FEA per-vertex field for one object. Field names are FROZEN — shared with
+ * the frontend shader engine (feaStressShader.ts) and the Python backend.
+ */
+export interface FeaObjectField {
+  object_id: string;
+  vertex_count: number;
+  damage: number[];
+  displacement: number[][];
+  stress_pa: number[];
+}
+
+/** Procedural fallback field: an analytic Gaussian stress/dent model. */
+export interface FeaProceduralField {
+  object_id: string;
+  impact_point_model_m: Vec3;
+  falloff_radius_m: number;
+  contact_normal_model: Vec3;
+  peak_stress_pa: number;
+  yield_stress_pa: number;
+  max_compression_m: number;
+}
+
+export interface FeaPeak {
+  object_id: string;
+  vertex_index: number;
+  location_model_m: Vec3;
+  damage: number;
+  stress_pa: number;
+  stress_mpa: number;
+}
+
+export interface FeaResult {
+  computed: boolean;
+  peak: FeaPeak | null;
+  yield_stress_pa: number | null;
+  damage_basis?:
+    | 'derated_allowable'
+    | 'material_yield'
+    | 'material_allowable'
+    | 'material_allowable_underated'
+    | null;
+  safety_factor: number | null;
+  impact_window_s: number;
+  dent_threshold: number;
+  tear_threshold: number;
+  center_frame?: 'panel_local' | 'world' | null;
+  objects: FeaObjectField[];
+  procedural: FeaProceduralField[];
+  assumptions: string[];
+  flags: string[];
+}
+
+/** FEA render mode consumed by the scene runtime (from contracts.ts). */
+export type RenderMode = 'default' | 'fea' | 'yield';
+
 export interface PipelineResult {
   schema_id: string;
   engine_version: string;
@@ -1117,6 +1173,7 @@ export interface PipelineResult {
   component_screening?: ComponentScreeningResult | null;
   shell?: ShellResult | null;
   population?: PopulationResult | null;
+  fea?: FeaResult | null;
   manifest: Record<string, unknown> | null;
   errors: ErrorEntry[];
 }

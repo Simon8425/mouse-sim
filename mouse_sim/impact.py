@@ -47,6 +47,20 @@ FATIGUE_GENERIC_FALLBACK_ASSUMPTION = (
     "generic polymer fatigue law (14 MPa @ 10^6, slope 6) used; "
     "material-specific S-N data unavailable"
 )
+FATIGUE_R_RATIO_ASSUMPTION = (
+    "S-N curve is for R~0 (near-zero mean) amplitude; caller-provided stress "
+    "is treated as the stress amplitude"
+)
+INVALID_SN_CURVE = "INVALID_SN_CURVE"
+INVALID_SN_CURVE_ASSUMPTION = (
+    "S-N curve entries must be numeric (stress, cycles) pairs; "
+    "cycles-to-failure could not be computed"
+)
+HERTZ_REGIME_EXCEEDED = "HERTZ_REGIME_EXCEEDED"
+# Hertz point-contact theory requires small deformation relative to the
+# contact radius (delta_max << R).  Beyond this ratio the point-contact law
+# is outside its validity; results are disclosed as screening-only.
+HERTZ_REGIME_RATIO_LIMIT = 0.1
 INVALID_MASS = "INVALID_MASS"
 INVALID_KINEMATICS = "INVALID_KINEMATICS"
 INVALID_RESTITUTION = "INVALID_RESTITUTION"
@@ -72,6 +86,19 @@ CONTACT_MODEL_HERTZ_NONLINEAR = "hertz_nonlinear"
 CONTACT_MODEL_HALF_SINE = "half_sine"
 CONTACT_MODEL_STOPPING_DISTANCE = "stopping_distance"
 HERTZ_EFFECTIVE_MODULUS_DEFAULT_PA = 1e9
+# Default corner blend radius for the default drop-impact path: a molded
+# shell corner lands on the floor with a small rounded feature rather than
+# a mathematically sharp point (a zero radius is rejected by the Hertz
+# branch, INVALID_CONTACT_RADIUS).  2.0 mm is a typical molded blend for a
+# handheld shell; the Hertz peak force scales as R^(1/5)
+# (F_peak ~ k_h^(2/5) with k_h ~ sqrt(R)), so this
+# assumption is disclosed wherever it is applied.
+DEFAULT_CORNER_BLEND_RADIUS_M = 0.002
+DEFAULT_CORNER_BLEND_RADIUS_ASSUMPTION = (
+    "contact geometry assumed as a Hertz sphere-on-plane point contact with "
+    "corner blend radius R = 2.0e-3 m (typical molded corner blend); peak "
+    "force scales as R^(1/5) (F_peak ~ k_h^(2/5), k_h ~ sqrt(R))"
+)
 # Full elastic (e=1) Hertz contact duration factor: t = 2.94*delta_max/v_n.
 # For restitution e the reported compression-phase duration is scaled by
 # (1+e)/2, so plastic impact (e=0) ends at max compression (t ~ 1.47*delta/v)
@@ -174,6 +201,30 @@ def _finite(value, label):
     if not math.isfinite(number):
         raise ValueError("{} must be finite".format(label))
     return number
+
+
+def effective_modulus(e1_pa, nu1, e2_pa, nu2):
+    """Hertz effective contact modulus for two elastic bodies.
+
+    E_eff = ((1-nu1^2)/E1 + (1-nu2^2)/E2)^-1 (Hertz point contact).  Both
+    moduli must be positive finite values and both Poisson ratios must be
+    finite within (-1, 0.5); invalid inputs raise ValueError (the caller
+    discloses, never silently substitutes).
+    """
+    for modulus, ratio, label in (
+        (e1_pa, nu1, "e1_pa"),
+        (e2_pa, nu2, "e2_pa"),
+    ):
+        try:
+            modulus = float(modulus)
+            ratio = float(ratio)
+        except (TypeError, ValueError):
+            raise ValueError("{} and its Poisson ratio must be numeric".format(label))
+        if not math.isfinite(modulus) or modulus <= 0.0:
+            raise ValueError("{} must be a positive finite modulus".format(label))
+        if not math.isfinite(ratio) or not (-1.0 < ratio < 0.5):
+            raise ValueError("Poisson ratio for {} must be finite and within (-1, 0.5)".format(label))
+    return 1.0 / ((1.0 - nu1 * nu1) / e1_pa + (1.0 - nu2 * nu2) / e2_pa)
 
 
 def _failed(flag, reason):
@@ -411,7 +462,10 @@ def estimate_impact(
     together with ``contact_radius_m``, F = (4/3)*E_eff*sqrt(r)*delta^(3/2)),
     stopping distance (average work-equivalent force F_avg = E/d with a
     documented conservative peak-force estimate), or contact duration
-    (half-sine pulse F = pi*J/(2*t)).
+    (half-sine pulse F = pi*J/(2*t)).  Hertz small-deformation validity
+    (delta_max << R) is screened: when delta_max/R exceeds 0.1 the result
+    carries the ``HERTZ_REGIME_EXCEEDED`` flag and a quantified disclosure
+    assumption; the numbers remain reported as screening-only.
 
     When ``inertia_tensor_kg_m2`` is supplied, an energy-partition estimate
     (translation vs rotation) is included in ``energy_partition`` using the
@@ -597,6 +651,7 @@ def estimate_impact(
     average_force = None
     peak_force_estimate = None
     contact_model = CONTACT_MODEL_LINEAR
+    hertz_regime_text = None
     if stiffness is not None:
         peak_force = normal_velocity * math.sqrt(effective_mass * stiffness)
         contact_duration = math.pi * math.sqrt(effective_mass / stiffness) / 2.0
@@ -633,6 +688,14 @@ def estimate_impact(
         )
         contact_model = CONTACT_MODEL_HERTZ_NONLINEAR
         peak_force_estimate = peak_force
+        if compression > HERTZ_REGIME_RATIO_LIMIT * radius:
+            hertz_regime_text = (
+                "Hertz small-deformation regime exceeded: delta_max/R = {:.6g} > {:.3g};"
+                " the point-contact law is outside its small-deformation validity and"
+                " peak force/compression are screening-only estimates (disclosure only)".format(
+                    compression / radius, HERTZ_REGIME_RATIO_LIMIT
+                )
+            )
     elif stopping is not None:
         average_force = energy / stopping
         peak_force = average_force
@@ -726,8 +789,12 @@ def estimate_impact(
             "Hertz nonlinear contact parameters (effective_modulus_pa, contact_radius_m) ignored:"
             " explicit contact_stiffness_n_per_m takes precedence"
         )
+    if hertz_regime_text is not None:
+        assumptions.append(hertz_regime_text)
     result_flags = [CONTACT_PATCH_ASSUMPTION]
     validity = "valid"
+    if hertz_regime_text is not None:
+        result_flags.append(HERTZ_REGIME_EXCEEDED)
     if not force_estimated:
         result_flags.extend((PEAK_FORCE_NOT_ESTIMATED, INSUFFICIENT_PARAMETERS))
         validity = "inconclusive"
@@ -833,7 +900,13 @@ def _load_path_stress(force, area, lever, modulus, force_label="peak force"):
     return stress, texts
 
 
-def _cycles_to_failure(stress, curve, fatigue_strength_at_1e6_pa=None, fatigue_exponent_k=None):
+def _cycles_to_failure(
+    stress,
+    curve,
+    fatigue_strength_at_1e6_pa=None,
+    fatigue_exponent_k=None,
+    endurance_limit_pa=None,
+):
     """Cycles to failure: exact S-N point, conservative curve bound, or
     per-material Basquin power law N = 1e6*(sigma_ref/sigma)^k.
 
@@ -841,17 +914,28 @@ def _cycles_to_failure(stress, curve, fatigue_strength_at_1e6_pa=None, fatigue_e
     the Basquin law is evaluated with the supplied material fatigue
     strength at 1e6 cycles and slope k; when either is missing the
     conservative generic polymer law (14 MPa @ 1e6, slope 6) is used and
-    ``used_generic_fallback`` is True so the caller can disclose it.  The
-    life is floored at 1 cycle and capped so astronomically low stresses
-    cannot overflow into inf and corrupt JSON output.
+    ``used_generic_fallback`` is True so the caller can disclose it.  When
+    ``endurance_limit_pa`` is supplied and the stress is at or below it the
+    curve carries an endurance-limit knee and the life is the
+    screening-infinite value ``_MAX_SCREENING_LIFE_CYCLES``; curves without
+    an endurance limit keep the generic path unchanged.  An explicit S-N
+    dict that carries non-numeric stress/life entries returns ``life =
+    None`` (the caller reports an INVALID_SN_CURVE failed result instead of
+    raising).  The life is floored at 1 cycle and capped so astronomically
+    low stresses cannot overflow into inf and corrupt JSON output.
     """
     if curve:
-        if stress in curve:
-            return max(1.0, float(curve[stress])), False
-        candidates = [float(life) for key, life in curve.items() if float(key) >= stress]
-        if candidates:
-            return min(candidates), False
-        return min(max(1.0, float(life)) for life in curve.values()), False
+        try:
+            if stress in curve:
+                return max(1.0, float(curve[stress])), False
+            candidates = [float(life) for key, life in curve.items() if float(key) >= stress]
+            if candidates:
+                return min(candidates), False
+            return min(max(1.0, float(life)) for life in curve.values()), False
+        except (TypeError, ValueError):
+            return None, False
+    if endurance_limit_pa is not None and stress <= endurance_limit_pa:
+        return _MAX_SCREENING_LIFE_CYCLES, False
     sigma_ref = fatigue_strength_at_1e6_pa
     exponent = fatigue_exponent_k
     if sigma_ref is None or exponent is None:
@@ -903,6 +987,7 @@ def repeat_impact_cycles(
     allowable_pa=None,
     fatigue_strength_at_1e6_pa=None,
     fatigue_exponent_k=None,
+    endurance_limit_pa=None,
 ):
     """Miner's-rule cumulative damage over repeated impact stress cycles.
 
@@ -912,8 +997,15 @@ def repeat_impact_cycles(
     per-material Basquin power law N = 1e6*(sigma_ref/sigma)^k with
     ``fatigue_strength_at_1e6_pa`` and ``fatigue_exponent_k``; when either
     is missing the generic polymer law is used and the result carries the
-    ``FATIGUE_GENERIC_FALLBACK`` flag and a disclosure assumption.  The
-    label is explicit: this is a coarse screening estimate, not a fatigue
+    ``FATIGUE_GENERIC_FALLBACK`` flag and a disclosure assumption.  When
+    ``endurance_limit_pa`` is supplied, stresses at or below it are treated
+    as screening-infinite life (``_MAX_SCREENING_LIFE_CYCLES``) and that
+    treatment is disclosed.  Zero/negative stress levels carry no fatigue
+    damage and are skipped with a disclosure counting them.  The payload
+    always records the R-ratio/amplitude interpretation of the S-N data.
+    An S-N dict with non-numeric entries returns a failed payload carrying
+    the ``INVALID_SN_CURVE`` flag instead of raising.  The label is
+    explicit: this is a coarse screening estimate, not a fatigue
     prediction.
     """
     levels = _cycle_levels(cycles_n, stress_amplitude_pa)
@@ -921,16 +1013,55 @@ def repeat_impact_cycles(
     total_cycles = 0.0
     damage = 0.0
     generic_fallback_used = False
+    invalid_curve = False
+    skipped_levels = 0
+    endurance_levels = 0
     for count, stress in levels:
         if stress <= 0.0:
+            skipped_levels += 1
             continue
         life, used_generic = _cycles_to_failure(
-            stress, s_n_curve or {}, fatigue_strength_at_1e6_pa, fatigue_exponent_k
+            stress,
+            s_n_curve or {},
+            fatigue_strength_at_1e6_pa,
+            fatigue_exponent_k,
+            endurance_limit_pa,
         )
+        if life is None:
+            invalid_curve = True
+            continue
+        if endurance_limit_pa is not None and stress <= endurance_limit_pa:
+            endurance_levels += 1
         generic_fallback_used = generic_fallback_used or used_generic
         total_cycles += count
         damage += count / life
         entries.append({"cycles": count, "stress_pa": stress, "cycles_to_failure": life})
+    assumptions = [FATIGUE_R_RATIO_ASSUMPTION]
+    if invalid_curve:
+        return {
+            "damage_sum": 0.0,
+            "miner_exceeded": False,
+            "cycles_evaluated": 0.0,
+            "flags": [INVALID_SN_CURVE],
+            "label": "coarse screening estimate, not fatigue prediction",
+            "levels": [],
+            "allowable_exceeded": False,
+            "assumptions": assumptions + [INVALID_SN_CURVE_ASSUMPTION],
+            "skipped_levels": skipped_levels,
+        }
+    if skipped_levels:
+        assumptions.append(
+            "{} zero/negative stress level(s) skipped (no fatigue damage at or below zero stress)".format(
+                skipped_levels
+            )
+        )
+    if endurance_levels:
+        assumptions.append(
+            "{} level(s) at or below the fatigue endurance limit {:.6g} Pa treated as"
+            " screening-infinite life ({:.3g} cycles)".format(
+                endurance_levels, endurance_limit_pa, _MAX_SCREENING_LIFE_CYCLES
+            )
+        )
     # Epsilon: exactly one lifetime of exposure (damage_sum == 1.0) is
     # exhaustion; a 1e-9 tolerance keeps float rounding from hiding it.
     exceeded = damage >= 1.0 - 1e-9
@@ -939,7 +1070,6 @@ def repeat_impact_cycles(
         allowable = _finite(allowable_pa, "allowable_pa")
         allowable_exceeded = any(stress > allowable for _, stress in levels if stress > 0.0)
     flags = [FATIGUE_ESTIMATE_EXCEEDED] if exceeded else []
-    assumptions = []
     if generic_fallback_used:
         flags.append(FATIGUE_GENERIC_FALLBACK)
         assumptions.append(FATIGUE_GENERIC_FALLBACK_ASSUMPTION)
@@ -952,6 +1082,7 @@ def repeat_impact_cycles(
         "levels": entries,
         "allowable_exceeded": allowable_exceeded,
         "assumptions": assumptions,
+        "skipped_levels": skipped_levels,
     }
 
 
@@ -991,17 +1122,41 @@ def impact_qualification_status(method=None, validated=False):
     return {"qualified": qualified, "disposition": disposition, "reason": reason}
 
 
-def desk_edge_impact(mass_kg, velocity_m_s, contact_radius_m, shell_stiffness_n_per_m=None, **kwargs):
+def desk_edge_impact(
+    mass_kg,
+    velocity_m_s,
+    contact_radius_m,
+    shell_stiffness_n_per_m=None,
+    effective_modulus_pa=None,
+    shell_young_modulus_pa=None,
+    shell_poissons_ratio=None,
+    floor_young_modulus_pa=None,
+    floor_poissons_ratio=None,
+    desk_edge_radius_m=None,
+    **kwargs,
+):
     """Desk-edge impact helper with an explicit contact-radius assumption.
 
     Changing contact geometry enters through the contact-radius stiffness
     assumption.  When ``shell_stiffness_n_per_m`` is absent, contact is
     modeled with the nonlinear Hertz point-contact law
-    F = (4/3)*E_eff*sqrt(r)*delta^(3/2) with an assumed effective modulus
-    E_eff = 1e9 Pa and the peak force follows from energy balance
+    F = (4/3)*E_eff*sqrt(r)*delta^(3/2).  The effective modulus is taken
+    from (in precedence order) the supplied shell/floor E and nu pairs
+    (routed through :func:`effective_modulus`), an explicit
+    ``effective_modulus_pa``, or the documented crude default
+    E_eff = 1e9 Pa; the peak force follows from energy balance
     (``contact_model`` = ``hertz_nonlinear``).  When an explicit
     ``shell_stiffness_n_per_m`` is supplied it is used as a calibrated
     linear stiffness (``contact_model`` = ``linear_calibrated``).
+
+    A sphere (the shell corner, radius ``contact_radius_m``) on a desk edge
+    (a cylinder of radius ``desk_edge_radius_m``) has the smaller combined
+    radius R_eff = R1*sqrt(R2/(R1+R2)) < R1.  When ``desk_edge_radius_m``
+    is supplied the combined radius is computed and used; when it is omitted
+    (backward compatible) the shell radius alone is used and the result
+    discloses that peak force may be overstated by ~2-17% for typical
+    desk-edge radii (0.5-10 mm, non-conservative), together with the
+    combined-radius formula.
     """
     if "contact_stiffness_n_per_m" in kwargs:
         raise ValueError("desk_edge_impact: use shell_stiffness_n_per_m instead of contact_stiffness_n_per_m")
@@ -1011,19 +1166,78 @@ def desk_edge_impact(mass_kg, velocity_m_s, contact_radius_m, shell_stiffness_n_
         return _failed(INVALID_CONTACT_RADIUS, "contact_radius_m must be numeric and finite")
     if radius <= 0.0:
         return _failed(INVALID_CONTACT_RADIUS, "contact_radius_m must be positive; got {!r}".format(contact_radius_m))
+    edge_radius = None
+    if desk_edge_radius_m is not None:
+        try:
+            edge_radius = _finite(desk_edge_radius_m, "desk_edge_radius_m")
+        except ValueError:
+            return _failed(INVALID_CONTACT_RADIUS, "desk_edge_radius_m must be numeric and finite")
+        if edge_radius <= 0.0:
+            return _failed(
+                INVALID_CONTACT_RADIUS,
+                "desk_edge_radius_m must be positive; got {!r}".format(desk_edge_radius_m),
+            )
+    effective_radius = radius
+    if edge_radius is not None:
+        effective_radius = radius * math.sqrt(edge_radius / (radius + edge_radius))
     if shell_stiffness_n_per_m is None:
+        material_pair = (
+            shell_young_modulus_pa,
+            shell_poissons_ratio,
+            floor_young_modulus_pa,
+            floor_poissons_ratio,
+        )
+        if any(item is not None for item in material_pair):
+            if any(item is None for item in material_pair):
+                return _failed(
+                    INVALID_STIFFNESS,
+                    "desk_edge_impact: shell and floor E and nu must be supplied together",
+                )
+            if effective_modulus_pa is not None:
+                return _failed(
+                    INVALID_STIFFNESS,
+                    "desk_edge_impact: effective_modulus_pa conflicts with the "
+                    "supplied shell/floor E and nu pair",
+                )
+            try:
+                e_eff = effective_modulus(
+                    shell_young_modulus_pa,
+                    shell_poissons_ratio,
+                    floor_young_modulus_pa,
+                    floor_poissons_ratio,
+                )
+            except ValueError as exc:
+                return _failed(INVALID_STIFFNESS, "desk_edge_impact: {}".format(exc))
+            modulus_text = (
+                "E_eff = ((1-nu1^2)/E1 + (1-nu2^2)/E2)^-1 = {:.6g} Pa from the "
+                "supplied shell/floor E and nu".format(e_eff)
+            )
+        elif effective_modulus_pa is not None:
+            try:
+                e_eff = _finite(effective_modulus_pa, "effective_modulus_pa")
+            except ValueError:
+                return _failed(INVALID_STIFFNESS, "effective_modulus_pa must be numeric and finite")
+            if e_eff <= 0.0:
+                return _failed(
+                    INVALID_STIFFNESS,
+                    "effective_modulus_pa must be positive; got {!r}".format(effective_modulus_pa),
+                )
+            modulus_text = "E_eff = {:.6g} Pa (supplied explicitly)".format(e_eff)
+        else:
+            e_eff = HERTZ_EFFECTIVE_MODULUS_DEFAULT_PA
+            modulus_text = "E_eff = 1e9 Pa (crude assumption)"
         result = estimate_impact(
             mass_kg,
             velocity_m_s,
-            effective_modulus_pa=HERTZ_EFFECTIVE_MODULUS_DEFAULT_PA,
-            contact_radius_m=radius,
+            effective_modulus_pa=e_eff,
+            contact_radius_m=effective_radius,
             **kwargs,
         )
         contact_model = CONTACT_MODEL_HERTZ_NONLINEAR
         stiffness_text = (
             " contact stiffness modeled with the nonlinear Hertz point-contact law"
-            " F = (4/3)*E_eff*sqrt(r)*delta^(3/2) with E_eff = 1e9 Pa (crude assumption);"
-            " peak force from energy balance"
+            " F = (4/3)*E_eff*sqrt(r)*delta^(3/2) with {};"
+            " peak force from energy balance".format(modulus_text)
         )
     else:
         try:
@@ -1043,11 +1257,33 @@ def desk_edge_impact(mass_kg, velocity_m_s, contact_radius_m, shell_stiffness_n_
         " changing contact geometry enters through the contact-radius stiffness assumption".format(radius)
         + stiffness_text
     )
+    assumption_texts = [assumption]
+    if edge_radius is not None:
+        assumption_texts.append(
+            "desk-edge combined radius for a sphere (R1 = {:.6g} m) on a cylindrical edge"
+            " (R2 = {:.6g} m): R_eff = R1*sqrt(R2/(R1+R2)) = {:.6g} m < R1; peak force"
+            " scales as R_eff^(1/5) (F_peak ~ k_h^(2/5), k_h ~ sqrt(r))".format(
+                radius, edge_radius, effective_radius
+            )
+        )
+        if shell_stiffness_n_per_m is not None:
+            assumption_texts.append(
+                "desk_edge_radius_m ignored for the contact force: explicit"
+                " shell_stiffness_n_per_m takes precedence (linear calibrated stiffness)"
+            )
+    else:
+        assumption_texts.append(
+            "desk-edge contact uses the shell radius alone (R1); the combined radius for"
+            " a cylindrical desk edge is R_eff = R1*sqrt(R2/(R1+R2)) < R1, so peak force"
+            " may be overstated by ~2-17% for typical desk-edge radii"
+            " (0.5-10 mm, non-conservative); pass desk_edge_radius_m to apply"
+            " the combined radius"
+        )
     return replace(
         result,
         contact_model=contact_model,
         flags=(DESK_EDGE_CONTACT_APPROXIMATION,) + result.flags,
-        assumptions=result.assumptions + (assumption,),
+        assumptions=result.assumptions + tuple(assumption_texts),
     )
 
 
@@ -1056,15 +1292,21 @@ __all__ = [
     "CONTACT_MODEL_LINEAR",
     "CONTACT_MODEL_LINEAR_CALIBRATED",
     "CONTACT_PATCH_ASSUMPTION",
+    "DEFAULT_CORNER_BLEND_RADIUS_ASSUMPTION",
+    "DEFAULT_CORNER_BLEND_RADIUS_M",
     "DESK_EDGE_CONTACT_APPROXIMATION",
     "FATIGUE_ESTIMATE_EXCEEDED",
     "FATIGUE_GENERIC_FALLBACK",
+    "FATIGUE_R_RATIO_ASSUMPTION",
     "HERTZ_CONTACT_DURATION_FACTOR",
+    "HERTZ_REGIME_EXCEEDED",
+    "HERTZ_REGIME_RATIO_LIMIT",
     "IMPACT_ACCELERATION_IMPLAUSIBLE",
     "IMPACT_STRESS_IMPLAUSIBLE",
     "IMPACT_UNSUPPORTED_FAILURE_MODES",
     "INVALID_CONTACT_OFFSET",
     "INVALID_INERTIA_TENSOR",
+    "INVALID_SN_CURVE",
     "ImpactResult",
     "PEAK_FORCE_NOT_ESTIMATED",
     "SCREENING_SURROGATE_MODEL_ID",
@@ -1074,6 +1316,7 @@ __all__ = [
     "UNSUPPORTED_PCB_SHOCK",
     "UNSUPPORTED_SCREW_PULLOUT",
     "desk_edge_impact",
+    "effective_modulus",
     "estimate_impact",
     "impact_qualification_status",
     "repeat_impact_cycles",

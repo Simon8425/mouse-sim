@@ -6,6 +6,7 @@ tests are deterministic on any host and never require FreeCAD.
 """
 
 import os
+import pathlib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -17,13 +18,32 @@ from mouse_sim.step_kernel import (
     freecadcmd_path,
 )
 
+# pathlib.Path dispatches on the *current* os.name, so inside an
+# ``os.name == "nt"`` mock a POSIX host cannot instantiate the WindowsPath
+# class (NotImplementedError).  The platform branch is still exercised via
+# mock.patch.object(os, "name", "nt"); only path CONSTRUCTION uses the
+# host-native class captured here at import time, before any mock applies.
+_HOST_NATIVE_PATH_CLS = pathlib.WindowsPath if os.name == "nt" else pathlib.PosixPath
+
+
+def _host_path(value):
+    return _HOST_NATIVE_PATH_CLS(value)
+
+
+class _HostNativePath(Path):
+    """step_kernel.Path replacement: builds host-native paths under the
+    os.name mock (pathlib refuses WindowsPath on POSIX hosts)."""
+
+    def __new__(cls, *args, **kwargs):
+        return super().__new__(_HOST_NATIVE_PATH_CLS, *args, **kwargs)
+
 
 def _win_glob_fake(candidates):
     """Autospec side_effect for Path.glob: only the install pattern matches."""
 
     def fake(self, pattern):
         if pattern == "FreeCAD*/bin/freecadcmd.exe":
-            return [Path(candidate) for candidate in candidates]
+            return [_host_path(candidate) for candidate in candidates]
         return []
 
     return fake
@@ -52,8 +72,9 @@ class FreecadCmdPathOrderTests(unittest.TestCase):
                                     with mock.patch.object(
                                         Path, "resolve", autospec=True, side_effect=lambda self: self
                                     ):
-                                        found = freecadcmd_path()
-                                        expected = str(Path(env_path))
+                                        with mock.patch("mouse_sim.step_kernel.Path", _HostNativePath):
+                                            found = freecadcmd_path()
+                                            expected = str(_host_path(env_path))
         self.assertEqual(str(found), expected)
 
     def test_env_var_skipped_when_path_does_not_exist(self):
@@ -78,8 +99,9 @@ class FreecadCmdPathOrderTests(unittest.TestCase):
                                     with mock.patch.object(
                                         Path, "resolve", autospec=True, side_effect=lambda self: self
                                     ):
-                                        found = freecadcmd_path()
-                                        expected = str(Path(glob_path))
+                                        with mock.patch("mouse_sim.step_kernel.Path", _HostNativePath):
+                                            found = freecadcmd_path()
+                                            expected = str(_host_path(glob_path))
         self.assertEqual(str(found), expected)
 
     def test_windows_glob_hit_prefers_highest_version(self):
@@ -97,8 +119,9 @@ class FreecadCmdPathOrderTests(unittest.TestCase):
                                     with mock.patch.object(
                                         Path, "resolve", autospec=True, side_effect=lambda self: self
                                     ):
-                                        found = freecadcmd_path()
-                                        expected = str(Path(new))
+                                        with mock.patch("mouse_sim.step_kernel.Path", _HostNativePath):
+                                            found = freecadcmd_path()
+                                            expected = str(_host_path(new))
         self.assertEqual(str(found), expected)
 
     def test_windows_candidate_ordering_uses_numeric_version(self):
@@ -128,8 +151,9 @@ class FreecadCmdPathOrderTests(unittest.TestCase):
                                     with mock.patch.object(
                                         Path, "resolve", autospec=True, side_effect=lambda self: self
                                     ):
-                                        found = freecadcmd_path()
-                                        expected = str(Path(which_path))
+                                        with mock.patch("mouse_sim.step_kernel.Path", _HostNativePath):
+                                            found = freecadcmd_path()
+                                            expected = str(_host_path(which_path))
         self.assertEqual(str(found), expected)
 
     def test_macos_default_only_checked_on_darwin(self):

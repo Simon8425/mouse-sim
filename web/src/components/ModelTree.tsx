@@ -1,13 +1,6 @@
 import * as React from 'react';
-import { useProjectStore } from '../state/projectStore';
-import {
-  selectObjectEntries,
-  selectFindingSeverities,
-  selectFindingsFor,
-  selectWarningsCount,
-} from '../state/selectors';
-import { severityTone, severityLabel } from '../lib/status';
-import { StatusBadge } from './StatusBadge';
+import { useProjectStore, COMPONENT_ROLES } from '../state/projectStore';
+import { selectObjectEntries } from '../state/selectors';
 
 function EyeIcon({ open }: { open: boolean }): React.ReactElement {
   return (
@@ -40,22 +33,28 @@ function EyeIcon({ open }: { open: boolean }): React.ReactElement {
 export const ModelTree = React.memo(function ModelTree(): React.ReactElement {
   const { state, dispatch } = useProjectStore();
   const entries = selectObjectEntries(state);
-  const severities = selectFindingSeverities(state);
 
   const [search, setSearch] = React.useState('');
   const deferredSearch = React.useDeferredValue(search);
-  const [filterSeverity, setFilterSeverity] = React.useState<string | null>(null);
+  const [activePopoverId, setActivePopoverId] = React.useState<string | null>(null);
+  const [popoverTop, setPopoverTop] = React.useState<number>(100);
 
-  // Compute severity chip counts
-  const counts = React.useMemo(() => {
-    let blocker = 0, error = 0, warning = 0;
-    for (const sev of severities.values()) {
-      if (sev === 'blocker') blocker++;
-      else if (sev === 'error') error++;
-      else if (sev === 'warning') warning++;
-    }
-    return { blocker, error, warning, all: severities.size };
-  }, [severities]);
+  // Close floating component card when clicking outside
+  React.useEffect(() => {
+    if (!activePopoverId) return;
+
+    const handlePointerDownOutside = (e: PointerEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && !target.closest('.model-row__floating-card') && !target.closest('.model-row__mat-pill')) {
+        setActivePopoverId(null);
+      }
+    };
+
+    window.addEventListener('pointerdown', handlePointerDownOutside);
+    return () => {
+      window.removeEventListener('pointerdown', handlePointerDownOutside);
+    };
+  }, [activePopoverId]);
 
   const filteredEntries = React.useMemo(() => {
     return entries.filter((entry) => {
@@ -66,13 +65,9 @@ export const ModelTree = React.memo(function ModelTree(): React.ReactElement {
       ) {
         return false;
       }
-      if (filterSeverity) {
-        const sev = severities.get(entry.id);
-        if (sev !== filterSeverity) return false;
-      }
       return true;
     });
-  }, [entries, deferredSearch, filterSeverity, severities]);
+  }, [entries, deferredSearch]);
 
   const listRef = React.useRef<HTMLDivElement | null>(null);
   const rowRefs = React.useRef(new Map<string, HTMLDivElement | null>());
@@ -85,7 +80,6 @@ export const ModelTree = React.memo(function ModelTree(): React.ReactElement {
     if (!selectedId) return;
     if (!filteredEntries.some((entry) => entry.id === selectedId)) {
       setSearch('');
-      setFilterSeverity(null);
     }
   }, [state.selectedId, filteredEntries]);
 
@@ -144,7 +138,6 @@ export const ModelTree = React.memo(function ModelTree(): React.ReactElement {
         <div>
           <h2 className="model-tree__title">Model tree</h2>
         </div>
-        <span className="model-tree__count">{entries.length.toString().padStart(2, '0')} items</span>
       </div>
       <div className="model-tree__search">
         <input
@@ -156,45 +149,6 @@ export const ModelTree = React.memo(function ModelTree(): React.ReactElement {
         />
       </div>
 
-      {counts.blocker > 0 || counts.error > 0 || counts.warning > 0 ? (
-      <div className="model-tree__chips" role="group" aria-label="Filter by severity">
-        <button
-          type="button"
-          className={`chip${filterSeverity === null ? ' chip--active' : ''}`}
-          onClick={() => setFilterSeverity(null)}
-        >
-          All ({entries.length})
-        </button>
-        {counts.blocker > 0 && (
-          <button
-            type="button"
-            className={`chip${filterSeverity === 'blocker' ? ' chip--active' : ''}`}
-            onClick={() => setFilterSeverity(filterSeverity === 'blocker' ? null : 'blocker')}
-          >
-            Blocker ({counts.blocker})
-          </button>
-        )}
-        {counts.error > 0 && (
-          <button
-            type="button"
-            className={`chip${filterSeverity === 'error' ? ' chip--active' : ''}`}
-            onClick={() => setFilterSeverity(filterSeverity === 'error' ? null : 'error')}
-          >
-            Error ({counts.error})
-          </button>
-        )}
-        {counts.warning > 0 && (
-          <button
-            type="button"
-            className={`chip${filterSeverity === 'warning' ? ' chip--active' : ''}`}
-            onClick={() => setFilterSeverity(filterSeverity === 'warning' ? null : 'warning')}
-          >
-            Warning ({counts.warning})
-          </button>
-        )}
-      </div>
-      ) : null}
-
       {filteredEntries.length === 0 ? (
         <p className="model-tree__empty muted">No matching objects found.</p>
       ) : (
@@ -203,26 +157,26 @@ export const ModelTree = React.memo(function ModelTree(): React.ReactElement {
             state.preview.display_asset.parts.length > 0 &&
             state.partGeometry ? (
             <div className="model-row model-row--parent" role="treeitem">
-              <div className="model-row__center">
-                <div className="model-row__title-line">
-                  <button
-                    type="button"
-                    className="model-row__eye"
-                    aria-label={`Toggle visibility ${state.preview.source_name ?? 'model'}`}
-                    aria-pressed={entries.every((entry) => state.visibility[entry.id] ?? true)}
-                    onClick={() => {
-                      const allVisible = entries.every((entry) => state.visibility[entry.id] ?? true);
-                      for (const entry of entries) {
-                        dispatch({ type: 'SET_VISIBILITY', id: entry.id, visible: !allVisible });
-                      }
-                    }}
-                  >
-                    <EyeIcon open={entries.every((entry) => state.visibility[entry.id] ?? true)} />
-                  </button>
-                  <span className="model-row__name model-row__name--parent">
-                    {state.preview.source_name ?? 'Assembly'}
-                  </span>
-                  <span className="model-row__type muted">{entries.length} parts</span>
+              <button
+                type="button"
+                className="model-row__eye"
+                aria-label={`Toggle visibility ${state.preview.source_name ?? 'model'}`}
+                aria-pressed={entries.every((entry) => state.visibility[entry.id] ?? true)}
+                onClick={() => {
+                  const allVisible = entries.every((entry) => state.visibility[entry.id] ?? true);
+                  for (const entry of entries) {
+                    dispatch({ type: 'SET_VISIBILITY', id: entry.id, visible: !allVisible });
+                  }
+                }}
+              >
+                <EyeIcon open={entries.every((entry) => state.visibility[entry.id] ?? true)} />
+              </button>
+              <span className="model-row__name model-row__name--parent">
+                {state.preview.source_name ?? 'Assembly'}
+              </span>
+              <div className="model-row__right">
+                <div className="model-row__mat-pill model-row__mat-pill--static">
+                  <span className="model-row__pill-text">{entries.length} parts</span>
                 </div>
               </div>
             </div>
@@ -230,15 +184,20 @@ export const ModelTree = React.memo(function ModelTree(): React.ReactElement {
           {filteredEntries.map((entry, index) => {
             const isSelected = state.selectedId === entry.id;
             const isVisible = state.visibility[entry.id] ?? true;
-            const worstSeverity = severities.get(entry.id);
-            const warningsCount = selectWarningsCount(state, entry.id);
-            const findings = selectFindingsFor(state, entry.id);
-            const findingTitle = findings.map((f) => f.message).join('\n');
             const displayName = entry.name ?? entry.id;
-            const displayType =
+            const rawType =
               entry.className && entry.className.toLowerCase() !== displayName.toLowerCase()
                 ? entry.className
                 : entry.geometry.type;
+            const assignedMatKey = state.objectMaterials?.[entry.id];
+            const assignedRole = state.objectClassifications?.[entry.id];
+            const roleObj = COMPONENT_ROLES.find((r) => r.value === assignedRole);
+            const displayChip = rawType !== 'mesh' ? rawType : null;
+            const pillText = assignedMatKey
+              ? assignedMatKey
+              : roleObj
+                ? roleObj.label.split(' / ')[0]
+                : 'Default';
             return (
               <div
                 key={entry.id}
@@ -252,8 +211,6 @@ export const ModelTree = React.memo(function ModelTree(): React.ReactElement {
                 className={`model-row model-row--child${!isVisible ? ' model-row--hidden' : ''}${isSelected ? ' is-selected' : ''}`}
                 onClick={() => {
                   dispatch({ type: 'SELECT', id: entry.id });
-                  // Selecting a component in the tree is an explicit request to
-                  // inspect it; open the inspector drawer alongside the tree.
                   dispatch({ type: 'SET_INSPECTOR_OPEN', open: true });
                 }}
                 onKeyDown={(e) => handleKeyDown(e, index, entry.id)}
@@ -270,50 +227,114 @@ export const ModelTree = React.memo(function ModelTree(): React.ReactElement {
                 >
                   <EyeIcon open={isVisible} />
                 </button>
-                <div className="model-row__center">
-                  <div className="model-row__title-line">
-                    <span className="model-row__name">{displayName}</span>
-                  </div>
-                  <div className="model-row__sub-line">
-                    <span className="model-row__meta">
-                      {displayType ? <span className="model-row__type muted">{displayType}</span> : null}
-                      {state.lastResult ? <span className="model-row__confidence">No findings</span> : null}
-                      {worstSeverity ? (
-                        <StatusBadge tone={severityTone(worstSeverity)} title={findingTitle}>
-                          {severityLabel(worstSeverity)}
-                        </StatusBadge>
-                      ) : null}
-                      {warningsCount > 0 ? (
-                        <span className="model-row__warnings badge badge--warn" title={`${warningsCount} finding(s)`}>
-                          {warningsCount}
-                        </span>
-                      ) : null}
+                <span className="model-row__name">{displayName}</span>
+                <div className="model-row__right">
+                  {displayChip ? <span className="model-row__chip">{displayChip}</span> : null}
+                  <button
+                    type="button"
+                    className={`model-row__mat-pill${activePopoverId === entry.id ? ' is-active' : ''}`}
+                    aria-label={`Configure component card for ${displayName}`}
+                    title="Configure mouse part role & material"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      dispatch({ type: 'SELECT', id: entry.id });
+                      if (activePopoverId === entry.id) {
+                        setActivePopoverId(null);
+                      } else {
+                        const rect = e.currentTarget.getBoundingClientRect();
+                        setPopoverTop(Math.min(rect.top - 4, window.innerHeight - 160));
+                        setActivePopoverId(entry.id);
+                      }
+                    }}
+                  >
+                    <span className="model-row__pill-text">
+                      {pillText}
                     </span>
-                  </div>
-                  {isSelected && state.materials && state.materials.length > 0 ? (
-                    <div className="model-row__config">
-                      <span className="model-row__config-label">Material</span>
-                      <select
-                        className="model-row__material"
-                        aria-label={`Material for ${displayName}`}
-                        value={state.objectMaterials[entry.id] ?? ''}
-                        onClick={(e) => e.stopPropagation()}
-                        onKeyDown={(e) => e.stopPropagation()}
-                        onChange={(e) =>
-                          dispatch({
-                            type: 'SET_OBJECT_MATERIAL',
-                            objectId: entry.id,
-                            materialKey: e.target.value === '' ? null : e.target.value,
-                          })
-                        }
-                      >
-                        <option value="">Default material</option>
-                        {state.materials.map((m) => (
-                          <option key={m.key} value={m.key}>
-                            {m.key}
-                          </option>
-                        ))}
-                      </select>
+                    <svg className="model-row__mat-chevron" width="7" height="4" viewBox="0 0 7 4" fill="none" aria-hidden="true">
+                      <path d="M1 0.5L3.5 3L6 0.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  </button>
+
+                  {activePopoverId === entry.id ? (
+                    <div
+                      className="model-row__floating-card"
+                      style={{ position: 'fixed', left: '264px', top: `${popoverTop}px`, width: '275px' }}
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <div className="floating-card__header">
+                        <span className="floating-card__title">{displayName}</span>
+                        <button
+                          type="button"
+                          className="floating-card__close"
+                          aria-label="Close component card"
+                          onClick={() => setActivePopoverId(null)}
+                        >
+                          ✕
+                        </button>
+                      </div>
+
+                      <div className="floating-card__section">
+                        <span className="floating-card__label">Mouse Part Role</span>
+                        <div className="floating-card__chip-grid">
+                          {COMPONENT_ROLES.map((r) => {
+                            const isSelected = assignedRole === r.value;
+                            return (
+                              <button
+                                key={r.value}
+                                type="button"
+                                className={`floating-chip${isSelected ? ' is-selected' : ''}`}
+                                onClick={() => {
+                                  dispatch({
+                                    type: 'SET_OBJECT_CLASSIFICATION',
+                                    objectId: entry.id,
+                                    role: r.value,
+                                  });
+                                }}
+                              >
+                                {r.label.split(' / ')[0]}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      <div className="floating-card__section">
+                        <span className="floating-card__label">Material</span>
+                        <div className="floating-card__chip-grid">
+                          <button
+                            type="button"
+                            className={`floating-chip${!assignedMatKey ? ' is-selected' : ''}`}
+                            onClick={() => {
+                              dispatch({
+                                type: 'SET_OBJECT_MATERIAL',
+                                objectId: entry.id,
+                                materialKey: null,
+                              });
+                            }}
+                          >
+                            Default
+                          </button>
+                          {(state.materials ?? []).map((m) => {
+                            const isSelected = assignedMatKey === m.key;
+                            return (
+                              <button
+                                key={m.key}
+                                type="button"
+                                className={`floating-chip${isSelected ? ' is-selected' : ''}`}
+                                onClick={() => {
+                                  dispatch({
+                                    type: 'SET_OBJECT_MATERIAL',
+                                    objectId: entry.id,
+                                    materialKey: m.key,
+                                  });
+                                }}
+                              >
+                                {m.key}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
                     </div>
                   ) : null}
                 </div>

@@ -43,6 +43,13 @@ def make_config(**overrides):
         "drop_surface": "concrete",
         "drop_orientation": "flat",
         "tolerance_scale": 1.0,
+        # These population-engine tests exercise the statistics machinery
+        # (determinism, sensitivity, survival, Wilson CI, unevaluated
+        # handling), not contact physics: pin the explicit screening
+        # linear-spring stiffness so their premises are unchanged.  The
+        # calibrated DEFAULT (Hertz point contact) is exercised by the
+        # dedicated HertzContactDefaultTests below.
+        "contact_stiffness_n_per_m": 1e5,
         "components": None,
     }
     config.update(overrides)
@@ -476,6 +483,86 @@ class PopulationRunTests(unittest.TestCase):
     def test_bad_surface_raises(self):
         with self.assertRaises(ValueError):
             run_population(make_config(drop_surface="jello"), self.context)
+
+
+class HertzContactDefaultTests(unittest.TestCase):
+    """The population default drop-contact model is the nonlinear Hertz
+    point-contact law (E_eff from the shell material pair and the floor
+    surface, corner blend radius 2.0 mm), NOT the uncalibrated 1e5 N/m
+    linear spring; an explicit contact_stiffness_n_per_m keeps the linear
+    override."""
+
+    def setUp(self):
+        self.context = make_context()
+        # The pipeline resolves the shell material pair (E, nu) into the
+        # context; ABS on concrete here.
+        self.context["shell_hertz_pair"] = (2.3e9, 0.35)
+        self.config = make_config(sample_count=100, workers=1)
+        del self.config["contact_stiffness_n_per_m"]
+
+    def test_default_contact_model_is_hertz(self):
+        result = run_population(self.config, self.context)
+        drop = result["model"]["drop"]
+        self.assertIsNone(drop["contact_stiffness_n_per_m"])
+        self.assertIn("Hertz", drop["impact_model"])
+        # E_eff(ABS on concrete) ~ 2.4 GPa and the default corner blend
+        # radius is 2.0 mm.
+        self.assertAlmostEqual(drop["effective_modulus_pa"], 2.418e9, delta=1e7)
+        self.assertEqual(drop["contact_radius_m"], 0.002)
+
+    def test_default_hertz_physics_drives_component_shock_failures(self):
+        # 0.1 kg from 0.75 m on concrete under the calibrated Hertz default:
+        # peak deceleration is ~2700 g, far beyond the 500 g cell shock
+        # class, so the battery screening channel fails every unit.  The
+        # old 1e5 N/m default (~390 g) passed — the premise codified here is
+        # the honest consequence of calibrated contact physics.
+        result = run_population(self.config, self.context)
+        self.assertEqual(result["units_failed"], result["sample_count"])
+        battery = next(
+            c for c in result["component_failure_rates"] if c["component_id"] == "battery_pack"
+        )
+        self.assertEqual(battery["rate"], 1.0)
+
+    def test_explicit_stiffness_override_reported(self):
+        config = dict(self.config)
+        config["contact_stiffness_n_per_m"] = 1e5
+        result = run_population(config, self.context)
+        drop = result["model"]["drop"]
+        self.assertEqual(drop["contact_stiffness_n_per_m"], 1e5)
+        self.assertIn("linear spring", drop["impact_model"])
+        self.assertIsNone(drop["effective_modulus_pa"])
+        # The explicit screening stiffness keeps the reference design
+        # healthy at 0.75 m (the override path is unchanged).
+        self.assertEqual(result["units_failed"], 0)
+
+    def test_missing_shell_material_pair_disclosed(self):
+        context = dict(self.context)
+        del context["shell_hertz_pair"]
+        result = run_population(self.config, context)
+        self.assertTrue(
+            any(
+                "HERTZ_EFFECTIVE_MODULUS_ASSUMED" in line and "generic polymer" in line
+                for line in result["diagnostics"]
+            ),
+            "missing shell material E/nu must be disclosed, never silent",
+        )
+        drop = result["model"]["drop"]
+        self.assertIn("Hertz", drop["impact_model"])
+        # Generic polymer (E=2.0e9, nu=0.36) on concrete.
+        self.assertAlmostEqual(drop["effective_modulus_pa"], 2.140e9, delta=1e7)
+
+    def test_explicit_corner_radius_override(self):
+        config = dict(self.config)
+        config["contact_radius_m"] = 0.004
+        result = run_population(config, self.context)
+        self.assertEqual(result["model"]["drop"]["contact_radius_m"], 0.004)
+
+    def test_invalid_radius_rejected(self):
+        for bad in (0.0, -0.001, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                run_population(
+                    make_config(contact_radius_m=bad), self.context
+                )
 
 
 if __name__ == "__main__":

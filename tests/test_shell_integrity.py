@@ -155,12 +155,13 @@ class CorrelationConfidenceTests(unittest.TestCase):
 
     def test_genuine_correlation_passes(self):
         # Three independent heights with measured values close to the
-        # predictions (~471 g at 0.5 m, ~577 g at 0.75 m, ~667 g at 1.0 m
-        # for this fixture's mass).
+        # predictions (~2877 g at 0.5 m, ~3675 g at 0.75 m, ~4371 g at 1.0 m
+        # for this fixture's mass under the default Hertz point-contact
+        # model).
         drops = [
-            self._drop(0, 0.5, 470.0),
-            self._drop(1, 0.75, 580.0),
-            self._drop(2, 1.0, 670.0),
+            self._drop(0, 0.5, 2880.0),
+            self._drop(1, 0.75, 3680.0),
+            self._drop(2, 1.0, 4370.0),
         ]
         result = self._run(drops)
         self.assertEqual(result["errors"], [])

@@ -46,6 +46,18 @@ SENSITIVITY_OUTPUTS = (
     "impact_speed_m_s",
 )
 
+# Outputs that drive the parameter ranking.  ``settle_s`` is EXCLUDED from
+# the ranking aggregation: the settle time of a rocking contact is
+# chaotically sensitive — microscopic input changes (relative 1e-6) flip
+# the settle branch (measured 2-8 s over a +/-1e-6 mass band on the
+# reference corner drop), so its per-parameter sensitivities are
+# knife-edge artifacts of the discrete contact detection, not robust
+# engineering measures.  It remains in the per-output rows so the
+# behavior stays visible, and the exclusion is disclosed in the result.
+SENSITIVITY_RANKING_OUTPUTS = tuple(
+    key for key in SENSITIVITY_OUTPUTS if key != "settle_s"
+)
+
 
 def _require(record, key, message):
     if key not in record or record[key] is None:
@@ -1144,11 +1156,24 @@ def run_sensitivity(base_request, fraction=DEFAULT_PERTURBATION_FRACTION, parame
                 }
             )
             continue
-        sensitivities.sort(key=lambda item: -(abs(item["sensitivity_up"] or 0.0) + abs(item["sensitivity_down"] or 0.0)) / 2.0)
-        mean_response = sum(
-            (abs(item["sensitivity_up"] or 0.0) + abs(item["sensitivity_down"] or 0.0)) / 2.0
-            for item in sensitivities
-        ) / len(sensitivities)
+        ranking_sensitivities = [
+            item for item in sensitivities
+            if item["output"] in SENSITIVITY_RANKING_OUTPUTS
+        ]
+        # The mean and ranking use the stable outputs only (settle_s excluded
+        # — see SENSITIVITY_RANKING_OUTPUTS); the per-output rows still carry
+        # the full set (including settle_s) so the chaotic response stays
+        # visible, ordered by response magnitude.
+        sensitivities.sort(
+            key=lambda item: -(abs(item["sensitivity_up"] or 0.0) + abs(item["sensitivity_down"] or 0.0)) / 2.0
+        )
+        mean_response = (
+            sum(
+                (abs(item["sensitivity_up"] or 0.0) + abs(item["sensitivity_down"] or 0.0)) / 2.0
+                for item in ranking_sensitivities
+            ) / len(ranking_sensitivities)
+            if ranking_sensitivities else 0.0
+        )
         row = {
             "parameter": name,
             "perturbation_fraction": fraction,
@@ -1169,7 +1194,11 @@ def run_sensitivity(base_request, fraction=DEFAULT_PERTURBATION_FRACTION, parame
             "sensitivity = relative output change per unit relative input change "
             "at +{:.0%} perturbation (end-to-end pipeline re-run; structural "
             "parameters re-solve the pinned closed-form case). It identifies "
-            "WHAT NEEDS MEASUREMENT, not a parameter ranking for tuning.".format(fraction)
+            "WHAT NEEDS MEASUREMENT, not a parameter ranking for tuning. "
+            "settle_s is reported per-output but EXCLUDED from the ranking: "
+            "for rocking contacts the settle time is chaotically sensitive "
+            "(sub-1e-6 relative input changes flip the settle branch), so its "
+            "sensitivity values are not robust engineering measures.".format(fraction)
         ),
     }
 
@@ -1299,6 +1328,52 @@ def _trace_boundary_assumptions(request):
     )
 
 
+def _derated_tensile_allowable_pa(material, temperature_k):
+    """The derated tensile allowable the structural solve used, or None.
+
+    Re-derives with the SAME physics material path the solver used
+    (``physics._material_props`` applies the linear temperature derating to
+    the catalog allowable at ``temperature_k``), so the persisted value is
+    byte-identical to the allowable behind
+    ``structural.response.safety_factor``.  Returns None when no
+    temperature derating was applied, no allowable exists, or the material
+    cannot be re-resolved.
+    """
+    if material is None or temperature_k is None:
+        return None
+    try:
+        temperature_k = float(temperature_k)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(temperature_k):
+        return None
+    from . import materials as materials_module
+    from . import physics as physics_module
+
+    try:
+        if isinstance(material, materials_module.MaterialDefinition):
+            definition = material
+        else:
+            definition = materials_module.MaterialDefinition.from_dict(material)
+    except Exception:
+        definition = None
+    if definition is None:
+        return None
+    try:
+        E, nu, allowable, info = physics_module._material_props(definition, temperature_k)
+    except Exception:
+        return None
+    if not info.get("derating_applied") or allowable is None:
+        return None
+    try:
+        allowable = float(allowable)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(allowable) or allowable <= 0.0:
+        return None
+    return round(allowable, 6)
+
+
 def build_shell_trace(request, result):
     """One authoritative trace of every quantity used by the shell result."""
     mass = result.get("mass") or {}
@@ -1318,6 +1393,16 @@ def build_shell_trace(request, result):
         for key in ("density", "young_modulus", "poissons_ratio", "tensile_allowable", "yield_strength"):
             if key in props:
                 material_properties[key] = props[key]
+    # Persist the temperature-DERATED tensile allowable when the structural
+    # solve applied linear temperature derating: the safety factor is
+    # computed against this derated value (physics._material_props +
+    # solve_load_case), and the FEA display fallback must prefer it over the
+    # catalog (underated) allowable — one name must never mean two values.
+    derated_tensile_allowable_pa = _derated_tensile_allowable_pa(
+        material_used, (structural.get("load_case") or {}).get("temperature_k")
+    )
+    if derated_tensile_allowable_pa is not None:
+        material_properties["derated_tensile_allowable_pa"] = derated_tensile_allowable_pa
     estimate = drop.get("peak_force_estimate") or {}
     return {
         "geometry": {

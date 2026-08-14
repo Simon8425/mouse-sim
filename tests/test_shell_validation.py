@@ -104,12 +104,12 @@ class ValidationConfigTests(unittest.TestCase):
     def test_explicit_quaternion_orientation_accepted(self):
         request = validation_request()
         request["validation"]["drop"]["orientation"] = {
-            "quaternion_wxyz": [0.8880738339771153, 0.32505758367186804, 0.32505758367186804, 0.0]
+            "quaternion_wxyz": [0.4597008433809831, -0.6279630301995544, 0.6279630301995544, 0.0]
         }
         result = run_pipeline(request)
         self.assertEqual(result["errors"], [])
         model = result["drop_simulation"]["model"]
-        expected = [0.8880738339771153, 0.32505758367186804, 0.32505758367186804, 0.0]
+        expected = [0.4597008433809831, -0.6279630301995544, 0.6279630301995544, 0.0]
         for value, reference in zip(model["orientation_quaternion_wxyz"], expected):
             self.assertAlmostEqual(value, reference, places=9)
 
@@ -180,6 +180,46 @@ class SensitivityTests(unittest.TestCase):
         self.assertIn(
             "VALIDATION_SENSITIVITY_FAILED", [item["code"] for item in result["issues"]]
         )
+
+
+
+    def test_settle_s_reported_but_excluded_from_ranking(self):
+        # VERIFICATION FINDING: the settle time of a rocking contact is
+        # chaotically sensitive (sub-1e-6 relative input changes flip the
+        # settle branch), so its per-parameter sensitivities are knife-edge
+        # artifacts.  The ranking/mean must be driven by the stable outputs
+        # (peak force, acceleration, stress, displacement, SF) while the
+        # settle_s response stays visible in the per-output rows, and the
+        # exclusion must be disclosed in the result note.
+        request = validation_request()
+        result = run_pipeline(request)
+        sensitivity = result["shell"]["validation"]["sensitivity"]
+        rows = {row["parameter"]: row for row in sensitivity["rows"]}
+        mass_row = rows["mass"]
+        output_names = [item["output"] for item in mass_row["outputs"]]
+        self.assertIn("settle_s", output_names)
+        # The mean is dominated by the stable outputs (peak force /
+        # acceleration ~0.5 per unit), not by the chaotic settle branch:
+        # a settle-driven mean would be O(1-3) (measured 2.8 before the fix).
+        self.assertLess(mass_row["mean_relative_response"], 0.5)
+        self.assertIn("settle_s", sensitivity["note"])
+        self.assertIn("EXCLUDED from the ranking", sensitivity["note"])
+
+    def test_ranking_stable_under_micro_perturbation(self):
+        # The chaotic settle branch must not move the top-3 ranking: a
+        # 1e-6 mass perturbation (sub-tolerance, flips the settle branch
+        # between 2-8 s on the reference corner drop) leaves the
+        # stable-output ranking unchanged.
+        def top_three(mass_override=None):
+            request = validation_request()
+            if mass_override is not None:
+                request["drop_simulation"] = {"mass_kg": mass_override}
+            result = run_pipeline(request)
+            return list(result["shell"]["validation"]["sensitivity"]["top_parameters"][:3])
+        base = top_three()
+        baseline_mass = run_pipeline(validation_request())["mass"]["mass_kg"]
+        perturbed = top_three(baseline_mass * (1.0 + 1e-6))
+        self.assertEqual(base, perturbed)
 
 
 class MeasuredComparisonTests(unittest.TestCase):
@@ -283,6 +323,9 @@ class ModelStatusAndTraceTests(unittest.TestCase):
         self.assertEqual(trace["drop"]["height_m"], 1.0)
         self.assertEqual(trace["drop"]["gravity_m_s2"], 9.81)
         self.assertEqual(trace["contact"]["contact_stiffness_n_per_m"], 1e5)
+        # Concrete restitution 0.30 is the instrumented drop-test class
+        # mid-point for polymer on concrete (range 0.25-0.35); the trace
+        # records the SURFACES value verbatim.
         self.assertEqual(trace["drop"]["restitution"], 0.3)
         self.assertEqual(trace["drop"]["timestep_s"], 1 / 240)
         self.assertEqual(trace["structural"]["safety_factor"], result["structural"]["response"]["safety_factor"])
@@ -292,6 +335,30 @@ class ModelStatusAndTraceTests(unittest.TestCase):
         # mass); the geometry-derived model mass is recorded alongside.
         self.assertEqual(trace["mass"]["mass_kg"], result["drop_simulation"]["model"]["mass_kg"])
         self.assertEqual(trace["mass"]["geometry_model_mass_kg"], result["mass"]["mass_kg"])
+
+    def test_trace_persists_derated_allowable_at_temperature(self):
+        # E3: when the structural solve applies linear temperature derating,
+        # the trace persists the DERATED tensile allowable (the value behind
+        # the safety factor) so downstream consumers never confuse it with
+        # the catalog (underated) allowable.
+        request = validation_request()
+        request["environment_temperature_k"] = 333.15
+        result = run_pipeline(request)
+        self.assertEqual(result["errors"], [])
+        props = result["shell"]["inputs_trace"]["material"]["properties"]
+        self.assertEqual(props["derated_tensile_allowable_pa"], 16400000.0)
+        # The solve discloses the derating; the raw catalog allowable stays.
+        self.assertEqual(props["tensile_allowable"]["value_si"], 20e6)
+        self.assertTrue(
+            any("temperature derating" in item for item in result["structural"]["response"]["assumptions"])
+        )
+
+    def test_trace_omits_derated_allowable_without_temperature(self):
+        # No temperature above the derating reference: no derated value is
+        # persisted (additive only — nothing changes for existing runs).
+        result = run_pipeline(validation_request())
+        props = result["shell"]["inputs_trace"]["material"]["properties"]
+        self.assertNotIn("derated_tensile_allowable_pa", props)
 
     def test_invalidating_assumptions_cover_major_sources(self):
         result = run_pipeline(validation_request())
@@ -482,7 +549,7 @@ class AuditFixRegressionTests(unittest.TestCase):
     def test_quaternion_measured_test_is_reesimulated(self):
         # Audit finding: an explicit-quaternion measured test previously died
         # in the correlation re-sim ("orientation must be one of flat...").
-        quaternion = {"quaternion_wxyz": [0.8880738339771153, 0.32505758367186804, 0.32505758367186804, 0.0]}
+        quaternion = {"quaternion_wxyz": [0.4597008433809831, -0.6279630301995544, 0.6279630301995544, 0.0]}
         request = validation_request()
         request["validation"]["measured_tests"] = [
             {

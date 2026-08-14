@@ -1,0 +1,4 @@
+# Taste
+See [taste/taste.md](taste/taste.md)
+
+- When diagnosing a user-reported rendering/behavioral bug (e.g., "it skids like ice", "it jitters"), prefers building a visible on-screen debug overlay that renders the real live physics numbers (velocity, rotation rate, friction, restitution, settle state, impacts) rather than blindly tweaking physics parameters — the numbers capture the ground truth for the next diagnosis round. The user will then screen-record the overlay and feed it to an external AI (e.g., Gemini) whose telemetry breakdown becomes the next input — so the overlay must display exact, unfaked values straight from the backend. When the user asks to "write a prompt for Gemini," they expect a structured diagnostic prompt (per-drop telemetry capture, transition timing, ranked root causes) that forces the external AI to read exact overlay numbers rather than guess. Confidence: 0.85

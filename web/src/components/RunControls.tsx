@@ -6,17 +6,15 @@
  */
 import * as React from 'react';
 import { useProjectStore, type ObjectEntry } from '../state/projectStore';
-import { selectObjectEntries } from '../state/selectors';
 import { worldBounds } from '../lib/geometryBounds';
+import { selectObjectEntries } from '../state/selectors';
 import {
   DROP_TESTS,
-  configForTest,
   type DropTestDefinition,
 } from '../lib/studies';
-import type { DropTestKind } from '../api/contracts';
 
 /** Shell-flex load case: uniform 5 kPa pressure on the panel. */
-const SHELL_FLEX_LOAD_CASE = {
+export const SHELL_FLEX_LOAD_CASE = {
   kind: 'pressure',
   magnitude_pa: 5000,
   distribution: 'uniform',
@@ -24,7 +22,7 @@ const SHELL_FLEX_LOAD_CASE = {
 } as const;
 
 /** Union bounds extents (meters) across all loaded geometry entries. */
-function shellDims(entries: ObjectEntry[]): { a_m: number; b_m: number; t_m: number } | null {
+export function shellDims(entries: ObjectEntry[]): { a_m: number; b_m: number; t_m: number } | null {
   let minX = Infinity;
   let minY = Infinity;
   let minZ = Infinity;
@@ -48,55 +46,93 @@ function shellDims(entries: ObjectEntry[]): { a_m: number; b_m: number; t_m: num
   return { a_m: extents[0], b_m: extents[1], t_m: extents[2] };
 }
 
-export function RunControls(): React.ReactElement {
+export interface RunControlsProps {
+  onReplaceModel?: () => void;
+  uploadOpen?: boolean;
+}
+
+export function RunControls({ onReplaceModel, uploadOpen }: RunControlsProps = {}): React.ReactElement {
   const { state, dispatch } = useProjectStore();
   const [testId, setTestId] = React.useState<DropTestDefinition['id']>('drop-test');
-  const hasGeometry = state.project !== null || state.preview !== null;
-  const isRunning = state.runStatus === 'loading' || state.runStatus === 'running';
-  const test = DROP_TESTS.find((definition) => definition.id === testId) ?? DROP_TESTS[0];
 
-  const run = () => {
-    const config = configForTest(test);
-    const entries = selectObjectEntries(state);
-    const dims = shellDims(entries);
-    dispatch({
-      type: 'RUN_DROP_TEST',
-      test: test.test as DropTestKind,
-      config: {
-        height_m: config.height_m,
-        surface: config.surface,
-        drop_count: config.drop_count,
-        orientation: config.orientation,
-        spin_rps: config.spin_rps,
-        structure: dims ? { type: 'shell_panel', ...dims } : null,
-        load_case: SHELL_FLEX_LOAD_CASE,
-      },
-    });
+  const hasGeometry =
+    selectObjectEntries(state).length > 0 ||
+    state.project !== null ||
+    state.preview !== null ||
+    state.tempPreview !== null;
+  const isRunning = state.runStatus === 'loading' || state.runStatus === 'running';
+
+  // The leave-test button is coupled to an ACTIVE test: once the test has
+  // been left (playbackDismissed) the button must disappear even though the
+  // retained result stays visible.
+  const testActive =
+    state.draft?.drop_simulation != null ||
+    (!state.playbackDismissed && state.lastResult?.drop_simulation != null);
+
+  const openConfigCard = () => {
+    dispatch({ type: 'SET_CONTROL_OPEN', open: true, mode: 'simulation' });
   };
 
-  return (
-    <div className="run-controls">
-      <label className="run-controls__field">
-        <span>Material</span>
-        <select
-          value={state.defaultMaterialKey}
-          aria-label="Material for analysis"
-          onChange={(event) =>
-            dispatch({ type: 'SET_DEFAULT_MATERIAL', key: event.target.value })
-          }
+  const leaveTest = () => {
+    dispatch({ type: 'LEAVE_TEST' });
+  };
+
+  if (isRunning) {
+    return (
+      <div className="run-controls run-controls--loading" role="status" aria-label="Loading test">
+        <div className="run-controls__loading-indicator">
+          <span className="run-controls__spinner" aria-hidden="true" />
+          <span className="run-controls__loading-text">Loading test…</span>
+        </div>
+        <div className="run-controls__divider" aria-hidden="true" />
+        <button
+          type="button"
+          className="btn btn--ghost btn--sm"
+          aria-label="Cancel test loading"
+          onClick={() => dispatch({ type: 'CANCEL_RUN' })}
         >
-          {(state.materials && state.materials.length > 0
-            ? state.materials.map((m) => m.key)
-            : ['default']
-          ).map((key) => (
-            <option key={key} value={key}>
-              {key}
-            </option>
-          ))}
-        </select>
-      </label>
+          Cancel
+        </button>
+      </div>
+    );
+  }
+
+  if (testActive) {
+    // During an active test only the leave action is offered here: the
+    // playback card (PLAY/PAUSE/status) floats over the viewport bottom.
+    return (
+      <div className="run-controls" role="group" aria-label="Analysis run parameters">
+        <button
+          type="button"
+          className="btn run-controls__leave-test"
+          aria-label="Leave test and return to normal mode"
+          onClick={leaveTest}
+        >
+          Leave test
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="run-controls" role="group" aria-label="Analysis run parameters">
+      {onReplaceModel ? (
+        <>
+          <button
+            type="button"
+            className="btn run-controls__replace"
+            onClick={onReplaceModel}
+            aria-expanded={uploadOpen}
+            title="Replace the loaded model with another file"
+          >
+            Replace model
+          </button>
+          <div className="run-controls__divider" aria-hidden="true" />
+        </>
+      ) : null}
+
+
       <label className="run-controls__field">
-        <span>Test</span>
         <select
           value={testId}
           aria-label="Test type"
@@ -109,17 +145,18 @@ export function RunControls(): React.ReactElement {
           ))}
         </select>
       </label>
+
       <button
         type="button"
         className="btn btn--primary"
-        aria-label="Run test"
-        onClick={run}
+        aria-label="Configure and run test"
+        onClick={openConfigCard}
         disabled={!hasGeometry || isRunning}
         title={
           isRunning
             ? 'A run is in progress'
             : hasGeometry
-              ? `Run ${test.title}`
+              ? 'Configure test parameters & run simulation'
               : 'Upload a model first'
         }
       >

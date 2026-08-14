@@ -190,6 +190,7 @@ def _properties(
     temperature_max_k,
     fatigue_strength_at_1e6_pa=None,
     fatigue_exponent_k=None,
+    fatigue_endurance_limit_pa=None,
     young_modulus_transverse_pa=None,
     young_modulus_thickness_pa=None,
     shear_modulus_xy_pa=None,
@@ -200,7 +201,7 @@ def _properties(
     continuous_use_temperature_min_k=None,
     continuous_use_temperature_max_k=None,
 ):
-    return MaterialProperties(
+    properties = MaterialProperties(
         density=_quantity(density, "density", "density"),
         young_modulus=_quantity(young_modulus, "pressure", "young_modulus"),
         poissons_ratio=poissons_ratio,
@@ -236,6 +237,17 @@ def _properties(
             continuous_use_temperature_max_k, "continuous_use_temperature_max_k"
         ),
     )
+    if fatigue_endurance_limit_pa is not None:
+        # The persisted model (MaterialProperties) does not declare an
+        # endurance-limit field; the built-in steel entry carries it as a
+        # supplementary attribute so it participates in catalog validation
+        # and the fatigue accessor without changing the persisted schema.
+        object.__setattr__(
+            properties,
+            "fatigue_endurance_limit_pa",
+            _quantity(fatigue_endurance_limit_pa, "pressure", "fatigue_endurance_limit_pa"),
+        )
+    return properties
 
 
 def _temperature(value, field_name):
@@ -269,6 +281,7 @@ def _builtin_definition(
     condition="nominal room temperature, dry",
     fatigue_strength_at_1e6_pa=None,
     fatigue_exponent_k=None,
+    fatigue_endurance_limit_pa=None,
     young_modulus_transverse_pa=None,
     young_modulus_thickness_pa=None,
     shear_modulus_xy_pa=None,
@@ -294,6 +307,7 @@ def _builtin_definition(
         293.15,
         fatigue_strength_at_1e6_pa=fatigue_strength_at_1e6_pa,
         fatigue_exponent_k=fatigue_exponent_k,
+        fatigue_endurance_limit_pa=fatigue_endurance_limit_pa,
         young_modulus_transverse_pa=young_modulus_transverse_pa,
         young_modulus_thickness_pa=young_modulus_thickness_pa,
         shear_modulus_xy_pa=shear_modulus_xy_pa,
@@ -336,7 +350,12 @@ def builtin_materials():
     continuous-use temperature ranges are drawn from the polymer supplier
     datasheet class (e.g., SABIC/Covestro/BASF modulus-vs-temperature and
     fatigue curves, MIL-HDBK-5 class values for steel) and are intentionally
-    conservative screening values, not certified data.
+    conservative screening values, not certified data.  Every Basquin curve
+    is anchored so the implied short-life point sigma(1e3) =
+    sigma_ref*1000^(1/k) stays at or below 90% of the ultimate strength
+    (catalog validation enforces the same rule); the metal entries carry a
+    fatigue endurance-limit knee (``fatigue_endurance_limit_pa``, e.g.
+    180 MPa for the steel entry) below which life is screening-infinite.
     """
 
     entries = (
@@ -346,7 +365,7 @@ def builtin_materials():
             "yield_strength": 40e6, "ultimate_strength": 45e6,
             "tensile_allowable": 20e6, "compressive_allowable": 60e6,
             "shear_allowable": 25e6, "friction_coefficient": 0.35,
-            "fatigue_strength_at_1e6_pa": 14e6, "fatigue_exponent_k": 6,
+            "fatigue_strength_at_1e6_pa": 14e6, "fatigue_exponent_k": 7,
             "continuous_use_temperature_min_k": 233.15,
             "continuous_use_temperature_max_k": 363.15,
         },
@@ -356,7 +375,7 @@ def builtin_materials():
             "yield_strength": 65e6, "ultimate_strength": 70e6,
             "tensile_allowable": 35e6, "compressive_allowable": 80e6,
             "shear_allowable": 40e6, "friction_coefficient": 0.30,
-            "fatigue_strength_at_1e6_pa": 25e6, "fatigue_exponent_k": 6,
+            "fatigue_strength_at_1e6_pa": 25e6, "fatigue_exponent_k": 8,
             "continuous_use_temperature_min_k": 233.15,
             "continuous_use_temperature_max_k": 398.15,
         },
@@ -366,7 +385,7 @@ def builtin_materials():
             "yield_strength": 45e6, "ultimate_strength": 55e6,
             "tensile_allowable": 25e6, "compressive_allowable": 65e6,
             "shear_allowable": 30e6, "friction_coefficient": 0.32,
-            "fatigue_strength_at_1e6_pa": 20e6, "fatigue_exponent_k": 6,
+            "fatigue_strength_at_1e6_pa": 20e6, "fatigue_exponent_k": 8,
             "continuous_use_temperature_min_k": 233.15,
             "continuous_use_temperature_max_k": 373.15,
         },
@@ -376,7 +395,7 @@ def builtin_materials():
             "yield_strength": 65e6, "ultimate_strength": 70e6,
             "tensile_allowable": 35e6, "compressive_allowable": 85e6,
             "shear_allowable": 40e6, "friction_coefficient": 0.25,
-            "fatigue_strength_at_1e6_pa": 30e6, "fatigue_exponent_k": 6,
+            "fatigue_strength_at_1e6_pa": 30e6, "fatigue_exponent_k": 10,
             "continuous_use_temperature_min_k": 233.15,
             "continuous_use_temperature_max_k": 363.15,
         },
@@ -403,7 +422,7 @@ def builtin_materials():
             "key": "FR4", "name": "FR-4 glass epoxy", "family": "laminate",
             "density": 1850, "young_modulus": 22e9, "poissons_ratio": 0.14,
             "yield_strength": 250e6, "ultimate_strength": 350e6,
-            "tensile_allowable": 200e6, "compressive_allowable": 300e6,
+            "tensile_allowable": 125e6, "compressive_allowable": 300e6,
             "shear_allowable": 100e6, "friction_coefficient": 0.40,
             "fatigue_strength_at_1e6_pa": 65e6, "fatigue_exponent_k": 10,
             "young_modulus_transverse_pa": 22e9, "young_modulus_thickness_pa": 9e9,
@@ -428,7 +447,8 @@ def builtin_materials():
             "yield_strength": 250e6, "ultimate_strength": 400e6,
             "tensile_allowable": 150e6, "compressive_allowable": 250e6,
             "shear_allowable": 100e6, "friction_coefficient": 0.45,
-            "fatigue_strength_at_1e6_pa": 220e6, "fatigue_exponent_k": 5,
+            "fatigue_strength_at_1e6_pa": 180e6, "fatigue_exponent_k": 10,
+            "fatigue_endurance_limit_pa": 180e6,
             "continuous_use_temperature_min_k": 233.15,
             "continuous_use_temperature_max_k": 473.15,
         },
@@ -449,6 +469,61 @@ def builtin_materials():
             "shear_allowable": 58e6, "friction_coefficient": 0.35,
             "continuous_use_temperature_min_k": 233.15,
             "continuous_use_temperature_max_k": 423.15,
+        },
+        {
+            "key": "SLA_8001",
+            "name": "SLA 8001 Resin (Translucent)",
+            "family": "photopolymer",
+            "density": 1120, "young_modulus": 2.1e9, "poissons_ratio": 0.38,
+            "yield_strength": 45e6, "ultimate_strength": 48e6,
+            "tensile_allowable": 22e6, "compressive_allowable": 60e6,
+            "shear_allowable": 26e6, "friction_coefficient": 0.35,
+            "continuous_use_temperature_min_k": 233.15,
+            "continuous_use_temperature_max_k": 318.15,
+        },
+        {
+            "key": "SLA_9000HE",
+            "name": "SLA 9000HE Resin (White High-Elasticity)",
+            "family": "photopolymer",
+            "density": 1140, "young_modulus": 2.65e9, "poissons_ratio": 0.42,
+            "yield_strength": 48e6, "ultimate_strength": 51e6,
+            "tensile_allowable": 24e6, "compressive_allowable": 62e6,
+            "shear_allowable": 28e6, "friction_coefficient": 0.35,
+            "continuous_use_temperature_min_k": 233.15,
+            "continuous_use_temperature_max_k": 323.15,
+        },
+        {
+            "key": "MJF_PA12_HP",
+            "name": "HP Multi Jet Fusion PA12-HP",
+            "family": "polyamide",
+            "density": 1010, "young_modulus": 1.75e9, "poissons_ratio": 0.47,
+            "yield_strength": 40e6, "ultimate_strength": 48e6,
+            "tensile_allowable": 20e6, "compressive_allowable": 60e6,
+            "shear_allowable": 25e6, "friction_coefficient": 0.30,
+            "continuous_use_temperature_min_k": 233.15,
+            "continuous_use_temperature_max_k": 373.15,
+        },
+        {
+            "key": "MJF_PA11_HP",
+            "name": "HP Multi Jet Fusion PA11-HP",
+            "family": "polyamide",
+            "density": 1050, "young_modulus": 1.8e9, "poissons_ratio": 0.43,
+            "yield_strength": 43e6, "ultimate_strength": 52e6,
+            "tensile_allowable": 22e6, "compressive_allowable": 64e6,
+            "shear_allowable": 26e6, "friction_coefficient": 0.30,
+            "continuous_use_temperature_min_k": 233.15,
+            "continuous_use_temperature_max_k": 383.15,
+        },
+        {
+            "key": "MJF_PA12S_HP",
+            "name": "HP Multi Jet Fusion PA12S-HP",
+            "family": "polyamide",
+            "density": 980, "young_modulus": 1.7e9, "poissons_ratio": 0.47,
+            "yield_strength": 38e6, "ultimate_strength": 45e6,
+            "tensile_allowable": 19e6, "compressive_allowable": 56e6,
+            "shear_allowable": 23e6, "friction_coefficient": 0.30,
+            "continuous_use_temperature_min_k": 233.15,
+            "continuous_use_temperature_max_k": 373.15,
         },
         {
             "key": DEFAULT_MATERIAL_KEY,
@@ -570,6 +645,7 @@ def _definition_from_mapping(payload, default_key=None):
                 "fatigue_strength_at_1e6_pa", raw_properties.get("fatigue_strength_pa")
             ),
             fatigue_exponent_k=raw_properties.get("fatigue_exponent_k"),
+            fatigue_endurance_limit_pa=raw_properties.get("fatigue_endurance_limit_pa"),
             young_modulus_transverse_pa=raw_properties.get(
                 "young_modulus_transverse_pa",
                 raw_properties.get("young_modulus_e2_pa", raw_properties.get("e2_pa")),
@@ -776,6 +852,46 @@ def material_validation_errors(material, require_structural=True, required_field
         errors.append(
             "fatigue_strength_at_1e6_pa and fatigue_exponent_k must be set together"
         )
+    # Fatigue curve consistency: the Basquin curve N = 1e6*(sigma_ref/sigma)^k
+    # implies a short-life point sigma(1e3) = sigma_ref*1000^(1/k).  A curve
+    # whose implied sigma(1e3) exceeds the ultimate strength is physically
+    # impossible (audit E1: the old steel curve implied 876 MPa against a
+    # 400 MPa UTS); anything above 90% of UTS leaves no margin for the
+    # screening use and is equally rejected.
+    endurance_limit = getattr(properties, "fatigue_endurance_limit_pa", None)
+    errors.extend(
+        _quantity_errors(endurance_limit, "fatigue_endurance_limit_pa", "pressure", positive=True)
+    )
+    anchor = properties.fatigue_strength_at_1e6_pa
+    exponent = properties.fatigue_exponent_k
+    if anchor is not None and exponent is not None:
+        anchor_value = quantity_value(anchor)
+        if not _finite_number(exponent) or float(exponent) <= 0.0:
+            errors.append("fatigue_exponent_k must be a positive finite number")
+        elif anchor_value is not None and anchor_value > 0.0:
+            implied_1e3 = anchor_value * 1000.0 ** (1.0 / float(exponent))
+            uts_value = quantity_value(properties.ultimate_strength)
+            if uts_value is not None and implied_1e3 > uts_value:
+                errors.append(
+                    "fatigue curve implies sigma(1e3) = {:.6g} Pa exceeding the "
+                    "ultimate strength {:.6g} Pa".format(implied_1e3, uts_value)
+                )
+            elif uts_value is not None and implied_1e3 > 0.9 * uts_value:
+                errors.append(
+                    "fatigue curve implies sigma(1e3) = {:.6g} Pa exceeding 90% of the "
+                    "ultimate strength {:.6g} Pa (0.9*UTS = {:.6g} Pa)".format(
+                        implied_1e3, uts_value, 0.9 * uts_value
+                    )
+                )
+        if (
+            endurance_limit is not None
+            and anchor_value is not None
+            and isinstance(endurance_limit, Quantity)
+            and endurance_limit.value_si > anchor_value
+        ):
+            errors.append(
+                "fatigue_endurance_limit_pa must not exceed fatigue_strength_at_1e6_pa"
+            )
     if definition.anisotropy_supported:
         for field_name in (
             "young_modulus_transverse_pa",
@@ -845,6 +961,21 @@ def validate_material(material, require_structural=True):
     if errors:
         raise ValidationError("invalid material definition", errors)
     return definition
+
+
+def fatigue_endurance_limit_pa(material):
+    """Return the fatigue endurance limit in Pa for a material, or None.
+
+    Only materials that carry an explicit endurance-limit knee (the built-in
+    steel entry) return a value; the Basquin path without an endurance limit
+    returns None.  The knee is supplementary data on the material properties
+    and is not part of the persisted model schema.
+    """
+    definition = _material_definition(material)
+    limit = getattr(definition.properties, "fatigue_endurance_limit_pa", None)
+    if limit is None:
+        return None
+    return float(limit.value_si)
 
 
 def mass_override_validation_errors(override, qualification=False):
@@ -1195,6 +1326,7 @@ __all__ = [
     "load_material_catalog",
     "material_validation_errors",
     "validate_material",
+    "fatigue_endurance_limit_pa",
     "mass_override_validation_errors",
     "validate_mass_override",
     "resolve_assignments",

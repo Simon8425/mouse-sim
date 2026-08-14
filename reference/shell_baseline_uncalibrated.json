@@ -3,7 +3,7 @@
   "note": "the first physical comparison MUST be against this untouched baseline; never fit parameters to individual tests (freeze-phase items 10-11)",
   "engine": {
     "version": "0.1.0",
-    "engine_hash": "729783dcfb7805f2026ffdf519b2a6fdd2b2a9f2c4e26c7f1fedafee84ed56e4"
+    "engine_hash": "cb8e7190d954124b856a457e883894fbbcc410a0e5773abc436485cbae24f0fb"
   },
   "config_hashes": {
     "geometry_digest": "b853630b3d6f1db19aafb79e38631cf54328f9f57d24c1c177a76b80ae5bc5b0",
@@ -11,105 +11,78 @@
     "load_case_digest": "2e9cadc4407c360883b623d439e8506b7f124bcb848cdadd58130f37016475ca",
     "validation_digest": "dd3ce8aee8e74b48f10a9d497f69066d4d0c966dd0271ffe05c4fddabf211ce1",
     "request_digest": "944d1ed50b89a300bfc503c8c592c10a9a78332421cc3fbf9e2cb25b4aef1136",
-    "run_id": "7dadfc0bb5456dc860ea0e0622adcbc85545e48487ef3b9e8a7c0518aa821df0"
+    "run_id": "63982068e975e0181e7cb154c20670b5b7f3d0403b570cedc86490a27024f7f1"
   },
   "request": {
-    "schema_id": "gms.project-document/1",
+    "load_case": {
+      "kind": "pressure",
+      "magnitude": {
+        "unit": "kPa",
+        "value": 1
+      }
+    },
     "mode": "validation",
-    "units": "mm",
     "objects": [
       {
-        "id": "shell",
         "geometry": {
-          "type": "box",
           "size": [
             60,
             40,
             10
           ],
+          "type": "box",
           "units": "mm"
         },
+        "id": "shell",
         "material": "ABS",
         "structural_behavior": "shell"
       },
       {
-        "id": "pcb",
         "geometry": {
-          "type": "box",
           "size": [
             50,
             30,
             1.6
           ],
+          "type": "box",
           "units": "mm"
         },
+        "id": "pcb",
         "material": "FR4",
         "structural_behavior": "rigid"
       },
       {
-        "id": "battery",
         "geometry": {
-          "type": "box",
           "size": [
             40,
             20,
             8
           ],
+          "type": "box",
           "units": "mm"
         },
+        "id": "battery",
         "material": "LiPo",
         "structural_behavior": "rigid"
       }
     ],
     "options": {
-      "min_thickness_m": 0.001,
-      "max_thickness_m": 0.05
+      "max_thickness_m": 0.05,
+      "min_thickness_m": 0.001
     },
-    "load_case": {
-      "kind": "pressure",
-      "magnitude": {
-        "value": 1,
-        "unit": "kPa"
-      }
-    },
+    "schema_id": "gms.project-document/1",
     "structure": {
-      "type": "shell_panel",
       "a_m": 0.06,
       "b_m": 0.04,
-      "t_m": 0.002,
-      "material": "ABS"
-    },
-    "validation": {
-      "geometry": {
-        "revision": "REF-CAD-1",
-        "units": "mm",
-        "quality": "reference"
-      },
       "material": "ABS",
-      "drop": {
-        "height_m": 1.0,
-        "orientation": "corner",
-        "surface": "concrete",
-        "gravity_m_s2": 9.81,
-        "initial_velocity_m_s": [
-          0,
-          0,
-          0
-        ],
-        "initial_angular_velocity_rad_s": [
-          0,
-          0,
-          0
-        ]
-      },
+      "t_m": 0.002,
+      "type": "shell_panel"
+    },
+    "units": "mm",
+    "validation": {
       "contact": {
         "stiffness_n_per_m": 100000.0,
         "timestep_s": 0.004166666666666667
-      },
-      "structural": {
-        "model": "shell_panel_navier_v1",
-        "boundary_assumptions": "simply supported",
-        "supported_validity": "t >= 0.5 mm"
       },
       "contact_stiffness_sweep_n_per_m": [
         100000.0,
@@ -117,8 +90,35 @@
         500000.0,
         1000000.0
       ],
+      "drop": {
+        "gravity_m_s2": 9.81,
+        "height_m": 1.0,
+        "initial_angular_velocity_rad_s": [
+          0,
+          0,
+          0
+        ],
+        "initial_velocity_m_s": [
+          0,
+          0,
+          0
+        ],
+        "orientation": "corner",
+        "surface": "concrete"
+      },
+      "geometry": {
+        "quality": "reference",
+        "revision": "REF-CAD-1",
+        "units": "mm"
+      },
+      "material": "ABS",
       "sensitivity": {
         "perturbation_fraction": 0.1
+      },
+      "structural": {
+        "boundary_assumptions": "simply supported",
+        "model": "shell_panel_navier_v1",
+        "supported_validity": "t >= 0.5 mm"
       }
     }
   },
@@ -210,9 +210,9 @@
       "gravity_m_s2": 9.81,
       "orientation": "corner",
       "orientation_quaternion_wxyz": [
-        0.8880738339771153,
-        0.32505758367186804,
-        0.32505758367186804,
+        0.4597008433809831,
+        -0.6279630301995544,
+        0.6279630301995544,
         0.0
       ],
       "initial_velocity_m_s": [
@@ -236,10 +236,12 @@
       "peak_force_estimate": {
         "mass_kg": 0.0454,
         "restitution": 0.3,
-        "energy_j": 0.283996,
-        "impact_speed_m_s": 3.537066,
+        "energy_j": 0.441279,
+        "impact_speed_m_s": 4.409037,
         "contact_stiffness_n_per_m": 100000.0,
-        "model": "linear-spring quasi-static estimate (drop-derived, effective mass and degraded restitution)"
+        "effective_modulus_pa": null,
+        "contact_radius_m": null,
+        "model": "linear-spring quasi-static estimate (explicit k = 100000 N/m) (drop-derived, effective mass and degraded restitution)"
       }
     },
     "structural": {
@@ -248,8 +250,8 @@
       "load_case": {
         "kind": "pressure",
         "magnitude": {
-          "value": 1,
-          "unit": "kPa"
+          "unit": "kPa",
+          "value": 1
         },
         "magnitude_pa": 1000.0
       },
@@ -259,7 +261,7 @@
     },
     "engine": {
       "version": "0.1.0",
-      "engine_hash": "729783dcfb7805f2026ffdf519b2a6fdd2b2a9f2c4e26c7f1fedafee84ed56e4"
+      "engine_hash": "cb8e7190d954124b856a457e883894fbbcc410a0e5773abc436485cbae24f0fb"
     },
     "seed": 0
   },
@@ -409,8 +411,15 @@
         0.0
       ],
       "max_stress_pa": 174350.0260853668,
-      "max_stress_filtered_pa": 134735.51691827332,
+      "max_stress_filtered_pa": 134735.5169182733,
       "filtered_location": [
+        0.03,
+        0.02,
+        -0.001
+      ],
+      "max_shear_pa": null,
+      "corner_twisting_vm_pa": 164537.3787552242,
+      "peak_location_m": [
         0.03,
         0.02,
         -0.001
@@ -472,8 +481,8 @@
           1.4740666666666668e-05
         ]
       ],
-      "support_model": "mesh_extreme_points",
-      "support_point_count": 14,
+      "support_model": "convex_hull",
+      "support_point_count": 20,
       "integrator": "semi_implicit_euler",
       "timestep_s": 0.004166666666666667,
       "gravity_m_s2": 9.81,
@@ -486,15 +495,15 @@
         0.0
       ],
       "orientation_quaternion_wxyz": [
-        0.8880738339771153,
-        0.32505758367186804,
-        0.32505758367186804,
+        0.4597008433809831,
+        -0.6279630301995544,
+        0.6279630301995544,
         0.0
       ],
       "gravity_vector_body": [
-        0.5773502691896256,
-        -0.5773502691896256,
-        -0.577350269189626
+        0.5773502691896258,
+        0.5773502691896258,
+        0.5773502691896257
       ],
       "initial_angular_velocity_rad_s": [
         0.0,
@@ -536,73 +545,75 @@
     },
     "drop_peak": {
       "drop": 0,
-      "t_s": 0.4542,
-      "impact_speed_m_s": 8.6742,
-      "kinetic_energy_j": 0.283996,
-      "raw_kinetic_energy_j": 0.283996
+      "t_s": 0.4458,
+      "impact_speed_m_s": 4.409,
+      "kinetic_energy_j": 0.441279,
+      "raw_kinetic_energy_j": 0.441279
     },
     "drop_first": {
-      "settled_s": 8.004,
-      "settled": false,
+      "settled_s": 1.008,
+      "settled": true,
       "energy": {
         "release_j": 0.459517,
         "first_impact_j": 0.441279,
-        "settled_j": 0.002939,
-        "lost_contact_j": 0.965223,
-        "lost_drag_j": 0.000462,
-        "drift_pct": 0.067
+        "settled_j": 0.00239,
+        "lost_contact_j": 0.213911,
+        "lost_drag_j": 6.9e-05,
+        "drift_pct": 0.0189
       },
-      "peak_impact_speed_m_s": 8.6742,
+      "peak_impact_speed_m_s": 4.409,
       "peak_kinetic_energy_j": 0.441279
     },
     "peak_force_estimate": {
       "mass_kg": 0.0454,
       "restitution": 0.3,
-      "energy_j": 0.283996,
-      "impact_speed_m_s": 3.537066,
+      "energy_j": 0.441279,
+      "impact_speed_m_s": 4.409037,
       "contact_stiffness_n_per_m": 100000.0,
-      "model": "linear-spring quasi-static estimate (drop-derived, effective mass and degraded restitution)"
+      "effective_modulus_pa": null,
+      "contact_radius_m": null,
+      "model": "linear-spring quasi-static estimate (explicit k = 100000 N/m) (drop-derived, effective mass and degraded restitution)"
     },
-    "peak_force_estimate_n": 238.32582738763335,
+    "peak_force_estimate_n": 297.0787774311723,
     "sweep": {
       "rows": [
         {
           "contact_stiffness_n_per_m": 100000.0,
-          "peak_force_n": 238.32581675751422,
-          "peak_acceleration_m_s2": 5249.4673294606655,
-          "impulse_n_s": 0.20875763532,
+          "peak_force_n": 297.07880603276845,
+          "peak_acceleration_m_s2": 6543.586035964063,
+          "impulse_n_s": 0.26022136374,
           "contact_duration_s": 0.0010583950583424142,
-          "contact_compression_m": 0.002383258167575142,
+          "contact_compression_m": 0.0029707880603276845,
           "load_path_stress_pa": null,
           "safety_factor": "not_available"
         },
         {
           "contact_stiffness_n_per_m": 200000.0,
-          "peak_force_n": 337.0436023221216,
-          "peak_acceleration_m_s2": 7423.867892557744,
-          "impulse_n_s": 0.20875763532,
+          "peak_force_n": 420.1328765851472,
+          "peak_acceleration_m_s2": 9254.028118615577,
+          "impulse_n_s": 0.26022136374,
           "contact_duration_s": 0.0007483983229282526,
-          "contact_compression_m": 0.0016852180116106081,
+          "contact_compression_m": 0.0021006643829257357,
           "load_path_stress_pa": null,
           "safety_factor": "not_available"
         },
         {
           "contact_stiffness_n_per_m": 500000.0,
-          "peak_force_n": 532.9127270629602,
-          "peak_acceleration_m_s2": 11738.16579433833,
-          "impulse_n_s": 0.20875763532,
+          "peak_force_n": 664.2884049637448,
+          "peak_acceleration_m_s2": 14631.903193034026,
+          "impulse_n_s": 0.26022136374,
           "contact_duration_s": 0.00047332865950069875,
-          "contact_compression_m": 0.0010658254541259205,
+          "contact_compression_m": 0.0013285768099274896,
           "load_path_stress_pa": null,
           "safety_factor": "not_available"
         },
         {
           "contact_stiffness_n_per_m": 1000000.0,
-          "peak_force_n": 753.65240617367,
-          "peak_acceleration_m_s2": 16600.273263737225,
-          "impulse_n_s": 0.20875763532,
+          "peak_force_n": 939.4456716269187,
+          "peak_acceleration_m_s2": 20692.635938918913,
+          "impulse_n_s": 0.26022136374,
           "contact_duration_s": 0.00033469390486288243,
-          "contact_compression_m": 0.00075365240617367,
+          "contact_compression_m": 0.0009394456716269188,
           "load_path_stress_pa": null,
           "safety_factor": "not_available"
         }
@@ -613,14 +624,14 @@
       "basis": "contact_stiffness_sweep",
       "band": {
         "peak_force_n": {
-          "low": 238.3258,
-          "high": 753.6524,
-          "nominal": 238.3258
+          "low": 297.0788,
+          "high": 939.4457,
+          "nominal": 297.0788
         },
         "peak_acceleration_m_s2": {
-          "low": 5249.4673,
-          "high": 16600.2733,
-          "nominal": 5249.4673
+          "low": 6543.586,
+          "high": 20692.6359,
+          "nominal": 6543.586
         },
         "contact_duration_s": {
           "low": 0.0003,
@@ -628,47 +639,15 @@
           "nominal": 0.0011
         },
         "contact_compression_m": {
-          "low": 0.0008,
-          "high": 0.0024,
-          "nominal": 0.0024
+          "low": 0.0009,
+          "high": 0.003,
+          "nominal": 0.003
         }
       },
       "note": "spread across the swept contact stiffness values (uncalibrated k); NOT a statistical confidence interval"
     },
     "sensitivity": {
       "rows": [
-        {
-          "parameter": "timestep",
-          "perturbation_fraction": 0.1,
-          "mean_relative_response": 1.2915,
-          "outputs": [
-            {
-              "output": "settle_s",
-              "sensitivity_up": -8.467,
-              "sensitivity_down": 8.467
-            },
-            {
-              "output": "impact_speed_m_s",
-              "sensitivity_up": 0.2415,
-              "sensitivity_down": -0.2415
-            },
-            {
-              "output": "peak_acceleration_m_s2",
-              "sensitivity_up": 0.1659,
-              "sensitivity_down": -0.1659
-            },
-            {
-              "output": "peak_force_n",
-              "sensitivity_up": 0.1659,
-              "sensitivity_down": -0.1659
-            },
-            {
-              "output": "peak_stress_pa",
-              "sensitivity_up": 0.0,
-              "sensitivity_down": -0.0
-            }
-          ]
-        },
         {
           "parameter": "thickness",
           "perturbation_fraction": 0.1,
@@ -734,6 +713,70 @@
           ]
         },
         {
+          "parameter": "mass",
+          "perturbation_fraction": 0.1,
+          "mean_relative_response": 0.1673,
+          "outputs": [
+            {
+              "output": "settle_s",
+              "sensitivity_up": 0.4563,
+              "sensitivity_down": 0.6151
+            },
+            {
+              "output": "peak_acceleration_m_s2",
+              "sensitivity_up": -0.4654,
+              "sensitivity_down": -0.5409
+            },
+            {
+              "output": "peak_force_n",
+              "sensitivity_up": 0.4881,
+              "sensitivity_down": 0.5132
+            },
+            {
+              "output": "peak_stress_pa",
+              "sensitivity_up": 0.0,
+              "sensitivity_down": -0.0
+            },
+            {
+              "output": "max_displacement_m",
+              "sensitivity_up": 0.0,
+              "sensitivity_down": -0.0
+            }
+          ]
+        },
+        {
+          "parameter": "contact_stiffness",
+          "perturbation_fraction": 0.1,
+          "mean_relative_response": 0.1669,
+          "outputs": [
+            {
+              "output": "peak_acceleration_m_s2",
+              "sensitivity_up": 0.4881,
+              "sensitivity_down": 0.5132
+            },
+            {
+              "output": "peak_force_n",
+              "sensitivity_up": 0.4881,
+              "sensitivity_down": 0.5132
+            },
+            {
+              "output": "peak_stress_pa",
+              "sensitivity_up": 0.0,
+              "sensitivity_down": -0.0
+            },
+            {
+              "output": "max_displacement_m",
+              "sensitivity_up": 0.0,
+              "sensitivity_down": -0.0
+            },
+            {
+              "output": "safety_factor",
+              "sensitivity_up": 0.0,
+              "sensitivity_down": -0.0
+            }
+          ]
+        },
+        {
           "parameter": "strength",
           "perturbation_fraction": 0.1,
           "mean_relative_response": 0.1667,
@@ -766,128 +809,32 @@
           ]
         },
         {
-          "parameter": "mass",
+          "parameter": "timestep",
           "perturbation_fraction": 0.1,
-          "mean_relative_response": 0.1434,
+          "mean_relative_response": 0.0115,
           "outputs": [
             {
-              "output": "peak_acceleration_m_s2",
-              "sensitivity_up": -0.4654,
-              "sensitivity_down": -0.5409
-            },
-            {
-              "output": "peak_force_n",
-              "sensitivity_up": 0.4881,
-              "sensitivity_down": 0.5132
-            },
-            {
-              "output": "peak_stress_pa",
-              "sensitivity_up": 0.0,
-              "sensitivity_down": -0.0
-            },
-            {
-              "output": "max_displacement_m",
-              "sensitivity_up": 0.0,
-              "sensitivity_down": -0.0
-            },
-            {
-              "output": "safety_factor",
-              "sensitivity_up": 0.0,
-              "sensitivity_down": -0.0
-            }
-          ]
-        },
-        {
-          "parameter": "contact_stiffness",
-          "perturbation_fraction": 0.1,
-          "mean_relative_response": 0.143,
-          "outputs": [
-            {
-              "output": "peak_acceleration_m_s2",
-              "sensitivity_up": 0.4881,
-              "sensitivity_down": 0.5132
-            },
-            {
-              "output": "peak_force_n",
-              "sensitivity_up": 0.4881,
-              "sensitivity_down": 0.5132
-            },
-            {
-              "output": "peak_stress_pa",
-              "sensitivity_up": 0.0,
-              "sensitivity_down": -0.0
-            },
-            {
-              "output": "max_displacement_m",
-              "sensitivity_up": 0.0,
-              "sensitivity_down": -0.0
-            },
-            {
-              "output": "safety_factor",
-              "sensitivity_up": 0.0,
-              "sensitivity_down": -0.0
-            }
-          ]
-        },
-        {
-          "parameter": "inertia",
-          "perturbation_fraction": 0.1,
-          "mean_relative_response": 0.1072,
-          "outputs": [
-            {
-              "output": "impact_speed_m_s",
-              "sensitivity_up": -0.4102,
-              "sensitivity_down": -0.3931
+              "output": "settle_s",
+              "sensitivity_up": 0.0397,
+              "sensitivity_down": -0.0397
             },
             {
               "output": "peak_acceleration_m_s2",
-              "sensitivity_up": -0.1685,
-              "sensitivity_down": -0.1804
+              "sensitivity_up": 0.0231,
+              "sensitivity_down": -0.0231
             },
             {
               "output": "peak_force_n",
-              "sensitivity_up": -0.1685,
-              "sensitivity_down": -0.1804
-            },
-            {
-              "output": "peak_stress_pa",
-              "sensitivity_up": 0.0,
-              "sensitivity_down": -0.0
-            },
-            {
-              "output": "max_displacement_m",
-              "sensitivity_up": 0.0,
-              "sensitivity_down": -0.0
-            }
-          ]
-        },
-        {
-          "parameter": "restitution",
-          "perturbation_fraction": 0.1,
-          "mean_relative_response": 0.013,
-          "outputs": [
-            {
-              "output": "peak_acceleration_m_s2",
-              "sensitivity_up": 0.0366,
-              "sensitivity_down": 0.0312
-            },
-            {
-              "output": "peak_force_n",
-              "sensitivity_up": 0.0366,
-              "sensitivity_down": 0.0312
+              "sensitivity_up": 0.0231,
+              "sensitivity_down": -0.0231
             },
             {
               "output": "impact_speed_m_s",
-              "sensitivity_up": 0.0045,
-              "sensitivity_down": 0.0415
+              "sensitivity_up": 0.0231,
+              "sensitivity_down": -0.0231
             },
             {
               "output": "peak_stress_pa",
-              "sensitivity_up": 0.0,
-              "sensitivity_down": -0.0
-            },
-            {
-              "output": "max_displacement_m",
               "sensitivity_up": 0.0,
               "sensitivity_down": -0.0
             }
@@ -927,10 +874,15 @@
           "note": "no sensitive output measured: the parameter does not affect the shell chain outputs as configured (reported zero, not omitted)"
         },
         {
-          "parameter": "friction",
+          "parameter": "inertia",
           "perturbation_fraction": 0.1,
           "mean_relative_response": 0.0,
           "outputs": [
+            {
+              "output": "settle_s",
+              "sensitivity_up": 0.4563,
+              "sensitivity_down": 0.6151
+            },
             {
               "output": "peak_acceleration_m_s2",
               "sensitivity_up": 0.0,
@@ -950,9 +902,70 @@
               "output": "max_displacement_m",
               "sensitivity_up": 0.0,
               "sensitivity_down": -0.0
+            }
+          ],
+          "note": "no sensitive output measured: the parameter does not affect the shell chain outputs as configured (reported zero, not omitted)"
+        },
+        {
+          "parameter": "restitution",
+          "perturbation_fraction": 0.1,
+          "mean_relative_response": 0.0,
+          "outputs": [
+            {
+              "output": "settle_s",
+              "sensitivity_up": 0.129,
+              "sensitivity_down": 0.5357
             },
             {
-              "output": "safety_factor",
+              "output": "peak_acceleration_m_s2",
+              "sensitivity_up": 0.0,
+              "sensitivity_down": -0.0
+            },
+            {
+              "output": "peak_force_n",
+              "sensitivity_up": 0.0,
+              "sensitivity_down": -0.0
+            },
+            {
+              "output": "peak_stress_pa",
+              "sensitivity_up": 0.0,
+              "sensitivity_down": -0.0
+            },
+            {
+              "output": "max_displacement_m",
+              "sensitivity_up": 0.0,
+              "sensitivity_down": -0.0
+            }
+          ],
+          "note": "no sensitive output measured: the parameter does not affect the shell chain outputs as configured (reported zero, not omitted)"
+        },
+        {
+          "parameter": "friction",
+          "perturbation_fraction": 0.1,
+          "mean_relative_response": 0.0,
+          "outputs": [
+            {
+              "output": "settle_s",
+              "sensitivity_up": -0.2083,
+              "sensitivity_down": -0.2877
+            },
+            {
+              "output": "peak_acceleration_m_s2",
+              "sensitivity_up": 0.0,
+              "sensitivity_down": -0.0
+            },
+            {
+              "output": "peak_force_n",
+              "sensitivity_up": 0.0,
+              "sensitivity_down": -0.0
+            },
+            {
+              "output": "peak_stress_pa",
+              "sensitivity_up": 0.0,
+              "sensitivity_down": -0.0
+            },
+            {
+              "output": "max_displacement_m",
               "sensitivity_up": 0.0,
               "sensitivity_down": -0.0
             }
@@ -961,13 +974,13 @@
         }
       ],
       "top_parameters": [
-        "timestep",
         "thickness",
         "youngs_modulus",
-        "strength",
-        "mass"
+        "mass",
+        "contact_stiffness",
+        "strength"
       ],
-      "note": "sensitivity = relative output change per unit relative input change at +10% perturbation (end-to-end pipeline re-run; structural parameters re-solve the pinned closed-form case). It identifies WHAT NEEDS MEASUREMENT, not a parameter ranking for tuning."
+      "note": "sensitivity = relative output change per unit relative input change at +10% perturbation (end-to-end pipeline re-run; structural parameters re-solve the pinned closed-form case). It identifies WHAT NEEDS MEASUREMENT, not a parameter ranking for tuning. settle_s is reported per-output but EXCLUDED from the ranking: for rocking contacts the settle time is chaotically sensitive (sub-1e-6 relative input changes flip the settle branch), so its sensitivity values are not robust engineering measures."
     },
     "model_status": "unvalidated",
     "physical_validation": {

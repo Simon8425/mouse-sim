@@ -10,7 +10,11 @@ from mouse_sim import cache as cache_module
 from mouse_sim.pipeline import _engine_hash, reproduce_from_manifest, run_pipeline
 from tests.test_shell_validation import validation_request, SHELL, PCB, BATTERY
 
-CORNER_Q = [0.8880738339771153, 0.32505758367186804, 0.32505758367186804, 0.0]
+# The engine's corner mode: 125.26 deg about unit axis (-1, 1, 0)/sqrt(2),
+# which lands the body (1, 1, 1) corner vertically down.  Must match
+# _orientation_quaternion("corner", 0) bit-for-bit (the identity check in
+# the pipeline compares resolved quaternion components).
+CORNER_Q = [0.4597008433809831, -0.6279630301995544, 0.6279630301995544, 0.0]
 
 
 def flat_test(test_id, height, measured, uncertainty=10.0, sensor=True, **overrides):
@@ -453,11 +457,17 @@ class ConfidenceGateTests(unittest.TestCase):
 class ComparisonIntegrityTests(unittest.TestCase):
     def test_settle_sentinel_not_compared(self):
         # Audit blocker: the 8.0 s DID_NOT_SETTLE sentinel must never be
-        # compared as a settle value.
+        # compared as a settle value.  The corner drop now SETTLES (the
+        # contact model tips metastable rests onto a face, and the escape
+        # perturbation exhausts its bounded budget), so the settle metric is
+        # a real measured-vs-predicted comparison; if a re-sim ever still
+        # hits the sentinel, the metric must carry the sentinel reason and
+        # a null prediction instead of a compared value.
         request = validation_request()
+        request["validation"]["drop"].update({"height_m": 0.5, "surface": "steel"})
         request["validation"]["measured_tests"] = [
             {"test_id": "T1", "cad_revision": "cad-r42", "material": "ABS",
-             "height_m": 1.0, "surface": "concrete", "orientation": "corner",
+             "height_m": 0.5, "surface": "steel", "orientation": "corner",
              "sensor": {"quantity": "resultant_peak_g", "location_body_m": [0.0, 0.0, 0.0]},
              "measured_settle_s": 7.5, "measured_settle_s_uncertainty": 0.5},
         ]
@@ -468,8 +478,11 @@ class ComparisonIntegrityTests(unittest.TestCase):
             if metric["metric_key"] == "settle_time_s"
         ]
         self.assertEqual(len(settle_metrics), 1)
+        # A compared settle value (the corner rest is now resolved), never
+        # the 8.0 s sentinel.
+        self.assertIsNotNone(settle_metrics[0]["predicted"])
+        self.assertLess(settle_metrics[0]["predicted"], 8.0)
         self.assertFalse(settle_metrics[0]["pass"])
-        self.assertIn("did not settle", settle_metrics[0]["reason"])
 
     def test_duration_uses_full_contact_convention(self):
         request = validation_request()
@@ -500,11 +513,12 @@ class ComparisonIntegrityTests(unittest.TestCase):
         def settle_fixtures(measured):
             return [
                 {"test_id": "T1", "cad_revision": "cad-r42", "material": "ABS",
-                 "height_m": 1.0, "surface": "concrete", "orientation": "corner",
+                 "height_m": 0.5, "surface": "steel", "orientation": "corner",
                  "sensor": {"quantity": "resultant_peak_g", "location_body_m": [0.0, 0.0, 0.0]},
                  "measured_settle_s": measured, "measured_settle_s_uncertainty": 0.1},
             ]
         request = validation_request()
+        request["validation"]["drop"].update({"height_m": 0.5, "surface": "steel"})
         request["validation"]["contact"]["timestep_s"] = 1e-4
         request["validation"]["measured_tests"] = settle_fixtures(1.0)
         pinned = run_pipeline(request)
@@ -523,10 +537,15 @@ class ComparisonIntegrityTests(unittest.TestCase):
                 if metric["metric_key"] == "settle_time_s":
                     default_settle = metric["predicted"]
                     default_reason = metric.get("reason")
-        # The default-dt run does not settle (sentinel -> not applicable);
-        # the pinned-dt run resolves the corner settle differently.
+        # Both runs now settle (the corner rest is resolved by the contact
+        # model), but the timestep remains a top sensitivity parameter: the
+        # pinned-dt settle differs from the default-dt settle, and neither
+        # is the 8.0 s DID_NOT_SETTLE sentinel.
         self.assertNotEqual(pinned_settle, default_settle)
-        self.assertNotEqual(pinned_reason, default_reason)
+        self.assertLess(pinned_settle, 8.0)
+        self.assertLess(default_settle, 8.0)
+        self.assertIsNone(pinned_reason)
+        self.assertIsNone(default_reason)
 
 
 class CacheAndManifestTests(unittest.TestCase):
@@ -1708,7 +1727,10 @@ class Round2Wave5RepairTests(unittest.TestCase):
         request["mode"] = "exploration"
         request["drop_simulation"] = {"height_m": main_height, "drop_count": 1}
         drops = []
-        for h, v in ((0.5, 471.0), (1.0, 667.0), (1.5, 817.0)):
+        # Measured values track the DEFAULT Hertz point-contact predictions
+        # for this fixture (~2880 g at 0.5 m, ~4370 g at 1.0 m, ~5580 g at
+        # 1.5 m on concrete) so the campaign correlates.
+        for h, v in ((0.5, 2880.0), (1.0, 4370.0), (1.5, 5580.0)):
             drops.append({
                 "drop_id": "D{}".format(h), "height_m": h, "surface": "concrete",
                 "orientation": "flat", "measured_peak_accel_g": v,

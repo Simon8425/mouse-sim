@@ -10,7 +10,9 @@ import type { CameraPreset } from './camera';
 import type { QualityTier } from './materialPalette';
 import type { OverlaySpec } from './overlays';
 import type { ObjectSceneEntry } from './geometryFactory';
-import type { DropSimulationDrop, DropSimulationResult } from '../api/contracts';
+import type { DropSimulationDrop, DropSimulationResult, FeaResult, RenderMode } from '../api/contracts';
+import { FeaHud } from '../components/FeaHud';
+import { DropPhysicsDebug } from '../components/DropPhysicsDebug';
 
 /**
  * Resolve the drop active at a playback time.
@@ -46,10 +48,13 @@ export interface SceneViewportProps {
   quality: QualityTier;
   overlays: OverlaySpec | null;
   dropSimulation?: DropSimulationResult | null;
+  renderMode?: RenderMode;
+  feaResult?: FeaResult | null;
   onPick: (id: string | null) => void;
   onDoublePick?: (id: string | null) => void;
   onStats?: (stats: RenderStats) => void;
   onDropEnded?: () => void;
+  onPlaybackStateChange?: (playing: boolean) => void;
   onWebGLUnsupported?: (reason: string) => void;
 }
 
@@ -292,6 +297,10 @@ export const SceneViewport = React.forwardRef<
   // a setState call per tick) alive for the whole lifetime of a displayed
   // drop result.
   React.useEffect(() => {
+    props.onPlaybackStateChange?.(dropPlaying);
+  }, [dropPlaying, props]);
+
+  React.useEffect(() => {
     if (!props.dropSimulation || !dropPlaying) return;
     const interval = window.setInterval(() => {
       setDropTime(runtimeRef.current?.getDropTime() ?? 0);
@@ -338,6 +347,14 @@ export const SceneViewport = React.forwardRef<
     runtimeRef.current?.setOverlays(props.overlays);
   }, [props.overlays]);
 
+  React.useEffect(() => {
+    runtimeRef.current?.setRenderMode(props.renderMode ?? 'default');
+  }, [props.renderMode]);
+
+  React.useEffect(() => {
+    runtimeRef.current?.setFeaResult(props.feaResult ?? null);
+  }, [props.feaResult]);
+
   React.useImperativeHandle(
     ref,
     () => ({
@@ -361,6 +378,8 @@ export const SceneViewport = React.forwardRef<
       aria-label="3D engineering viewport"
     >
       <canvas ref={canvasRef} aria-hidden="true" />
+      <FeaHud mode={props.renderMode ?? 'default'} fea={props.feaResult ?? null} />
+      <DropPhysicsDebug simulation={props.dropSimulation ?? null} dropTime={dropTime} />
       {dropSimulation ? (
         <div className="drop-sim-controls" role="group" aria-label="Drop simulation playback">
           <DropPlaybackButtons
@@ -372,10 +391,10 @@ export const SceneViewport = React.forwardRef<
             {activeDrop ? `Drop ${activeDrop.index + 1}/${dropSimulation.drops.length}` : 'Simulation'}
             {' · '}
             {dropTime.toFixed(2)}s
-            {dropSimulation.peak ? (
+            {activeDrop ? (
               <>
-                {' · peak '}
-                {dropSimulation.peak.impact_speed_m_s.toFixed(2)} m/s
+                {' · '}
+                {activeDrop.peak_impact_speed_m_s.toFixed(2)} m/s
               </>
             ) : null}
           </span>
