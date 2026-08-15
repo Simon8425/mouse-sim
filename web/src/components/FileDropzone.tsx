@@ -259,9 +259,6 @@ export function FileDropzone({ onClose, variant = 'modal' }: FileDropzoneProps):
             <div className="import-progress-minimal__track" aria-hidden="true">
               <span />
             </div>
-            <div className="import-progress-minimal__status">
-              <span>Preparing preview...</span>
-            </div>
           </div>
         </div>
       ) : !selectedFile ? (

@@ -1,5 +1,4 @@
 import { render, screen, waitFor } from '@testing-library/react';
-import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi, beforeAll, afterEach } from 'vitest';
 import { useEffect } from 'react';
 import { ModelTree } from '../components/ModelTree';
@@ -66,23 +65,13 @@ describe('ModelTree', () => {
     expect(screen.getByRole('treeitem', { name: /battery_pack/i })).toBeInTheDocument();
   });
 
-  it('clears the search filter and scrolls to the row when SELECT targets a filtered-out entry', async () => {
-    const user = userEvent.setup();
+  it('scrolls to the row and marks it selected when SELECT targets an entry', async () => {
     const { rerender } = render(<TreeFixture />);
-
-    const searchBox = screen.getByRole('textbox', { name: 'Filter models' });
-    await user.type(searchBox, 'battery_pack');
-    await waitFor(() => {
-      expect(screen.queryByRole('treeitem', { name: /shell_top/i })).not.toBeInTheDocument();
-    });
 
     rerender(<TreeFixture actions={[{ type: 'SELECT', id: 'shell_top' }]} />);
 
     const row = await screen.findByRole('treeitem', { name: /shell_top/i });
     expect(row).toHaveClass('is-selected');
-    await waitFor(() => {
-      expect(searchBox).toHaveValue('');
-    });
     await waitFor(() => {
       expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' });
     });

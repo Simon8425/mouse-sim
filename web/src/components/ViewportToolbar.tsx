@@ -1,9 +1,9 @@
 import * as React from 'react';
 import { useProjectStore } from '../state/projectStore';
-import type { CameraPreset } from '../scene/camera';
 import type { RenderStats } from '../scene/sceneRuntime';
 import type { SceneViewportHandle } from '../scene/SceneViewport';
 import type { RenderMode } from '../api/contracts';
+import { PhysicsLogDebugger } from './PhysicsLogDebugger';
 
 export interface ViewportToolbarProps {
   viewport: React.RefObject<SceneViewportHandle | null>;
@@ -18,17 +18,17 @@ export function ViewportToolbar({ viewport, stats }: ViewportToolbarProps) {
   const { state, dispatch } = useProjectStore();
   const [openDropdown, setOpenDropdown] = React.useState<'legend' | 'stats' | null>(null);
 
-  const presetButtons: Array<{ label: string; title: string; preset: CameraPreset | 'fit' }> = [
-    { label: 'Fit', title: 'Fit view', preset: 'fit' },
-  ];
-
   // The FEA preview is a NORMAL-MODE feature: during an active test only
   // Leave Test and the playback card are shown. Once the test is left the
   // results stay visible (LEAVE_TEST resets renderMode so the model returns
   // to normal materials) and this switch lets the user enable the heatmap /
   // yield shader for inspection.
   const testModeActive =
-    !state.playbackDismissed && state.lastResult?.drop_simulation != null && !state.stale;
+    !state.playbackDismissed &&
+    (state.lastResult?.drop_simulation != null ||
+      state.lastResult?.population != null ||
+      state.draft?.population != null) &&
+    !state.stale;
   const feaAvailable = state.lastResult?.fea?.computed === true && !state.stale;
   const showFeaSwitch = feaAvailable && !testModeActive;
 
@@ -39,45 +39,25 @@ export function ViewportToolbar({ viewport, stats }: ViewportToolbarProps) {
 
   return (
     <div className="viewport-toolbar" role="toolbar" aria-label="Viewport controls">
-      <div className="viewport-toolbar__group" role="group" aria-label="Camera preset">
-        {presetButtons.map(({ label, title, preset }) => (
+      {!testModeActive ? (
+        <div className="viewport-toolbar__group" role="group" aria-label="Exploded view">
           <button
-            key={preset}
             type="button"
             className="btn"
-            aria-label={title}
-            title={title}
-            onClick={() => {
-              if (preset === 'fit') {
-                viewport.current?.fit();
-              } else {
-                viewport.current?.preset(preset);
-              }
-            }}
+            aria-pressed={state.explode > 0}
+            title="Display-only offsets; never included in analysis"
+            onClick={() =>
+              dispatch({ type: 'SET_EXPLODE', factor: state.explode > 0 ? 0 : 1 })
+            }
           >
-            {label}
+            Exploded
           </button>
-        ))}
-      </div>
-
-      <div className="viewport-toolbar__divider" aria-hidden="true" />
-      <div className="viewport-toolbar__group" role="group" aria-label="Exploded view">
-        <button
-          type="button"
-          className="btn"
-          aria-pressed={state.explode > 0}
-          title="Display-only offsets; never included in analysis"
-          onClick={() =>
-            dispatch({ type: 'SET_EXPLODE', factor: state.explode > 0 ? 0 : 1 })
-          }
-        >
-          Exploded
-        </button>
-      </div>
+        </div>
+      ) : null}
 
       {showFeaSwitch ? (
         <>
-          <div className="viewport-toolbar__divider" aria-hidden="true" />
+          {!testModeActive ? <div className="viewport-toolbar__divider" aria-hidden="true" /> : null}
           <div className="viewport-toolbar__group" role="group" aria-label="Render mode">
             {renderModeButtons.map(({ mode, label }) => {
               const active = state.renderMode === mode;
@@ -103,6 +83,23 @@ export function ViewportToolbar({ viewport, stats }: ViewportToolbarProps) {
           </div>
         </>
       ) : null}
+
+      <div className="viewport-toolbar__divider" aria-hidden="true" />
+
+      <div className={`viewport-toolbar__log${state.debuggerOpen ? ' is-open' : ''}`} role="group" aria-label="Telemetry debugger">
+        <button
+          type="button"
+          className="btn"
+          aria-pressed={state.debuggerOpen}
+          title="Open the physics & telemetry log"
+          onClick={() => dispatch({ type: 'SET_DEBUGGER_OPEN', open: !state.debuggerOpen })}
+        >
+          Log
+        </button>
+        {state.debuggerOpen ? (
+          <PhysicsLogDebugger viewportRef={viewport} />
+        ) : null}
+      </div>
 
       <div className="viewport-toolbar__divider" aria-hidden="true" />
 

@@ -507,6 +507,57 @@ export function worldVerticesForGeometry(geometry: GeometryJson): Vec3[] {
   return collected;
 }
 
+/**
+ * ALL world-frame vertices of a geometry (no stride sampling), for building
+ * physics colliders (e.g. Rapier's convexHull).  The display-stride version
+ * (worldVerticesForGeometry) caps at ~250 points per mesh which is fine for
+ * rendering bounds but too coarse for a contact hull.
+ */
+export function worldVerticesForGeometryFull(geometry: GeometryJson): Vec3[] {
+  const collected: Vec3[] = [];
+  collectWorldVerticesFull(geometry, new THREE.Matrix4(), collected);
+  return collected;
+}
+
+function collectWorldVerticesFull(geometry: unknown, parent: THREE.Matrix4, out: Vec3[]): void {
+  if (!isSafeGeometry(geometry)) return;
+  if (geometry.type === 'compound') {
+    if (!hasSafeTransform(geometry.transform)) return;
+    const matrix = new THREE.Matrix4().multiplyMatrices(parent, pythonTransformToMatrix4(geometry.transform));
+    if (!matrix.elements.every(isFiniteNumber)) return;
+    for (const child of geometry.children) {
+      collectWorldVerticesFull(child, matrix, out);
+    }
+    return;
+  }
+  const matrix = new THREE.Matrix4().multiplyMatrices(parent, pythonTransformToMatrix4(geometry.transform));
+  if (!matrix.elements.every(isFiniteNumber)) return;
+  if (geometry.type === 'mesh') {
+    const vertices = geometry.vertices as Vec3[];
+    if (vertices.length === 0) return;
+    const point = new THREE.Vector3();
+    for (const vertex of vertices) {
+      point.set(vertex[0], vertex[1], vertex[2]).applyMatrix4(matrix);
+      if (isFiniteNumber(point.x) && isFiniteNumber(point.y) && isFiniteNumber(point.z)) {
+        out.push([point.x, point.y, point.z]);
+      }
+    }
+    return;
+  }
+  // Primitives: same 8-corner AABB conservative proxy as the strided version.
+  const local = localBoundsOf(geometry);
+  if (!local) return;
+  for (let i = 0; i < 8; i += 1) {
+    const x = i & 1 ? local.max[0] : local.min[0];
+    const y = i & 2 ? local.max[1] : local.min[1];
+    const z = i & 4 ? local.max[2] : local.min[2];
+    const p = new THREE.Vector3(x, y, z).applyMatrix4(matrix);
+    if (isFiniteNumber(p.x) && isFiniteNumber(p.y) && isFiniteNumber(p.z)) {
+      out.push([p.x, p.y, p.z]);
+    }
+  }
+}
+
 function collectWorldVertices(geometry: unknown, parent: THREE.Matrix4, out: Vec3[]): void {
   if (!isSafeGeometry(geometry)) return;
   if (geometry.type === 'compound') {

@@ -331,7 +331,7 @@ describe('ResultsRail', () => {
   it('renders the header with the test name when a drop simulation ran', () => {
     renderRail(dropTestResult());
 
-    expect(screen.getByText('Drop Test')).toBeInTheDocument();
+    expect(screen.getByText('Results of Drop Test')).toBeInTheDocument();
   });
 
   it('renders the collapsed strip and the expand/collapse toggle', () => {

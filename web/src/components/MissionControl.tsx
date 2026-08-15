@@ -4,6 +4,7 @@ import {
   DROP_TESTS,
   DROP_SURFACES,
   DROP_ORIENTATIONS,
+  PAUSE_BETWEEN_DROPS_OPTIONS,
   persistedConfigForTest,
   persistConfigForTest,
   clampDropConfig,
@@ -13,6 +14,19 @@ import { selectObjectEntries } from '../state/selectors';
 import { SHELL_FLEX_LOAD_CASE, shellDims } from './RunControls';
 import type { DropTestKind, DropSurface, DropOrientation } from '../api/contracts';
 
+const AI_MODELS = [
+  {
+    id: 'qwen3.5-4b',
+    label: 'Local (qwen3.5-4b @ 127.0.0.1:1234)',
+    provider: 'Local',
+    endpoint: 'http://127.0.0.1:1234',
+    apiKey: '',
+  },
+  { id: 'openai/gpt-5.6-luna-pro', label: 'gpt 5.6 luna', provider: 'OpenAI', endpoint: '', apiKey: '' },
+  { id: 'google/gemini-3.7-flash', label: 'google/gemini-3.7-flash', provider: 'Google', endpoint: '', apiKey: '' },
+  { id: 'x-ai/grok-4.6', label: 'x-ai/grok-4.6', provider: 'xAI', endpoint: '', apiKey: '' },
+];
+
 export interface MissionControlProps {
   onClose: () => void;
 }
@@ -21,21 +35,24 @@ export function MissionControl({ onClose }: MissionControlProps): React.ReactEle
   const { state, dispatch } = useProjectStore();
   const panelRef = React.useRef<HTMLDivElement | null>(null);
 
+  const [customModelMode, setCustomModelMode] = React.useState(false);
+
   const [selectedTestId, setSelectedTestId] = React.useState<DropTestDefinition['id']>('drop-test');
   const selectedTest = DROP_TESTS.find((t) => t.id === selectedTestId) ?? DROP_TESTS[0];
   const [testConfig, setTestConfig] = React.useState(() => persistedConfigForTest(selectedTest));
 
-  React.useEffect(() => {
-    setTestConfig(persistedConfigForTest(selectedTest));
-  }, [selectedTestId, selectedTest]);
-
-  const updateConfig = (overrides: Partial<typeof testConfig>) => {
-    const next = clampDropConfig({ ...testConfig, ...overrides });
-    setTestConfig(next);
-    persistConfigForTest(selectedTest, next);
+  const updateConfig = (next: Partial<typeof testConfig>) => {
+    const merged = clampDropConfig({ ...testConfig, ...next });
+    persistConfigForTest(selectedTest, merged);
+    setTestConfig(merged);
   };
 
   const runSimulation = () => {
+    if (selectedTest.test === 'population' || selectedTest.id === 'population-test') {
+      dispatch({ type: 'RUN_POPULATION' });
+      onClose();
+      return;
+    }
     const entries = selectObjectEntries(state);
     const dims = shellDims(entries);
     dispatch({
@@ -148,6 +165,108 @@ export function MissionControl({ onClose }: MissionControlProps): React.ReactEle
                   Switch middle 3D viewport canvas between Dark Studio and Pure White background.
                 </p>
               </div>
+
+              <div className="mc-group" style={{ marginTop: '8px' }}>
+                <label className="mc-label" htmlFor="mc-ai-model">
+                  AI Vision Model
+                </label>
+                <select
+                  id="mc-ai-model"
+                  className="settings-default-material"
+                  value={
+                    customModelMode ||
+                    !AI_MODELS.some(
+                      (m) =>
+                        m.id === (state.aiConfig?.model || '') &&
+                        (m.endpoint || '') === (state.aiConfig?.endpoint || '')
+                    )
+                      ? 'custom'
+                      : (state.aiConfig?.model || 'openai/gpt-5.6-luna-pro')
+                  }
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    if (val === 'custom') {
+                      setCustomModelMode(true);
+                    } else {
+                      setCustomModelMode(false);
+                      const modelObj = AI_MODELS.find((m) => m.id === val);
+                      dispatch({
+                        type: 'SET_AI_CONFIG',
+                        config: {
+                          model: val,
+                          provider: modelObj?.provider || 'OpenAI',
+                          endpoint: modelObj?.endpoint || '',
+                          apiKey: modelObj?.apiKey ?? state.aiConfig?.apiKey ?? '',
+                        },
+                      });
+                    }
+                  }}
+                >
+                  <option value="openai/gpt-5.6-luna-pro">gpt 5.6 luna</option>
+                  <option value="google/gemini-3.7-flash">google/gemini-3.7-flash</option>
+                  <option value="x-ai/grok-4.6">x-ai/grok-4.6</option>
+                  <option value="qwen3.5-4b">Local (qwen3.5-4b @ 127.0.0.1:1234)</option>
+                  <option value="custom">Custom Model / Local Endpoint…</option>
+                </select>
+                {customModelMode ? (
+                  <div style={{ marginTop: '6px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                    <input
+                      id="mc-ai-custom-model"
+                      type="text"
+                      className="settings-default-material"
+                      placeholder="Model ID (e.g. qwopus3.5-9b-coder)"
+                      value={state.aiConfig?.model || ''}
+                      onChange={(e) =>
+                        dispatch({
+                          type: 'SET_AI_CONFIG',
+                          config: { model: e.target.value, provider: 'Custom' },
+                        })
+                      }
+                    />
+                    <input
+                      id="mc-ai-endpoint"
+                      type="text"
+                      className="settings-default-material"
+                      placeholder="Base URL / Endpoint (e.g. http://192.168.1.29:1238)"
+                      value={state.aiConfig?.endpoint || ''}
+                      onChange={(e) =>
+                        dispatch({
+                          type: 'SET_AI_CONFIG',
+                          config: { endpoint: e.target.value },
+                        })
+                      }
+                    />
+                  </div>
+                ) : null}
+                <p className="mc-subtext muted">
+                  Vision or local LLM used for automated mouse component recognition.
+                </p>
+              </div>
+
+              <div className="mc-group" style={{ marginTop: '8px' }}>
+                <label className="mc-label" htmlFor="mc-ai-key">
+                  API Key {state.aiConfig?.endpoint ? '(Optional for local)' : ''}
+                </label>
+                <input
+                  id="mc-ai-key"
+                  type="password"
+                  className="settings-default-material"
+                  placeholder={
+                    state.aiConfig?.endpoint
+                      ? 'Not needed for local network'
+                      : 'sk-or-v1-... (optional, overrides server key)'
+                  }
+                  value={state.aiConfig?.apiKey || ''}
+                  onChange={(e) =>
+                    dispatch({ type: 'SET_AI_CONFIG', config: { apiKey: e.target.value } })
+                  }
+                />
+                <p className="mc-subtext muted">
+                  {state.aiConfig?.endpoint
+                    ? 'Local models on your private network do not require an API key.'
+                    : 'Stored locally in your browser. Configures vision LLM classification.'}
+                </p>
+              </div>
             </>
           ) : (
             /* SIMULATION MODE: DROP SIMULATION SETTINGS */
@@ -223,24 +342,44 @@ export function MissionControl({ onClose }: MissionControlProps): React.ReactEle
                     onChange={(e) => updateConfig({ drop_count: parseInt(e.target.value, 10) || 1 })}
                   />
                 </div>
+                <div className="mc-group" style={{ gridColumn: 'span 2' }}>
+                  <label className="mc-label">Pause between drops</label>
+                  <select
+                    className="settings-default-material"
+                    value={testConfig.pause_between_drops_s ?? 1.0}
+                    onChange={(e) => updateConfig({ pause_between_drops_s: parseFloat(e.target.value) || 1.0 })}
+                  >
+                    {PAUSE_BETWEEN_DROPS_OPTIONS.map((p) => (
+                      <option key={p.value} value={p.value}>
+                        {p.label}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="mc-subtext muted">Stable dwell duration after mouse stops moving before next drop releases.</p>
+                </div>
               </div>
-              <div className="mc-actions-row" style={{ marginTop: '10px' }}>
+              <div className="mc-actions-row">
                 <button
                   type="button"
-                  className="btn btn--primary"
+                  className="btn"
                   aria-label={`Start ${selectedTest.title}`}
                   onClick={runSimulation}
                   disabled={!hasGeometry || isRunning}
-                  style={{
-                    width: '100%',
-                    justifyContent: 'center',
-                    padding: '6px 12px',
-                    fontSize: '11px',
-                    fontWeight: 500,
-                    borderRadius: '4px',
-                  }}
                 >
                   {isRunning ? 'Loading test…' : `Start ${selectedTest.title}`}
+                </button>
+                <button
+                  type="button"
+                  className="btn"
+                  aria-label="Run Population analysis (10k units)"
+                  title="Run 10,000-unit Monte Carlo population drop simulation"
+                  disabled={!hasGeometry || isRunning}
+                  onClick={() => {
+                    dispatch({ type: 'RUN_POPULATION' });
+                    onClose();
+                  }}
+                >
+                  Run Population Analysis (10k units)
                 </button>
               </div>
             </>

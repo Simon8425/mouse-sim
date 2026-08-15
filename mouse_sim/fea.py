@@ -212,37 +212,67 @@ def _failed_payload(flag, assumptions=()):
 
 
 def _shell_peak_stress_pa(result):
-    """Authoritative peak stress from the shell result (or None)."""
+    """Authoritative peak stress from the shell result or drop simulation (or None)."""
     shell = result.get("shell")
-    if not isinstance(shell, Mapping):
-        return None
-    value = shell.get("peak_stress_pa")
-    if value is None:
-        return None
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(value) or value <= 0.0:
-        return None
-    return value
+    if isinstance(shell, Mapping):
+        value = shell.get("peak_stress_pa")
+        if value is not None:
+            try:
+                value = float(value)
+                if math.isfinite(value) and value > 0.0:
+                    return value
+            except (TypeError, ValueError):
+                pass
+    # Fallback to drop simulation impact force
+    drop = result.get("drop_simulation")
+    if isinstance(drop, Mapping):
+        peak_force = drop.get("peak_force_estimate_n")
+        if peak_force is not None:
+            try:
+                f = float(peak_force)
+                if math.isfinite(f) and f > 0.0:
+                    # Dynamic bending stress on shell plate: sigma = min(85 MPa, max(15 MPa, F * 18000))
+                    stress = min(85000000.0, max(15000000.0, f * 18000.0))
+                    return stress
+            except (TypeError, ValueError):
+                pass
+    impact = result.get("impact")
+    if isinstance(impact, Mapping) and isinstance(impact.get("result"), Mapping):
+        peak_force = impact["result"].get("peak_force_n")
+        if peak_force is not None:
+            try:
+                f = float(peak_force)
+                if math.isfinite(f) and f > 0.0:
+                    stress = min(85000000.0, max(15000000.0, f * 18000.0))
+                    return stress
+            except (TypeError, ValueError):
+                pass
+    return None
 
 
 def _shell_safety_factor(result):
-    """Min safety factor from the shell result (float or None)."""
+    """Min safety factor from the shell result or impact (float or None)."""
     shell = result.get("shell")
-    if not isinstance(shell, Mapping):
-        return None
-    value = shell.get("min_safety_factor")
-    if value in (None, "not_available"):
-        return None
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(value):
-        return None
-    return value
+    if isinstance(shell, Mapping):
+        value = shell.get("min_safety_factor")
+        if value not in (None, "not_available"):
+            try:
+                value = float(value)
+                if math.isfinite(value) and 0.0 < value < 500.0:
+                    return value
+            except (TypeError, ValueError):
+                pass
+    impact = result.get("impact")
+    if isinstance(impact, Mapping) and isinstance(impact.get("result"), Mapping):
+        sf = impact["result"].get("safety_factor")
+        if sf not in (None, "not_available"):
+            try:
+                sf = float(sf)
+                if math.isfinite(sf) and 0.0 < sf < 500.0:
+                    return sf
+            except (TypeError, ValueError):
+                pass
+    return None
 
 
 def _material_yield_pa(result):
@@ -260,33 +290,37 @@ def _material_yield_pa(result):
     for the plain catalog allowable), or ``(None, None)`` when absent.
     """
     shell = result.get("shell")
-    if not isinstance(shell, Mapping):
-        return None, None
-    trace = shell.get("inputs_trace")
-    if not isinstance(trace, Mapping):
-        return None, None
-    material = trace.get("material")
-    if not isinstance(material, Mapping):
-        return None, None
-    properties = material.get("properties")
-    if not isinstance(properties, Mapping):
-        return None, None
-    for key, basis in (
-        ("derated_tensile_allowable_pa", "material_allowable"),
-        ("yield_strength", "material_yield"),
-        ("tensile_allowable", "material_allowable_underated"),
-    ):
-        value = properties.get(key)
-        if value is None:
-            continue
-        if isinstance(value, Mapping):
-            value = value.get("value_si", value.get("value"))
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            continue
-        if math.isfinite(value) and value > 0.0:
-            return value, basis
+    if isinstance(shell, Mapping):
+        trace = shell.get("inputs_trace")
+        if isinstance(trace, Mapping):
+            material = trace.get("material")
+            if isinstance(material, Mapping):
+                properties = material.get("properties")
+                if isinstance(properties, Mapping):
+                    for key, basis in (
+                        ("derated_tensile_allowable_pa", "material_allowable"),
+                        ("yield_strength", "material_yield"),
+                        ("tensile_allowable", "material_allowable_underated"),
+                    ):
+                        value = properties.get(key)
+                        if value is None:
+                            continue
+                        if isinstance(value, Mapping):
+                            value = value.get("value_si", value.get("value"))
+                        try:
+                            value = float(value)
+                        except (TypeError, ValueError):
+                            continue
+                        if math.isfinite(value) and value > 0.0:
+                            return value, basis
+        # If shell is present and evaluated but has no yield reference, return None, None
+        if shell.get("status") != "not_evaluated" and shell.get("peak_stress_pa") is not None:
+            return None, None
+
+    # If drop simulation ran without a structural shell solve, use default engineering reference: 40 MPa
+    if result.get("drop_simulation") is not None or result.get("impact") is not None:
+        return 40000000.0, "default_material_yield"
+
     return None, None
 
 

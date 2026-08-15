@@ -1,3 +1,4 @@
+process.env.NODE_ENV = 'test';
 import '@testing-library/jest-dom';
 
 // Global mocks for canvas / WebGL / ResizeObserver if needed in jsdom

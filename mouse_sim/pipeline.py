@@ -21,6 +21,7 @@ from mouse_sim import (
     classify_objects,
     sha256_bytes,
 )
+from mouse_sim.classification import canonical_component_type
 from mouse_sim import importers
 from mouse_sim import impact
 from mouse_sim import materials
@@ -59,6 +60,7 @@ _ENGINE_BEHAVIOR_MODULES = (
     "units",
     "collision",
     "classification",
+    "ai_classify",
     "lifecycle",
     "components_elec",
     "components_mech",
@@ -1001,6 +1003,9 @@ def _run_component_and_population_sections(
                 population_settings = dict(population_config)
                 if not population_settings.get("components"):
                     population_settings["components"] = list(population_module.DEFAULT_COMPONENT_SPECS)
+                if "workers" not in population_settings:
+                    import os
+                    population_settings["workers"] = min(os.cpu_count() or 4, 8)
                 result["population"] = population_module.run_population(population_settings, context)
             except Exception as exc:
                 result["issues"].append(
@@ -1620,14 +1625,35 @@ def _material_catalog(request, result):
 # polymer, a PCB is FR4, a battery is LiPo, ...) instead of the generic
 # Default polymer density.  These are engineering estimates, not supplier
 # measurements; the mass section discloses them via mass_status/diagnostics.
+#
+# The table carries BOTH the canonical taxonomy keys
+# (classification.CANONICAL_COMPONENT_TYPES: top_shell, bottom_shell,
+# scroll_wheel, foot_pad, screw_boss, ...) and the legacy rule-classifier
+# keys (shell_top, shell_bottom, wheel, skate, screw, ...): the pipeline's
+# classification dict holds canonical names when a user-reviewed or AI-fused
+# classification is applied, and legacy names on the raw rule path.  A
+# missing key silently dropped the density override AND its disclosure, so
+# the two vocabularies must never diverge again.
 _CLASSIFICATION_DENSITY_KG_M3 = {
+    # Canonical taxonomy keys.
+    "top_shell": 1040.0,
+    "bottom_shell": 1040.0,
+    "main_button": 1040.0,
+    "side_button": 1040.0,
+    "scroll_wheel": 1410.0,
+    "encoder": 1410.0,
+    "pcb": 1850.0,
+    "sensor": 1850.0,
+    "foot_pad": 2200.0,
+    "battery": 2500.0,
+    "internal_structure": 1040.0,
+    "screw_boss": 7850.0,
+    # Legacy rule-classifier keys.
     "shell_top": 1040.0,
     "shell_bottom": 1040.0,
     "shell": 1040.0,
     "button": 1040.0,
     "wheel": 1410.0,
-    "pcb": 1850.0,
-    "battery": 2500.0,
     "skate": 2200.0,
     "screw": 7850.0,
 }
@@ -1666,9 +1692,13 @@ def _parse_objects(request, catalog, result, units):
     density_by_object = {}
     overrides = {}
     behaviors = {}
+    # User-reviewed AI classifications ride along on request objects
+    # (component_type + confidence); they win over heuristic and AI signals.
+    request_classifications = {}
+    request_names = {}
     if "objects" in request and not isinstance(request.get("objects"), (Mapping, list, tuple)):
         _pipeline_error(result, "INVALID_OBJECTS", "objects must be an object or array")
-        return geometry_objs, materials_by_object, density_by_object, overrides, behaviors
+        return geometry_objs, materials_by_object, density_by_object, overrides, behaviors, request_classifications, request_names
     # Default-material fallback: every object without a valid explicit
     # material is deterministically assigned the configured Default material
     # so the simulation never runs on undefined material properties.
@@ -1697,7 +1727,7 @@ def _parse_objects(request, catalog, result, units):
         entries = _object_entries(request)
     except (TypeError, ValueError) as exc:
         _pipeline_error(result, "INVALID_OBJECTS", str(exc))
-        return geometry_objs, materials_by_object, density_by_object, overrides, behaviors
+        return geometry_objs, materials_by_object, density_by_object, overrides, behaviors, request_classifications, request_names
     seen_ids = set()
     for raw_object_id, raw in entries:
         object_id = "" if raw_object_id is None else str(raw_object_id).strip()
@@ -1708,6 +1738,9 @@ def _parse_objects(request, catalog, result, units):
             _pipeline_error(result, "DUPLICATE_OBJECT_ID", "duplicate object id {!r}".format(object_id))
             continue
         seen_ids.add(object_id)
+        name_value = raw.get("name")
+        if isinstance(name_value, str) and name_value.strip():
+            request_names[object_id] = name_value
         geometry_data = raw.get("geometry", raw.get("shape"))
         geometry = None
         parse_message = None
@@ -1819,6 +1852,14 @@ def _parse_objects(request, catalog, result, units):
         behavior = raw.get("structural_behavior")
         if behavior is not None:
             behaviors[object_id] = behavior
+        raw_classification = raw.get("classification")
+        if isinstance(raw_classification, Mapping):
+            component_type = raw_classification.get("component_type")
+            if isinstance(component_type, str) and component_type.strip():
+                request_classifications[object_id] = {
+                    "component_type": canonical_component_type(component_type),
+                    "confidence": raw_classification.get("confidence", 0.95),
+                }
         result["geometry_summary"]["objects"].append(
             {
                 "object_id": object_id,
@@ -1842,7 +1883,7 @@ def _parse_objects(request, catalog, result, units):
                 ),
             )
         )
-    return geometry_objs, materials_by_object, density_by_object, overrides, behaviors
+    return geometry_objs, materials_by_object, density_by_object, overrides, behaviors, request_classifications, request_names
 
 
 def _first_material(catalog):
@@ -2641,17 +2682,60 @@ def _execute(request, mode, options, result):
     if raw_requirements is None and request.get("requirement") is not None:
         raw_requirements = [request["requirement"]]
     result["requirements"] = canonical_value(raw_requirements or [])
-    geometry_objs, materials_by_object, density_by_object, overrides, behaviors = _parse_objects(
+    geometry_objs, materials_by_object, density_by_object, overrides, behaviors, request_classifications, request_names = _parse_objects(
         request, catalog, result, units
     )
     result["materials"] = _material_evidence(catalog, materials_by_object, result)
 
     classification_result = classify_objects(geometry_objs)
+    # Merge AI + user signals per the consensus matrix: the deterministic rule
+    # classification is the baseline; a user-reviewed request wins; the
+    # OpenRouter vision result is fused when enabled (offline → heuristic).
+    from . import ai_classify
+
     classifications = {}
+    ai_inputs = []
     for object_id, item in classification_result.by_id().items():
         data = item.to_dict()
         data["structural_behavior"] = behaviors.get(object_id, "solid")
-        classifications[object_id] = data
+        if object_id in request_classifications:
+            classifications[object_id] = ai_classify.merge_classification(
+                object_id, data, None, request_classifications[object_id]
+            )
+            continue
+        geometry = geometry_objs.get(object_id)
+        geometry_dict = None
+        if geometry is not None:
+            try:
+                geometry_dict = geometry.to_dict()
+            except Exception:
+                geometry_dict = None
+        ai_inputs.append(
+            {
+                "object_id": object_id,
+                "name": request_names.get(object_id),
+                "geometry": geometry_dict,
+                "rule": data,
+            }
+        )
+    if ai_inputs and ai_classify.is_enabled():
+        ai_results = ai_classify.classify_parts(
+            ai_inputs, use_cache=True, cache=ai_classify.ClassificationCache()
+        )
+        for entry in ai_results:
+            classifications[entry["object_id"]] = entry
+    # Remaining parts (AI disabled or skipped) fall back to the rule result.
+    for entry in ai_inputs:
+        object_id = entry["object_id"]
+        if object_id not in classifications:
+            classifications[object_id] = entry["rule"]
+    # Merged dicts from ai_classify do not carry the request's structural
+    # behavior; re-apply it so validation (CLASSIFICATION_MISSING_BEHAVIOR)
+    # and density handling keep working unchanged.
+    for object_id, data in classifications.items():
+        if isinstance(data, dict) and "structural_behavior" not in data:
+            data["structural_behavior"] = behaviors.get(object_id, "solid")
+    result["classifications"] = classifications
 
     # Components without an explicit material are deterministically assigned
     # the Default material for mechanical properties, but their MASS uses a
@@ -3113,6 +3197,7 @@ def _execute(request, mode, options, result):
                 dt=timestep_s if timestep_s is not None else drop_module.DT_S,
                 mass_scale=mass_scale if mass_scale is not None else 1.0,
                 inertia_scale=inertia_scale if inertia_scale is not None else 1.0,
+                pause_between_drops_s=config["pause_between_drops_s"],
             )
             if lifecycle_section is not None:
                 from . import lifecycle as lifecycle_module

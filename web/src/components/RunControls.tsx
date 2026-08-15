@@ -70,7 +70,11 @@ export function RunControls({ onReplaceModel, uploadOpen }: RunControlsProps = {
     (!state.playbackDismissed && state.lastResult?.drop_simulation != null);
 
   const openConfigCard = () => {
-    dispatch({ type: 'SET_CONTROL_OPEN', open: true, mode: 'simulation' });
+    if (testId === 'population-test') {
+      dispatch({ type: 'RUN_POPULATION' });
+    } else {
+      dispatch({ type: 'SET_CONTROL_OPEN', open: true, mode: 'simulation' });
+    }
   };
 
   const leaveTest = () => {
@@ -98,7 +102,7 @@ export function RunControls({ onReplaceModel, uploadOpen }: RunControlsProps = {
   }
 
   if (testActive) {
-    // During an active test only the leave action is offered here: the
+    // During an active test only the leave action and settings are offered here: the
     // playback card (PLAY/PAUSE/status) floats over the viewport bottom.
     return (
       <div className="run-controls" role="group" aria-label="Analysis run parameters">
@@ -109,6 +113,29 @@ export function RunControls({ onReplaceModel, uploadOpen }: RunControlsProps = {
           onClick={leaveTest}
         >
           Leave test
+        </button>
+        <div className="run-controls__divider" aria-hidden="true" />
+        <button
+          type="button"
+          className="btn run-controls__settings-btn"
+          aria-label="Settings"
+          title="Settings & Mission Control"
+          onClick={() => dispatch({ type: 'SET_CONTROL_OPEN', open: true, mode: 'settings' })}
+        >
+          <svg
+            width="13"
+            height="13"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+          </svg>
         </button>
       </div>
     );
@@ -125,7 +152,7 @@ export function RunControls({ onReplaceModel, uploadOpen }: RunControlsProps = {
             aria-expanded={uploadOpen}
             title="Replace the loaded model with another file"
           >
-            Replace model
+            Replace
           </button>
           <div className="run-controls__divider" aria-hidden="true" />
         </>
@@ -138,7 +165,7 @@ export function RunControls({ onReplaceModel, uploadOpen }: RunControlsProps = {
           aria-label="Test type"
           onChange={(event) => setTestId(event.target.value as DropTestDefinition['id'])}
         >
-          {DROP_TESTS.map((definition) => (
+          {DROP_TESTS.filter((definition) => definition.id !== 'population-test').map((definition) => (
             <option key={definition.id} value={definition.id}>
               {definition.title}
             </option>
@@ -161,6 +188,31 @@ export function RunControls({ onReplaceModel, uploadOpen }: RunControlsProps = {
         }
       >
         {isRunning ? 'Running…' : 'Run'}
+      </button>
+
+      <div className="run-controls__divider" aria-hidden="true" />
+
+      <button
+        type="button"
+        className="btn run-controls__settings-btn"
+        aria-label="Settings"
+        title="Settings & Mission Control"
+        onClick={() => dispatch({ type: 'SET_CONTROL_OPEN', open: true, mode: 'settings' })}
+      >
+        <svg
+          width="13"
+          height="13"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+        >
+          <circle cx="12" cy="12" r="3" />
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+        </svg>
       </button>
     </div>
   );

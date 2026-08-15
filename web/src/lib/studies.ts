@@ -28,6 +28,13 @@ export const DROP_ORIENTATIONS: { value: DropOrientation; label: string }[] = [
   { value: 'random', label: 'Random (deterministic)' },
 ];
 
+export const PAUSE_BETWEEN_DROPS_OPTIONS: { value: number; label: string }[] = [
+  { value: 1.0, label: '1.0s (Recommended)' },
+  { value: 0.5, label: '0.5s' },
+  { value: 0.1, label: '0.1s (Fast)' },
+  { value: 2.0, label: '2.0s (Extended)' },
+];
+
 export const DROP_TESTS: DropTestDefinition[] = [
   {
     id: 'drop-test',
@@ -71,10 +78,26 @@ export const DROP_TESTS: DropTestDefinition[] = [
       spin_rps: 4,
     },
   },
+  {
+    id: 'population-test',
+    title: 'Population Analysis (10k)',
+    test: 'population',
+    description:
+      '10,000-unit Monte Carlo population drop simulation across manufacturing tolerance variations.',
+    defaults: {
+      height_m: 0.75,
+      surface: 'concrete',
+      drop_count: 1,
+      orientation: 'flat',
+      spin_rps: 0,
+    },
+  },
 ];
 
 export interface DropTestConfigState extends Omit<DropSimulationConfig, 'test'> {
   mass_kg: number | null;
+  seed?: number | null;
+  pause_between_drops_s?: number;
 }
 
 export function configForTest(definition: DropTestDefinition, overrides: Partial<DropTestConfigState> = {}): DropTestConfigState {
@@ -85,6 +108,8 @@ export function configForTest(definition: DropTestDefinition, overrides: Partial
     orientation: overrides.orientation ?? definition.defaults.orientation,
     spin_rps: overrides.spin_rps ?? definition.defaults.spin_rps,
     mass_kg: overrides.mass_kg ?? null,
+    seed: overrides.seed ?? null,
+    pause_between_drops_s: overrides.pause_between_drops_s ?? 1.0,
   };
 }
 

@@ -121,6 +121,13 @@ export interface FeaPlateConfig {
 export function feaFieldMaxDamage(fea: FeaResult | null): number {
   if (!fea) return 0;
   let fieldMaxDamage = 0;
+  if (typeof fea.peak?.damage === 'number' && Number.isFinite(fea.peak.damage)) {
+    fieldMaxDamage = Math.max(fieldMaxDamage, fea.peak.damage);
+  }
+  if (typeof fea.peak?.stress_mpa === 'number' && fea.peak.stress_mpa > 0) {
+    const yieldMpa = fea.yield_stress_pa ? fea.yield_stress_pa / 1e6 : 40;
+    fieldMaxDamage = Math.max(fieldMaxDamage, Math.min(1, fea.peak.stress_mpa / yieldMpa));
+  }
   for (const field of fea.objects) {
     for (const value of field.damage) {
       if (typeof value === 'number' && Number.isFinite(value) && value > fieldMaxDamage) {
@@ -290,6 +297,8 @@ const FEA_VERTEX_BODY = /* glsl */ `
 const FEA_FRAGMENT_PREFIX = /* glsl */ `
 uniform float uFeaMode;
 uniform float uTime;
+uniform float uImpactWindow01;
+uniform float uImpactWindowActive;
 uniform vec3 uImpactPointModel;
 uniform float uFalloffRadius;
 uniform float uPeakDamage;
@@ -361,11 +370,15 @@ function buildGradientColorFrag(): string {
 
 const FEA_FRAGMENT_BODY = /* glsl */ `
 	// --- FEA fragment (after color_fragment) ---
+	// Dynamic impact scaling during drop simulation:
+	// While the drop is active/falling, progress advances from 0 to 1 at the moment of impact.
+	// When inspecting post-drop or static models, uImpactWindowActive is 0 so progress is 1.0.
+	float feaProg = mix( 1.0, uImpactWindow01, uImpactWindowActive );
 	// Continuous procedural base layer: the same Gaussian evaluated on the
 	// interpolated fragment position keeps the heatmap visible even on sparse
 	// meshes whose vertices miss the impact zone (the per-vertex field from
 	// vFeaDamage would otherwise be zero everywhere).
-	float feaProcedural = uPeakDamage * exp( -dot( vFeaPosition - uImpactPointModel, vFeaPosition - uImpactPointModel ) / max( uFalloffRadius * uFalloffRadius, 1e-6 ) );
+	float feaProcedural = uPeakDamage * exp( -dot( vFeaPosition - uImpactPointModel, vFeaPosition - uImpactPointModel ) / max( uFalloffRadius * uFalloffRadius, 1e-6 ) ) * feaProg;
 	// Continuous plate-field layer: the dominant Navier term evaluated on the
 	// interpolated fragment position (same bbox->panel mapping as the backend
 	// and applyFeaPlateField). Keeps the heatmap visible on vertex-sparse
@@ -374,14 +387,10 @@ const FEA_FRAGMENT_BODY = /* glsl */ `
 	if ( uPlateA > 0.0 && uPlateB > 0.0 ) {
 		float feaPx = uPlateA / 2.0 + ( vFeaPosition.x - uPlateCx ) * ( uPlateA / max( uPlateXExtent, 1e-9 ) );
 		float feaPy = uPlateB / 2.0 + ( vFeaPosition.y - uPlateCy ) * ( uPlateB / max( uPlateYExtent, 1e-9 ) );
-		feaPlate = uPlatePeakDamage * sin( FEA_PI * feaPx / uPlateA ) * sin( FEA_PI * feaPy / uPlateB );
+		feaPlate = uPlatePeakDamage * sin( FEA_PI * feaPx / uPlateA ) * sin( FEA_PI * feaPy / uPlateB ) * feaProg;
 		feaPlate = max( feaPlate, 0.0 );
 	}
-	float feaDamage = clamp( max( vFeaDamage, max( feaProcedural, feaPlate ) ), 0.0, 1.0 );
-	// Auto-normalized visual damage for the CONTOUR only: the ramp spans the
-	// field's OWN maximum (standard FEA post-processor behavior). The plastic
-	// whitening and the tear cutout below use the TRUE damage so a tiny real
-	// stress never whitens or tears the model.
+	float feaDamage = clamp( max( vFeaDamage * feaProg, max( feaProcedural, feaPlate ) ), 0.0, 1.0 );
 	float feaDamageVis = clamp( feaDamage * uDamageScale, 0.0, 1.0 );
 	if ( uFeaMode > 0.5 ) {
 		// YIELD SHADER: distinct from the heatmap — a steel-gray base with
@@ -389,6 +398,8 @@ const FEA_FRAGMENT_BODY = /* glsl */ `
 		// stress-whitening with a hot tint, and the tear zone (D > 0.92)
 		// cut out entirely (fracture hole).
 		diffuseColor.rgb = vec3( 0.60, 0.62, 0.66 );
+		float feaYieldContour = smoothstep( 0.20, 0.95, feaDamageVis );
+		diffuseColor.rgb = mix( diffuseColor.rgb, vec3( 0.78, 0.52, 0.20 ), feaYieldContour * 0.45 );
 		float feaW = clamp( ( feaDamage - ${FEA_DENT_THRESHOLD} ) / ${FEA_TEAR_THRESHOLD - FEA_DENT_THRESHOLD}, 0.0, 1.0 );
 		if ( feaW > 0.0 ) {
 			float feaNoise = feaHashNoise( vFeaPosition, uTime );
@@ -399,12 +410,10 @@ const FEA_FRAGMENT_BODY = /* glsl */ `
 			discard;
 		}
 	} else if ( uFeaMode > -0.5 ) {
-		// FEA HEATMAP: neutral white base so the contour reads clearly on
-		// colorful CAD/palette materials; damaged regions get the gradient.
+		// FEA HEATMAP: Clean neutral white base with full von Mises stress gradient contour.
 		diffuseColor.rgb = vec3( 1.0 );
 		if ( feaDamageVis > 0.0005 ) {
-			// Deterministic per-fragment dither (static seed, no uTime) so the
-			// 8-bit banded gradient reads smooth without shimmering.
+			// Deterministic per-fragment dither so the 8-bit banded gradient reads smooth without shimmering.
 			float feaDither = ( feaHashNoise( vFeaPosition, 0.37 ) - 0.5 ) / 48.0;
 			feaDamageVis = clamp( feaDamageVis + feaDither, 0.0, 1.0 );
 			diffuseColor.rgb = feaGradientColorFrag( feaDamageVis );

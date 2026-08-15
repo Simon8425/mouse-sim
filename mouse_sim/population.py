@@ -214,12 +214,12 @@ DEFAULT_COMPONENT_SPECS = [
     # the platform component module design defaults.
     {"component_id": "switch_primary", "type": "switch", "actuation_force_n": 0.7},
     {"component_id": "scroll_encoder", "type": "encoder"},
-    {"component_id": "battery_pack", "type": "battery"},
+    {"component_id": "battery_pack", "type": "battery", "mass_kg": 0.008, "shock_limit_g": 500.0},
     {"component_id": "pcb_main", "type": "pcb", "thickness_m": 0.0016},
-    {"component_id": "adhesive_plate", "type": "adhesive", "area_m2": 4e-4},
-    {"component_id": "screw_boss_m1_6", "type": "screw", "preload_n": 15.0},
+    {"component_id": "adhesive_plate", "type": "adhesive", "area_m2": 4e-4, "adhered_mass_kg": 0.002},
+    {"component_id": "screw_boss_m1_6", "type": "screw", "preload_n": 8.0, "supported_mass_kg": 0.015},
     {"component_id": "clip_side_button", "type": "clip", "beam_thickness_m": 0.001},
-    {"component_id": "mount_battery", "type": "mount"},
+    {"component_id": "mount_battery", "type": "mount", "supported_mass_kg": 0.008},
 ]
 ELEC_TYPES = ("pcb", "battery", "switch", "encoder")
 MECH_TYPES = ("screw", "clip", "mount", "adhesive")
@@ -1005,7 +1005,9 @@ def _fallback_ratio(spec, ctx, ctype):
     elif ctype == "adhesive":
         area = float(spec.get("area_m2", 2.0e-4))
         strength = float(spec.get("strength_pa", 5.0e6))
-        stress = force / area if area > 0.0 else 0.0
+        adhered_mass = float(spec.get("adhered_mass_kg", 0.002))
+        joint_force = adhered_mass * accel_m_s2
+        stress = joint_force / area if area > 0.0 else 0.0
         ratio = stress / strength if strength > 0.0 else 0.0
     elif ctype == "screw":
         retention = float(spec.get("retention_force_n", 400.0)) * float(spec.get("preload_n", 2.0)) / 2.0
@@ -1167,6 +1169,8 @@ def _process_unit(index, config, context, contact_kwargs):
         drop_count=1,
         test="drop",
         orientation=config["drop_orientation"],
+        dt=0.002,
+        max_duration_s=0.6,
         seed=0,
         unit_seed=unit_seed,
         unit_scale=config["tolerance_scale"],

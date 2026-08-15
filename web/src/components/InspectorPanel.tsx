@@ -187,11 +187,7 @@ export function InspectorPanel() {
     state.selectedId === null ? null : selectObjectById(state, state.selectedId);
 
   if (entry === null) {
-    return (
-      <div className="inspector-panel inspector-panel--empty">
-        <p>Select an object in the model navigator or click it in the viewport.</p>
-      </div>
-    );
+    return null;
   }
 
   const geometry = entry.geometry;
@@ -207,6 +203,15 @@ export function InspectorPanel() {
     materialName !== null
       ? state.materials?.find((m) => m.key.toLowerCase() === materialName.toLowerCase()) ?? null
       : null;
+  const aiSuggestion = state.aiClassifications?.[entry.id] ?? null;
+  const aiTone =
+    !aiSuggestion || aiSuggestion.confidence === undefined
+      ? 'neutral'
+      : aiSuggestion.confidence >= 0.85
+        ? 'ok'
+        : aiSuggestion.confidence >= 0.6
+          ? 'warn'
+          : 'error';
   const family = readString(material?.family);
   const density = num(material?.density_kg_m3);
   const youngModulus = num(material?.young_modulus_pa);
@@ -248,14 +253,36 @@ export function InspectorPanel() {
   return (
     <div className="inspector-panel">
       <div className="inspector-panel__header">
-        <div>
-          <span className="panel-eyebrow">Selected component</span>
-          <h2 className="inspector-panel__object">{displayName}</h2>
+        <h2 className="inspector-panel__object">{displayName}</h2>
+        <div className="inspector-panel__header-actions">
+          {entry.className ? <StatusBadge tone="neutral">{entry.className}</StatusBadge> : null}
+          <button
+            type="button"
+            className="inspector-panel__close-btn"
+            aria-label="Close inspector"
+            onClick={() => dispatch({ type: 'SET_INSPECTOR_OPEN', open: false })}
+            title="Close inspector"
+          >
+            <svg
+              width="13"
+              height="13"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
         </div>
-        {entry.className ? <StatusBadge tone="neutral">{entry.className}</StatusBadge> : null}
       </div>
 
-      <h3 className="section-title">Mouse Part Role</h3>
+      <div className="inspector-panel__body">
+        <h3 className="section-title">Mouse Part Role</h3>
       <label className="inspector-material-select">
         <span>Part of the mouse (e.g. Top Shell, PCB, Wheel)</span>
         <select
@@ -278,6 +305,31 @@ export function InspectorPanel() {
           ))}
         </select>
       </label>
+      {aiSuggestion && !state.objectClassifications?.[entry.id] ? (
+        <div className="inspector-ai-suggestion">
+          <span className={`badge badge--${aiTone}`}>AI {aiSuggestion.confidence !== undefined ? `${Math.round(aiSuggestion.confidence * 100)}%` : ''}</span>
+          <span className="inspector-ai-suggestion__role">{aiSuggestion.component_type ?? 'unresolved'}</span>
+          <button
+            type="button"
+            className="btn btn--small"
+            onClick={() => dispatch({ type: 'CLASSIFY_APPLY_ONE', objectId: entry.id })}
+          >
+            Apply
+          </button>
+          <button
+            type="button"
+            className="btn btn--small"
+            onClick={() => dispatch({ type: 'CLASSIFY_CLEAR', objectId: entry.id })}
+          >
+            Dismiss
+          </button>
+          {aiSuggestion.reasons && aiSuggestion.reasons.length > 0 ? (
+            <span className="inspector-ai-suggestion__reasons" title={aiSuggestion.reasons.join(' · ')}>
+              {aiSuggestion.reasons.join(' · ')}
+            </span>
+          ) : null}
+        </div>
+      ) : null}
 
       <h3 className="section-title">Material</h3>
       {state.materials && state.materials.length > 0 ? (
@@ -418,6 +470,7 @@ export function InspectorPanel() {
           </tr>
         </tbody>
       </table>
+      </div>
     </div>
   );
 }

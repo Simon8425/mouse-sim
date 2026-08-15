@@ -182,10 +182,9 @@ describe('Settings modal', () => {
     expect(screen.getByRole('dialog', { name: 'Settings' })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Settings' })).toBeInTheDocument();
     expect(screen.getByText('Default Material')).toBeInTheDocument();
-    // Engine/API status is no longer surfaced in the settings panel.
+    // Engine status card is no longer surfaced in the settings panel.
     expect(screen.queryByRole('heading', { name: 'Engine status' })).not.toBeInTheDocument();
-    expect(screen.queryByText(/API/)).not.toBeInTheDocument();
-    expect(screen.queryByText('on')).not.toBeInTheDocument();
+    expect(screen.getByText('AI Vision Model')).toBeInTheDocument();
   });
 
   it('closes on Escape and on the close button', async () => {

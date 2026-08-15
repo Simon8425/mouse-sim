@@ -1,6 +1,13 @@
+import os
 import tempfile
 import unittest
 from unittest import mock
+
+# The pipeline's AI-classify stage is opt-in (OPENROUTER_API_KEY +
+# MOUSE_SIM_AI_ENABLED).  These tests assert deterministic offline behavior,
+# so force the stage off even when a developer's shell/.env enables it.
+os.environ.pop("OPENROUTER_API_KEY", None)
+os.environ["MOUSE_SIM_AI_ENABLED"] = "0"
 
 from mouse_sim import canonical_json
 from mouse_sim.cache import ArtifactCache

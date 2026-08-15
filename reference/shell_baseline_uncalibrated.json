@@ -3,7 +3,7 @@
   "note": "the first physical comparison MUST be against this untouched baseline; never fit parameters to individual tests (freeze-phase items 10-11)",
   "engine": {
     "version": "0.1.0",
-    "engine_hash": "cb8e7190d954124b856a457e883894fbbcc410a0e5773abc436485cbae24f0fb"
+    "engine_hash": "0516756b26c59d7f7621520ea65cc698a0b1c010b658af9ebc5274b1dc4e49ea"
   },
   "config_hashes": {
     "geometry_digest": "b853630b3d6f1db19aafb79e38631cf54328f9f57d24c1c177a76b80ae5bc5b0",
@@ -11,7 +11,7 @@
     "load_case_digest": "2e9cadc4407c360883b623d439e8506b7f124bcb848cdadd58130f37016475ca",
     "validation_digest": "dd3ce8aee8e74b48f10a9d497f69066d4d0c966dd0271ffe05c4fddabf211ce1",
     "request_digest": "944d1ed50b89a300bfc503c8c592c10a9a78332421cc3fbf9e2cb25b4aef1136",
-    "run_id": "63982068e975e0181e7cb154c20670b5b7f3d0403b570cedc86490a27024f7f1"
+    "run_id": "25d8918094c3aaf31f3c8c9d6f01abf551769a62e0a60d4ab6b2c80330878778"
   },
   "request": {
     "load_case": {
@@ -261,7 +261,7 @@
     },
     "engine": {
       "version": "0.1.0",
-      "engine_hash": "cb8e7190d954124b856a457e883894fbbcc410a0e5773abc436485cbae24f0fb"
+      "engine_hash": "0516756b26c59d7f7621520ea65cc698a0b1c010b658af9ebc5274b1dc4e49ea"
     },
     "seed": 0
   },

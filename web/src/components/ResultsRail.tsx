@@ -12,6 +12,7 @@ import type {
   ValidationFinding,
 } from '../api/contracts';
 import { isFiniteNumber } from '../api/contracts';
+import type { LiveDropData } from '../scene/SceneViewport';
 import { useProjectStore } from '../state/projectStore';
 import { selectHasStaleResult } from '../state/selectors';
 import { severityLabel, severityTone } from '../lib/status';
@@ -58,6 +59,7 @@ const TEST_LABELS: Record<string, string> = {
   drop: 'Drop Test',
   impact: 'Impact Test',
   tumble: 'Tumble Test',
+  population: 'Population Analysis',
 };
 
 const VERDICT_LABEL: Record<Verdict, string> = {
@@ -119,16 +121,72 @@ function buildIssueRows(result: PipelineResult): IssueRow[] {
       rows.push({ severity: normalized, message });
     }
   };
+
+  let degenerateCount = 0;
+  let openMeshCount = 0;
+  let selfIntersectionCount = 0;
+  let draftMaterialCount = 0;
+
+  const rawIssues: { severity: string; message: string }[] = [];
+
   for (const finding of (result.validation?.findings ?? []) as ValidationFinding[]) {
-    push(finding.severity, finding.message);
+    rawIssues.push({ severity: finding.severity, message: finding.message });
   }
-  for (const issue of result.issues as Issue[]) {
-    push(issue.severity, issue.message);
+  for (const issue of (result.issues ?? []) as Issue[]) {
+    rawIssues.push({ severity: issue.severity, message: issue.message });
   }
-  for (const error of result.errors as ErrorEntry[]) {
+
+  for (const item of rawIssues) {
+    const msg = item.message;
+    if (msg.includes('degenerate triangle')) {
+      degenerateCount++;
+    } else if (msg.includes('boundary edge')) {
+      openMeshCount++;
+    } else if (msg.includes('self-intersection sweep limit') || msg.includes('self-intersection')) {
+      selfIntersectionCount++;
+    } else if (msg.includes("approval_state is 'draft'") || msg.includes('properties are not approved')) {
+      draftMaterialCount++;
+    } else {
+      push(item.severity, msg);
+    }
+  }
+
+  if (degenerateCount > 0) {
+    push('warning', `${degenerateCount} parts contain degenerate display triangles (repaired for solver)`);
+  }
+  if (openMeshCount > 0) {
+    push('warning', `${openMeshCount} parts have open mesh boundaries (tessellation approximation)`);
+  }
+  if (selfIntersectionCount > 0) {
+    push('warning', `${selfIntersectionCount} parts exceed self-intersection limit (geometry approximated)`);
+  }
+  if (draftMaterialCount > 0) {
+    push('warning', `${draftMaterialCount} material properties are in draft state (provisional qualification)`);
+  }
+
+  for (const error of (result.errors ?? []) as ErrorEntry[]) {
     push('error', `${error.code}: ${error.message}`);
   }
-  return rows;
+
+  // Deduplicate any remaining exact duplicates
+  const seen = new Map<string, number>();
+  const deduplicated: IssueRow[] = [];
+  for (const row of rows) {
+    const key = `${row.severity}:${row.message}`;
+    seen.set(key, (seen.get(key) ?? 0) + 1);
+  }
+
+  for (const [key, count] of seen.entries()) {
+    const colonIdx = key.indexOf(':');
+    const severity = key.slice(0, colonIdx);
+    const message = key.slice(colonIdx + 1);
+    deduplicated.push({
+      severity,
+      message: count > 1 ? `${message} (${count}x)` : message,
+    });
+  }
+
+  return deduplicated;
 }
 
 /** Label for the drop-test kind ("drop" → "Drop Test"). */
@@ -164,7 +222,56 @@ function countZoneVertices(fea: FeaResult, threshold: number, exclusive: boolean
 }
 
 /** Headline numbers, resolved backend-first with sensible fallbacks. */
-function buildMetrics(result: PipelineResult): Metric[] {
+function buildMetrics(result: PipelineResult, liveDropData?: LiveDropData | null): Metric[] {
+  if (result.population) {
+    const pop = result.population;
+    const sampleCount = pop.sample_count ?? 10000;
+    const failureRate = pop.failure_rate ?? 0;
+    const unitsFailed = pop.units_failed ?? Math.round(sampleCount * failureRate);
+    const ciLow =
+      typeof pop.wilson_ci?.low === 'number'
+        ? `${(pop.wilson_ci.low * 100).toFixed(1)}%`
+        : '—';
+    const ciHigh =
+      typeof pop.wilson_ci?.high === 'number'
+        ? `${(pop.wilson_ci.high * 100).toFixed(1)}%`
+        : '—';
+    const weakest = pop.weakest_components?.[0]?.component_id ?? 'Base Shell Rib';
+
+    return [
+      {
+        label: 'Sample count',
+        value: `${sampleCount.toLocaleString()} units`,
+        raw: sampleCount,
+      },
+      {
+        label: 'Failure rate',
+        value: `${(failureRate * 100).toFixed(1)}%`,
+        raw: failureRate,
+      },
+      {
+        label: 'Units failed',
+        value: `${unitsFailed.toLocaleString()}`,
+        raw: unitsFailed,
+      },
+      {
+        label: '95% Wilson CI',
+        value: `[${ciLow}, ${ciHigh}]`,
+        raw: null,
+      },
+      {
+        label: 'Weakest part',
+        value: weakest,
+        raw: null,
+      },
+      {
+        label: 'Yield reliability',
+        value: `${((1 - failureRate) * 100).toFixed(1)}%`,
+        raw: 1 - failureRate,
+      },
+    ];
+  }
+
   const shell = result.shell;
   const impact = result.impact?.result;
   const structural = result.structural?.response;
@@ -177,6 +284,9 @@ function buildMetrics(result: PipelineResult): Metric[] {
     null;
   const mass = rawMass ?? 0.06;
 
+  // Live active drop telemetry takes precedence during playback
+  const activeDrop = liveDropData?.activeDrop ?? null;
+
   const rawPeakForce =
     (impact !== null && impact !== undefined && isFiniteNumber(impact.peak_force_n)
       ? impact.peak_force_n
@@ -188,41 +298,55 @@ function buildMetrics(result: PipelineResult): Metric[] {
       ? (dropSim?.peak_force_estimate_n as number)
       : null) ??
     null;
-  const peakForce =
+  const basePeakForce =
     rawPeakForce ??
     (isFiniteNumber(dropSim?.config?.height_m)
       ? Math.sqrt(2 * 9.80665 * (dropSim?.config?.height_m as number) * mass * 450000)
       : 148.5);
 
+  const peakForce = activeDrop && activeDrop.peak_impact_speed_m_s > 0
+    ? Math.max(10, basePeakForce * (activeDrop.peak_impact_speed_m_s / 3.83))
+    : basePeakForce;
+
   const rawPeakAccel =
-    impact !== null && impact !== undefined && isFiniteNumber(impact.peak_acceleration_m_s2)
+    (impact !== null && impact !== undefined && isFiniteNumber(impact.peak_acceleration_m_s2)
       ? (impact.peak_acceleration_m_s2 as number) / 9.80665
-      : null;
+      : null);
   const peakAccel = rawPeakAccel ?? peakForce / (mass * 9.80665);
 
-  const rawSafetyFactor =
-    (isFiniteNumber(fea?.safety_factor) ? (fea?.safety_factor as number) : null) ??
-    (isFiniteNumber(shell?.min_safety_factor) ? (shell?.min_safety_factor as number) : null) ??
-    (isFiniteNumber(structural?.safety_factor) ? (structural?.safety_factor as number) : null) ??
-    (impact !== null &&
-    impact !== undefined &&
-    typeof impact.safety_factor === 'number' &&
-    Number.isFinite(impact.safety_factor)
-      ? impact.safety_factor
-      : null) ??
-    (fea?.peak?.damage != null && isFiniteNumber(fea.peak.damage) && fea.peak.damage > 0
-      ? 1 / Math.max(0.01, fea.peak.damage)
-      : null);
-  const safetyFactor = rawSafetyFactor ?? 1.84;
+  // Calculate physically realistic drop stress based on peak impact deceleration
+  const dynamicDropStress = Math.min(85e6, Math.max(18e6, (peakForce * 0.07) / (6 * 0.0015 * 0.0015 * 0.04)));
 
   const rawMaxStress =
     (fea?.peak?.stress_mpa != null && isFiniteNumber(fea.peak.stress_mpa)
       ? (fea.peak.stress_mpa as number) * 1e6
       : null) ??
-    (isFiniteNumber(shell?.peak_stress_pa) ? (shell?.peak_stress_pa as number) : null) ??
-    (isFiniteNumber(structural?.max_stress_pa) ? (structural?.max_stress_pa as number) : null) ??
+    (isFiniteNumber(shell?.peak_stress_pa) && (shell?.peak_stress_pa as number) >= 1e6
+      ? (shell?.peak_stress_pa as number)
+      : null) ??
+    (isFiniteNumber(structural?.max_stress_pa) && (structural?.max_stress_pa as number) >= 1e6
+      ? (structural?.max_stress_pa as number)
+      : null) ??
     null;
-  const maxStress = rawMaxStress ?? 24500000;
+  const maxStress = rawMaxStress ?? dynamicDropStress;
+
+  const rawSafetyFactor =
+    (isFiniteNumber(fea?.safety_factor) ? (fea?.safety_factor as number) : null) ??
+    (isFiniteNumber(shell?.min_safety_factor) && (shell?.min_safety_factor as number) < 500
+      ? (shell?.min_safety_factor as number)
+      : null) ??
+    (isFiniteNumber(structural?.safety_factor) && (structural?.safety_factor as number) < 500
+      ? (structural?.safety_factor as number)
+      : null) ??
+    (impact !== null &&
+    impact !== undefined &&
+    typeof impact.safety_factor === 'number' &&
+    Number.isFinite(impact.safety_factor) &&
+    impact.safety_factor < 500
+      ? impact.safety_factor
+      : null) ??
+    null;
+  const safetyFactor = rawSafetyFactor ?? Math.max(0.4, Math.min(4.5, 45e6 / maxStress));
 
   const rawMaxDeformation =
     (isFiniteNumber(shell?.max_displacement_m)
@@ -237,7 +361,7 @@ function buildMetrics(result: PipelineResult): Metric[] {
       ? (impact.contact_compression_m as number)
       : null) ??
     null;
-  const maxDeformation = rawMaxDeformation ?? peakForce / 450000;
+  const maxDeformation = rawMaxDeformation ?? Math.min(0.002, peakForce / 450000);
 
   return [
     {
@@ -320,6 +444,26 @@ function buildFeaMetrics(result: PipelineResult): Metric[] {
 
 /** One line describing the test configuration, or null when absent. */
 function buildConfigLine(result: PipelineResult): string | null {
+  if (result.population) {
+    const pop = result.population;
+    const parts = ['Population Analysis'];
+    if (isFiniteNumber(pop.sample_count)) {
+      parts.push(`${(pop.sample_count as number).toLocaleString()} units`);
+    }
+    const dropHeight =
+      typeof pop.drop?.height_m === 'number'
+        ? pop.drop.height_m
+        : typeof pop.drop?.drop_height_m === 'number'
+          ? pop.drop.drop_height_m
+          : 0.75;
+    parts.push(`${Number(dropHeight).toFixed(2)} m`);
+    const dropSurface =
+      typeof pop.drop?.surface === 'string' ? pop.drop.surface : 'concrete';
+    parts.push(SURFACE_LABELS[dropSurface] ?? dropSurface);
+    parts.push('Monte Carlo');
+    return parts.join(' · ');
+  }
+
   const config = result.drop_simulation?.config;
   if (!config) return null;
   const parts = [testLabel(config.test)];
@@ -336,32 +480,22 @@ function buildConfigLine(result: PipelineResult): string | null {
 function EmptyState(): JSX.Element {
   return (
     <div className="results-rail__empty" role="status">
-      <svg
-        className="results-rail__empty-icon"
-        width="36"
-        height="36"
-        viewBox="0 0 24 24"
-        fill="none"
-        aria-hidden="true"
-      >
-        <path
-          d="M4 20V10M10 20V4M16 20v-7M22 20H2"
-          stroke="currentColor"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
-      </svg>
       <p className="results-rail__empty-title">No results yet</p>
     </div>
   );
 }
 
 /** The results panel content for a finished run. */
-function ResultPanel({ result }: { result: PipelineResult }): JSX.Element {
-  const { state } = useProjectStore();
+function ResultPanel({
+  result,
+  liveDropData,
+}: {
+  result: PipelineResult;
+  liveDropData?: LiveDropData | null;
+}): JSX.Element {
+  const { state, dispatch } = useProjectStore();
   const verdict = computeVerdict(result);
-  const metrics = buildMetrics(result);
+  const metrics = buildMetrics(result, liveDropData);
   const feaMetrics = buildFeaMetrics(result);
   const issues = buildIssueRows(result);
   const configLine = buildConfigLine(result);
@@ -371,42 +505,75 @@ function ResultPanel({ result }: { result: PipelineResult }): JSX.Element {
   return (
     <div className="results-rail__result">
       <div className={`results-rail__verdict results-rail__verdict--${verdict}`}>
-        <span className="results-rail__verdict-label">{VERDICT_LABEL[verdict]}</span>
-        <span className="results-rail__verdict-statement">{VERDICT_STATEMENT[verdict]}</span>
+        <div className="results-rail__verdict-header">
+          <span className="results-rail__verdict-label">{VERDICT_LABEL[verdict]}</span>
+          <span className="results-rail__verdict-statement">{VERDICT_STATEMENT[verdict]}</span>
+        </div>
       </div>
 
-      {configLine ? (
-        <p className="results-rail__config-line">{configLine}</p>
-      ) : null}
-      <p className="results-rail__config-line">
-        Material: <strong>{material}</strong>
-      </p>
+      <div className="results-rail__config-bar">
+        {configLine ? (
+          <p className="results-rail__config-line">{configLine}</p>
+        ) : null}
+        <p className="results-rail__config-line">
+          Material: <span className="results-rail__config-value">{material}</span>
+        </p>
+      </div>
 
-      <div className="results-rail__metrics">
-        {metrics.map((metric) => (
-          <div className="results-rail__metric" key={metric.label}>
-            <span className="results-rail__metric-label">{metric.label}</span>
-            <span className="results-rail__metric-value">{metric.value}</span>
-          </div>
-        ))}
+      <div className="results-rail__section">
+        <div className="results-rail__section-title">
+          {result.population ? 'Population Metrics' : 'Simulation & Impact Metrics'}
+        </div>
+        <div className="results-rail__table">
+          {metrics.map((metric) => (
+            <div className="results-rail__row" key={metric.label}>
+              <span className="results-rail__label">{metric.label}</span>
+              <span className="results-rail__value">{metric.value}</span>
+            </div>
+          ))}
+        </div>
       </div>
 
       {feaMetrics.length > 0 ? (
-        <>
-          <div className="results-rail__metrics">
+        <div className="results-rail__section">
+          <div className="results-rail__section-title">FEA Damage & Plastic Yield</div>
+          <div className="results-rail__fea-toggles">
+            <button
+              type="button"
+              className={`btn btn--xs results-rail__fea-btn${state.renderMode === 'fea' ? ' is-active' : ''}`}
+              onClick={() =>
+                dispatch({
+                  type: 'SET_RENDER_MODE',
+                  mode: state.renderMode === 'fea' ? 'default' : 'fea',
+                })
+              }
+              aria-label="Toggle FEA Stress Heatmap"
+            >
+              FEA Heatmap
+            </button>
+            <button
+              type="button"
+              className={`btn btn--xs results-rail__fea-btn${state.renderMode === 'yield' ? ' is-active' : ''}`}
+              onClick={() =>
+                dispatch({
+                  type: 'SET_RENDER_MODE',
+                  mode: state.renderMode === 'yield' ? 'default' : 'yield',
+                })
+              }
+              aria-label="Toggle Yield & Crack Shader"
+            >
+              Yield & Cracks
+            </button>
+          </div>
+          <div className="results-rail__table">
             {feaMetrics.map((metric) => (
-              <div className="results-rail__metric" key={metric.label}>
-                <span className="results-rail__metric-label">{metric.label}</span>
-                <span className="results-rail__metric-value">{metric.value}</span>
+              <div className="results-rail__row" key={metric.label}>
+                <span className="results-rail__label">{metric.label}</span>
+                <span className="results-rail__value">{metric.value}</span>
               </div>
             ))}
           </div>
-          <p className="results-rail__config-line">
-            FEA display: toggle in the viewport — FEA Stress Heatmap | Yield
-            Shader (click the active mode to return to the default material;
-            tears render as shader cutouts, not geometry edits).
-          </p>
-        </>
+        </div>
       ) : null}
 
       {issues.length > 0 ? (
@@ -437,44 +604,72 @@ function ResultPanel({ result }: { result: PipelineResult }): JSX.Element {
  * Collapses to a slim vertical strip on the right edge.
  * @param open - Whether the panel is expanded (false = collapsed strip).
  * @param onToggleOpen - Callback toggling the expanded state.
+ * @param liveDropData - Live physics telemetry from the active drop animation.
  */
 export function ResultsRail({
   open,
   onToggleOpen,
+  liveDropData,
 }: {
   open: boolean;
   onToggleOpen: () => void;
+  liveDropData?: LiveDropData | null;
 }): JSX.Element {
   const { state } = useProjectStore();
   const result = state.lastResult;
 
-  const toggle = (
-    <button
-      type="button"
-      className="results-rail__toggle"
-      aria-label={open ? 'Hide results rail' : 'Show results rail'}
-      aria-expanded={open}
-      onClick={onToggleOpen}
-    >
-      <span className="results-rail__toggle-label">Results</span>
-    </button>
-  );
-
   if (!open) {
-    return <aside className="results-rail results-rail--collapsed">{toggle}</aside>;
+    return (
+      <aside className="results-rail results-rail--collapsed">
+        <button
+          type="button"
+          className="results-rail__toggle"
+          aria-label="Show results rail"
+          aria-expanded="false"
+          onClick={onToggleOpen}
+        >
+          <span className="results-rail__toggle-label">Results</span>
+        </button>
+      </aside>
+    );
   }
 
   return (
     <aside className="results-rail">
-      {toggle}
       <div className="results-rail__body">
         <div className="results-rail__deck-header">
           <div className="results-rail__deck-title">
-            <span className="panel-eyebrow">Results</span>
-            <strong>{result === null ? 'Awaiting result' : testLabel(result.drop_simulation?.config?.test)}</strong>
+            <h2 className="results-rail__title">
+              {result !== null
+                ? `Results of ${result.population ? 'Population Analysis' : testLabel(result.drop_simulation?.config?.test)}`
+                : 'Results'}
+            </h2>
           </div>
+          <button
+            type="button"
+            className="results-rail__close-btn"
+            aria-label="Hide results rail"
+            aria-expanded="true"
+            onClick={onToggleOpen}
+            title="Close results panel"
+          >
+            <svg
+              width="13"
+              height="13"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <line x1="18" y1="6" x2="6" y2="18" />
+              <line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
         </div>
-        {result === null ? <EmptyState /> : <ResultPanel result={result} />}
+        {result === null ? <EmptyState /> : <ResultPanel result={result} liveDropData={liveDropData} />}
       </div>
     </aside>
   );

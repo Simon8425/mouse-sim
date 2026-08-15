@@ -108,15 +108,38 @@ function fmt(v: number, digits = 3): string {
 export function DropPhysicsDebug({
   simulation,
   dropTime,
+  liveFrame,
 }: {
   simulation: DropSimulationResult | null;
   dropTime: number;
+  /** Live Rapier body state (position/velocity/angular) when active. */
+  liveFrame?: {
+    position: [number, number, number];
+    quaternion: [number, number, number, number];
+    linvel: [number, number, number];
+    angvel: [number, number, number];
+  } | null;
 }): React.ReactElement | null {
   const [show, setShow] = React.useState(true);
   if (!simulation) return null;
 
+  // When the live Rapier simulation drives the pose, the LIVE FRAME table
+  // shows the REAL physics body state; otherwise it falls back to the
+  // backend-sample finite differences.
+  const live = liveFrame
+    ? {
+        t: dropTime,
+        pos: liveFrame.position,
+        hSpeed: Math.hypot(liveFrame.linvel[0], liveFrame.linvel[1]),
+        vSpeed: liveFrame.linvel[2],
+        speed: Math.hypot(liveFrame.linvel[0], liveFrame.linvel[1], liveFrame.linvel[2]),
+        rotRate: Math.hypot(liveFrame.angvel[0], liveFrame.angvel[1], liveFrame.angvel[2]),
+        dq: 0,
+        settled: false,
+      }
+    : deriveLiveFrame(simulation.trajectory, dropTime);
+
   const samples = simulation.trajectory;
-  const live = deriveLiveFrame(samples, dropTime);
 
   // Active drop (largest start_s <= t).
   let activeDrop: (typeof simulation.drops)[number] | null = null;
@@ -174,6 +197,10 @@ export function DropPhysicsDebug({
             <div className="drop-debug__section-title">LIVE FRAME</div>
             <table className="drop-debug__table">
               <tbody>
+                <tr>
+                  <td>mode</td>
+                  <td>{liveFrame ? 'LIVE (Rapier 3D)' : 'SAMPLE (Telemetry)'}</td>
+                </tr>
                 <tr>
                   <td>t</td>
                   <td>{fmt(dropTime, 3)} s</td>

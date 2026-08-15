@@ -193,15 +193,26 @@ export interface ProjectObject {
   mass_override?: number;
   measured_mass?: number;
   structural_behavior?: string;
-  classification?: {
-    component_type?: string;
-    source?: string;
-    confidence?: number | string;
-  };
+  classification?: AiClassification;
   [key: string]: unknown;
 }
 
-export type DropTestKind = 'drop' | 'impact' | 'tumble';
+/**
+ * AI component-type classification (heuristic, OpenRouter vision, or user).
+ * component_type uses the canonical taxonomy (COMPONENT_ROLES values or
+ * 'unresolved').
+ */
+export interface AiClassification {
+  object_id?: string;
+  component_type?: string;
+  source?: 'heuristic' | 'openrouter_vision' | 'user' | 'imported' | string;
+  confidence?: number;
+  reasons?: string[];
+  needs_review?: boolean;
+  cached?: boolean;
+}
+
+export type DropTestKind = 'drop' | 'impact' | 'tumble' | 'population';
 export type DropSurface = 'concrete' | 'wood' | 'foam' | 'steel';
 export type DropOrientation = 'flat' | 'edge' | 'corner' | 'random';
 
@@ -311,6 +322,9 @@ export interface DropSimulationConfig {
   orientation: DropOrientation;
   spin_rps?: number;
   mass_kg?: number | null;
+  seed?: number | null;
+  pause_between_drops_s?: number;
+  drop_interval_s?: number;
 }
 
 export interface DropSimulationDrop {
@@ -326,6 +340,7 @@ export interface DropSimulationDrop {
   orientation: DropOrientation;
   orientation_quaternion_wxyz?: number[];
   gravity_vector_body?: number[];
+  /** Initial angular velocity in the body-fixed principal frame [rad/s]. */
   initial_angular_velocity_rad_s?: number[];
   initial_velocity_m_s?: number[];
   starting_pose_m?: number[];
@@ -400,6 +415,7 @@ export interface DropSimulationResult {
     com_offset_m?: number[];
     orientation_quaternion_wxyz?: number[];
     gravity_vector_body?: number[];
+    /** Initial angular velocity in the body-fixed principal frame [rad/s]. */
     initial_angular_velocity_rad_s?: number[];
     initial_velocity_m_s?: number[];
     starting_pose_m?: number[];
@@ -786,6 +802,7 @@ export interface ShellInputsTrace {
     orientation?: string | null;
     orientation_quaternion_wxyz?: number[] | null;
     initial_velocity_m_s?: number[] | null;
+    /** Initial angular velocity in the body-fixed principal frame [rad/s]. */
     initial_angular_velocity_rad_s?: number[] | null;
     surface?: string | null;
     restitution?: number | null;

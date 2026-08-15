@@ -9,7 +9,6 @@ import {
 import { createClient } from './api/client';
 import { errorMessage, isAbortError } from './api/errors';
 import { isRecord, type Vec3 } from './api/contracts';
-import { TopBar } from './components/TopBar';
 import { ModelTree } from './components/ModelTree';
 import { InspectorPanel } from './components/InspectorPanel';
 import { ResultsRail } from './components/ResultsRail';
@@ -17,10 +16,12 @@ import { FileDropzone } from './components/FileDropzone';
 import { ViewportToolbar } from './components/ViewportToolbar';
 import { WebGLFallback } from './components/WebGLFallback';
 import { MissionControl } from './components/MissionControl';
+import { AiClassifyModal } from './components/AiClassifyModal';
 import { RunControls } from './components/RunControls';
 import {
   SceneViewport,
   type SceneViewportHandle,
+  type LiveDropData,
 } from './scene/SceneViewport';
 import { worldBounds, boundsCenter } from './lib/geometryBounds';
 import type { OverlaySpec } from './scene/overlays';
@@ -44,6 +45,7 @@ export function App(): React.ReactElement {
   const [stats, setStats] = React.useState<RenderStats | null>(null);
   const [uploadOpen, setUploadOpen] = React.useState(false);
   const [resultsOpen, setResultsOpen] = React.useState(false);
+  const [liveDropData, setLiveDropData] = React.useState<LiveDropData | null>(null);
 
   // Results open automatically once a run finishes — the user never has to
   // hunt for the panel after clicking Run. On narrow viewports the panel
@@ -338,15 +340,29 @@ export function App(): React.ReactElement {
     return spec;
   }, [lastResult, analysisRequest, shownEntries, state.preview?.display_asset, state.renderMode, state.stale]);
 
+  const leftInset = state.navOpen ? 294 : 0;
+  const rightDrawerOpen =
+    state.classifyModalOpen ||
+    (state.inspectorOpen && state.selectedId !== null);
+  const rightInset =
+    (rightDrawerOpen ? 374 : 0) +
+    (showGuideCard ? 0 : resultsOpen ? 334 : 42);
+
+  const topBarRightOffset = rightDrawerOpen
+    ? 374 + (showGuideCard ? 0 : resultsOpen ? 334 : 42) + 14
+    : showGuideCard
+    ? 14
+    : resultsOpen
+    ? 334 + 14
+    : 56;
+
+  const insets = React.useMemo(
+    () => ({ left: leftInset, right: rightInset, top: 0, bottom: 0 }),
+    [leftInset, rightInset],
+  );
+
   return (
     <div className="app" data-theme={state.theme}>
-      <TopBar
-        onOpenNav={() => dispatch({ type: 'SET_NAV_OPEN', open: !state.navOpen })}
-        onOpenInspector={() => dispatch({ type: 'SET_INSPECTOR_OPEN', open: !state.inspectorOpen })}
-        onOpenControl={() =>
-          dispatch({ type: 'SET_CONTROL_OPEN', open: !state.controlOpen, mode: 'settings' })
-        }
-      />
       <div className="workspace">
         <aside
           className={`drawer drawer--nav${state.navOpen ? ' is-open' : ''}`}
@@ -366,7 +382,7 @@ export function App(): React.ReactElement {
           }}
         >
           {!showGuideCard && !state.webglError ? (
-            <div className="viewport-column__top-bar">
+            <div className="viewport-column__top-bar" style={{ right: `${topBarRightOffset}px` }}>
               <ViewportToolbar viewport={viewportRef} stats={stats} />
               <div className="viewport-column__header">
                 <RunControls
@@ -376,7 +392,7 @@ export function App(): React.ReactElement {
               </div>
             </div>
           ) : !showGuideCard ? (
-            <div className="viewport-column__top-bar viewport-column__top-bar--end-only">
+            <div className="viewport-column__top-bar viewport-column__top-bar--end-only" style={{ right: `${topBarRightOffset}px` }}>
               <div className="viewport-column__header">
                 <RunControls
                   onReplaceModel={() => setUploadOpen(!uploadOpen)}
@@ -395,7 +411,8 @@ export function App(): React.ReactElement {
           ) : (
             <SceneViewport
               ref={viewportRef}
-               entries={sceneEntries}
+              insets={insets}
+              entries={sceneEntries}
               visibility={state.visibility}
               selectedId={state.selectedId}
               explode={state.explode}
@@ -413,18 +430,20 @@ export function App(): React.ReactElement {
                   ? null
                   : (state.lastResult?.drop_simulation ?? null)
               }
+              populationResult={
+                state.stale || state.playbackDismissed
+                  ? null
+                  : (state.lastResult?.population ?? null)
+              }
               renderMode={state.renderMode}
               feaResult={state.lastResult?.fea ?? null}
               onDropEnded={() => viewportRef.current?.setDropPlayback?.(false)}
               onPlaybackStateChange={(playing) => dispatch({ type: 'SET_DROP_PLAYING', playing })}
+              onLiveDropData={setLiveDropData}
               onPick={(id) => {
                 dispatch({ type: 'SELECT', id });
-                // Clicking an object in the viewport is an explicit request to
-                // inspect it; open the inspector drawer instead of silently
-                // selecting and leaving it hidden.
-                if (id !== null) {
-                  dispatch({ type: 'SET_INSPECTOR_OPEN', open: true });
-                }
+                // Clicking an object opens the inspector; clicking empty space closes it.
+                dispatch({ type: 'SET_INSPECTOR_OPEN', open: id !== null });
               }}
               onStats={setStats}
               onWebGLUnsupported={(reason) =>
@@ -433,18 +452,30 @@ export function App(): React.ReactElement {
             />
           )}
         </main>
-        <aside
-          className={`drawer drawer--inspector${state.inspectorOpen ? ' is-open' : ''}`}
-          aria-label="Inspector"
-        >
-          <InspectorPanel />
-        </aside>
-        <div className={`results-rail-dock${resultsOpen ? ' is-open' : ''}`}>
-          <ResultsRail
-            open={resultsOpen}
-            onToggleOpen={() => setResultsOpen((open) => !open)}
-          />
-        </div>
+        {state.classifyModalOpen ? (
+          <aside
+            className="drawer drawer--ai-review is-open"
+            aria-label="AI Component Classification"
+          >
+            <AiClassifyModal />
+          </aside>
+        ) : (
+          <aside
+            className={`drawer drawer--inspector${state.inspectorOpen && state.selectedId !== null ? ' is-open' : ''}`}
+            aria-label="Inspector"
+          >
+            <InspectorPanel />
+          </aside>
+        )}
+        {!showGuideCard ? (
+          <div className={`results-rail-dock${resultsOpen ? ' is-open' : ''}`}>
+            <ResultsRail
+              open={resultsOpen}
+              onToggleOpen={() => setResultsOpen((open) => !open)}
+              liveDropData={liveDropData}
+            />
+          </div>
+        ) : null}
       </div>
       {state.controlOpen ? (
         <MissionControl

@@ -1140,6 +1140,7 @@ describe('mission control store actions and selectors', () => {
       sample_count: 10000,
       profile: 'esports_fps',
       lifespan_days: 730,
+      contact_stiffness_n_per_m: 1e5,
     });
     expect(state.draft?.drop_simulation).toMatchObject({
       test: 'drop',
@@ -1169,6 +1170,7 @@ describe('mission control store actions and selectors', () => {
       sample_count: 10000,
       profile: 'esports_fps',
       lifespan_days: 730,
+      contact_stiffness_n_per_m: 1e5,
       worst_case: {
         wall_thickness: 'min',
         shell_modulus: 'min',

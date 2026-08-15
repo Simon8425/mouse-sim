@@ -6,13 +6,16 @@ import {
   type RenderStats,
   type ShaderPrecision,
 } from './sceneRuntime';
+import type { LiveBodyState } from './rapierDropSim';
 import type { CameraPreset } from './camera';
 import type { QualityTier } from './materialPalette';
 import type { OverlaySpec } from './overlays';
 import type { ObjectSceneEntry } from './geometryFactory';
-import type { DropSimulationDrop, DropSimulationResult, FeaResult, RenderMode } from '../api/contracts';
+import type { DropSimulationDrop, DropSimulationResult, FeaResult, RenderMode, PopulationResult } from '../api/contracts';
 import { FeaHud } from '../components/FeaHud';
 import { DropPhysicsDebug } from '../components/DropPhysicsDebug';
+import { PopulationFleetHud } from '../components/PopulationFleetHud';
+import type { FleetUnitData } from './populationFleetScene';
 
 /**
  * Resolve the drop active at a playback time.
@@ -37,6 +40,20 @@ export interface SceneViewportHandle {
   fit: () => void;
   preset: (name: CameraPreset) => void;
   setDropPlayback: (playing: boolean) => void;
+  /** Seek live drop playback to an absolute time (seconds). */
+  seekDropTime: (t: number) => void;
+}
+
+export interface LiveDropData {
+  activeDropIndex: number;
+  totalDrops: number;
+  dropTime: number;
+  activeDrop: DropSimulationDrop | null;
+  liveFrame: LiveBodyState | null;
+  speedMps: number;
+  kineticEnergyJ: number;
+  isPlaying: boolean;
+  status: 'free_fall' | 'impact' | 'settled' | 'idle';
 }
 
 export interface SceneViewportProps {
@@ -48,13 +65,16 @@ export interface SceneViewportProps {
   quality: QualityTier;
   overlays: OverlaySpec | null;
   dropSimulation?: DropSimulationResult | null;
+  populationResult?: PopulationResult | null;
   renderMode?: RenderMode;
   feaResult?: FeaResult | null;
+  insets?: { left?: number; right?: number; top?: number; bottom?: number };
   onPick: (id: string | null) => void;
   onDoublePick?: (id: string | null) => void;
   onStats?: (stats: RenderStats) => void;
   onDropEnded?: () => void;
   onPlaybackStateChange?: (playing: boolean) => void;
+  onLiveDropData?: (data: LiveDropData | null) => void;
   onWebGLUnsupported?: (reason: string) => void;
 }
 
@@ -80,24 +100,24 @@ const DropPlaybackButtons = React.memo(function DropPlaybackButtons({
   onRestart: () => void;
 }) {
   return (
-    <>
+    <div className="viewport-toolbar__group" role="group" aria-label="Playback actions">
       <button
         type="button"
-        className="btn btn--sm"
+        className="btn"
         aria-label={playing ? 'Pause drop simulation' : 'Play drop simulation'}
         onClick={onTogglePlay}
       >
-        {playing ? 'PAUSE' : 'PLAY'}
+        {playing ? 'Pause' : 'Play'}
       </button>
       <button
         type="button"
-        className="btn btn--sm"
+        className="btn"
         aria-label="Restart drop simulation"
         onClick={onRestart}
       >
-        RESTART
+        Restart
       </button>
-    </>
+    </div>
   );
 });
 
@@ -291,6 +311,12 @@ export const SceneViewport = React.forwardRef<
 
   const [dropPlaying, setDropPlaying] = React.useState(false);
   const [dropTime, setDropTime] = React.useState(0);
+  const [liveDropIndex, setLiveDropIndex] = React.useState(0);
+  const [playbackSpeed, setPlaybackSpeed] = React.useState(1.0);
+  const [liveFrame, setLiveFrame] = React.useState<LiveBodyState | null>(null);
+
+  const { onLiveDropData, dropSimulation } = props;
+
   // The status interval only needs to run while playback is active: the
   // runtime's drop clock is frozen whenever the simulation is paused or
   // finished, so polling it every 100 ms would otherwise keep a timer (and
@@ -301,17 +327,56 @@ export const SceneViewport = React.forwardRef<
   }, [dropPlaying, props]);
 
   React.useEffect(() => {
-    if (!props.dropSimulation || !dropPlaying) return;
+    if (!props.dropSimulation) return;
     const interval = window.setInterval(() => {
       setDropTime(runtimeRef.current?.getDropTime() ?? 0);
-    }, 100);
+      setLiveDropIndex(runtimeRef.current?.getLiveDropIndex() ?? 0);
+      setLiveFrame(runtimeRef.current?.getLiveFrame() ?? null);
+    }, 50);
     return () => window.clearInterval(interval);
-  }, [props.dropSimulation, dropPlaying]);
+  }, [props.dropSimulation]);
 
-  const dropSimulation = props.dropSimulation;
   const activeDrop = dropSimulation
-    ? resolveActiveDrop(dropSimulation.drops, dropTime)
+    ? (dropSimulation.drops[liveDropIndex] ?? resolveActiveDrop(dropSimulation.drops, dropTime))
     : null;
+
+  // Broadcast live frame / telemetry to listeners (e.g. ResultsRail)
+  React.useEffect(() => {
+    if (!dropSimulation) {
+      onLiveDropData?.(null);
+      return;
+    }
+    const mass = dropSimulation.model?.mass_kg ?? 0.06;
+    let speedMps = 0;
+    if (liveFrame?.linvel) {
+      const [vx, vy, vz] = liveFrame.linvel;
+      speedMps = Math.sqrt(vx * vx + vy * vy + vz * vz);
+    } else if (activeDrop) {
+      speedMps = activeDrop.peak_impact_speed_m_s;
+    }
+    const ke = 0.5 * mass * speedMps * speedMps;
+    let status: LiveDropData['status'] = 'idle';
+    if (dropPlaying) {
+      if (speedMps < 0.05 && liveFrame?.position && liveFrame.position[2] < 0.02) {
+        status = 'settled';
+      } else if (liveFrame?.position && liveFrame.position[2] < 0.06 && speedMps > 0.4) {
+        status = 'impact';
+      } else {
+        status = 'free_fall';
+      }
+    }
+    onLiveDropData?.({
+      activeDropIndex: activeDrop?.index ?? 0,
+      totalDrops: dropSimulation.drops.length,
+      dropTime,
+      activeDrop,
+      liveFrame,
+      speedMps,
+      kineticEnergyJ: ke,
+      isPlaying: dropPlaying,
+      status,
+    });
+  }, [dropSimulation, dropPlaying, dropTime, liveFrame, activeDrop, onLiveDropData]);
 
   const handleTogglePlay = React.useCallback(() => {
     const next = !dropPlaying;
@@ -325,6 +390,11 @@ export const SceneViewport = React.forwardRef<
     setDropPlaying(true);
     setDropTime(0);
     runtimeRef.current?.restartDropPlayback();
+  }, []);
+
+  const handleSpeedChange = React.useCallback((speed: number) => {
+    setPlaybackSpeed(speed);
+    runtimeRef.current?.setPlaybackSpeed(speed);
   }, []);
 
   React.useEffect(() => {
@@ -351,9 +421,30 @@ export const SceneViewport = React.forwardRef<
     runtimeRef.current?.setRenderMode(props.renderMode ?? 'default');
   }, [props.renderMode]);
 
+  // Population Fleet 3D State
+  const [fleetPlaying, setFleetPlaying] = React.useState(true);
+  const [selectedFleetUnit, setSelectedFleetUnit] = React.useState<FleetUnitData | null>(null);
+
+  React.useEffect(() => {
+    if (props.populationResult) {
+      setFleetPlaying(true);
+      setSelectedFleetUnit(null);
+    }
+  }, [props.populationResult]);
+
+  React.useEffect(() => {
+    runtimeRef.current?.setPopulationFleet(props.populationResult ?? null, true);
+  }, [props.populationResult]);
+
   React.useEffect(() => {
     runtimeRef.current?.setFeaResult(props.feaResult ?? null);
   }, [props.feaResult]);
+
+  React.useEffect(() => {
+    if (props.insets) {
+      runtimeRef.current?.setInsets(props.insets);
+    }
+  }, [props.insets]);
 
   React.useImperativeHandle(
     ref,
@@ -367,6 +458,9 @@ export const SceneViewport = React.forwardRef<
       setDropPlayback(playing: boolean) {
         runtimeRef.current?.setDropPlayback(playing);
       },
+      seekDropTime(t: number) {
+        runtimeRef.current?.seekDropTime(t);
+      },
     }),
     [],
   );
@@ -379,25 +473,56 @@ export const SceneViewport = React.forwardRef<
     >
       <canvas ref={canvasRef} aria-hidden="true" />
       <FeaHud mode={props.renderMode ?? 'default'} fea={props.feaResult ?? null} />
-      <DropPhysicsDebug simulation={props.dropSimulation ?? null} dropTime={dropTime} />
-      {dropSimulation ? (
-        <div className="drop-sim-controls" role="group" aria-label="Drop simulation playback">
+      {!props.populationResult ? (
+        <DropPhysicsDebug simulation={props.dropSimulation ?? null} dropTime={dropTime} liveFrame={liveFrame} />
+      ) : null}
+      
+      {props.populationResult ? (
+        <PopulationFleetHud
+          population={props.populationResult}
+          playing={fleetPlaying}
+          onTogglePlay={() => {
+            const next = !fleetPlaying;
+            setFleetPlaying(next);
+            runtimeRef.current?.setFleetPlayback(next);
+          }}
+          selectedUnit={selectedFleetUnit}
+          onCloseSelectedUnit={() => {
+            setSelectedFleetUnit(null);
+            runtimeRef.current?.highlightFleetUnit(null);
+          }}
+        />
+      ) : null}
+
+      {dropSimulation && !props.populationResult ? (
+        <div className="drop-sim-controls viewport-toolbar" role="toolbar" aria-label="Drop simulation playback">
           <DropPlaybackButtons
             playing={dropPlaying}
             onTogglePlay={handleTogglePlay}
             onRestart={handleRestart}
           />
-          <span className="drop-sim-controls__status">
-            {activeDrop ? `Drop ${activeDrop.index + 1}/${dropSimulation.drops.length}` : 'Simulation'}
-            {' · '}
-            {dropTime.toFixed(2)}s
-            {activeDrop ? (
-              <>
-                {' · '}
-                {activeDrop.peak_impact_speed_m_s.toFixed(2)} m/s
-              </>
-            ) : null}
-          </span>
+          <div className="viewport-toolbar__divider" aria-hidden="true" />
+          <div className="viewport-toolbar__group" role="group" aria-label="Playback speed">
+            {[1, 5, 20].map((spd) => (
+              <button
+                key={spd}
+                type="button"
+                className={`btn${playbackSpeed === spd ? ' is-active' : ''}`}
+                onClick={() => handleSpeedChange(spd)}
+                aria-label={`Set speed to ${spd}x`}
+              >
+                {spd}x
+              </button>
+            ))}
+          </div>
+          <div className="viewport-toolbar__divider" aria-hidden="true" />
+          <div className="viewport-toolbar__group" role="group" aria-label="Simulation time">
+            <span className="drop-sim-controls__status">
+              {activeDrop ? `Drop ${activeDrop.index + 1}/${dropSimulation.drops.length}` : 'Simulation'}
+              {' · '}
+              {dropTime.toFixed(2)}s
+            </span>
+          </div>
         </div>
       ) : null}
     </div>

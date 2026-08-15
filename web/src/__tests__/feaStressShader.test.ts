@@ -396,7 +396,7 @@ describe('createFeaUniforms / updateFeaUniforms (no per-frame allocation)', () =
     expect(shader.fragmentShader).toContain('uniform float uPlateA;');
     expect(shader.fragmentShader).toContain('uniform float uPlateB;');
     expect(shader.fragmentShader).toContain('uniform float uPlatePeakDamage;');
-    expect(shader.fragmentShader).toContain('clamp( max( vFeaDamage, max( feaProcedural, feaPlate ) ), 0.0, 1.0 )');
+    expect(shader.fragmentShader).toContain('clamp( max( vFeaDamage * feaProg, max( feaProcedural, feaPlate ) ), 0.0, 1.0 )');
     expect(shader.fragmentShader).toContain('uniform vec3 uImpactPointModel;');
     expect(shader.fragmentShader).toContain('uniform float uFalloffRadius;');
     expect(shader.fragmentShader).toContain('uniform float uPeakDamage;');

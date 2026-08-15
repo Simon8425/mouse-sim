@@ -7,6 +7,7 @@ import type {
   WebAnalysisRequest,
   WebAnalysisResponse,
   AssetPartsResponse,
+  AiClassification,
 } from './contracts';
 import { isRecord } from './contracts';
 import {
@@ -142,6 +143,44 @@ export class ApiClient {
       signal,
     });
   }
+
+  async startClassify(
+    assetId: string,
+    partIds?: string[],
+    options?: { apiKey?: string; model?: string; provider?: string; endpoint?: string },
+    signal?: AbortSignal,
+  ): Promise<ClassifyJob> {
+    return this.request<ClassifyJob>('/api/classify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        asset_id: assetId,
+        part_ids: partIds ?? null,
+        api_key: options?.apiKey || undefined,
+        model: options?.model || undefined,
+        provider: options?.provider || undefined,
+        endpoint: options?.endpoint || undefined,
+      }),
+      signal,
+    });
+  }
+
+  async getClassifyJob(jobId: string, signal?: AbortSignal): Promise<ClassifyJob> {
+    return this.request<ClassifyJob>(`/api/classify/jobs/${encodeURIComponent(jobId)}`, {
+      method: 'GET',
+      signal,
+    });
+  }
+}
+
+export interface ClassifyJob {
+  schema_id?: string;
+  job_id: string;
+  status: 'queued' | 'running' | 'done' | 'error';
+  total: number;
+  done: number;
+  results: AiClassification[];
+  error?: string | null;
 }
 
 export function createClient(baseUrl?: string): ApiClient {

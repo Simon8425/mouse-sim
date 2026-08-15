@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import threading
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -68,6 +69,12 @@ _STEP_ASSET_REGISTRY_LOCK = threading.Lock()
 _STEP_ASSET_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _STEP_ASSET_ROUTE_RE = re.compile(r"^/api/geometry/assets/([0-9a-f]{64})\.glb$")
 _STEP_ASSET_PARTS_ROUTE_RE = re.compile(r"^/api/geometry/assets/([0-9a-f]{64})\.parts\.json$")
+
+# AI classification job registry (see ai_classify_jobs below).
+_CLASSIFY_JOBS = {}
+_CLASSIFY_JOBS_LOCK = threading.Lock()
+_CLASSIFY_MAX_JOBS = 64
+_CLASSIFY_JOB_ID_RE = re.compile(r"^cj-[0-9a-f]{16}$")
 # Bound the in-memory asset registry; the files remain on disk and re-upload
 # re-registers.  Eviction only drops the registry entry.
 _STEP_ASSET_REGISTRY_CAP = 256
@@ -296,6 +303,17 @@ def _load_registered_asset_objects(asset_id):
     """Load normalized STEP part geometry for a server-side analysis reference."""
     with _STEP_ASSET_REGISTRY_LOCK:
         parts_path = _STEP_ASSET_PARTS_REGISTRY.get(asset_id)
+    if parts_path is None or not parts_path.is_file():
+        candidates = [
+            Path.cwd() / ".web-cache" / "step-assets" / "{}.parts.json".format(asset_id),
+            Path.cwd() / ".web-cache" / "{}.parts.json".format(asset_id),
+        ]
+        for cand in candidates:
+            if cand.is_file():
+                parts_path = cand
+                with _STEP_ASSET_REGISTRY_LOCK:
+                    _STEP_ASSET_PARTS_REGISTRY[asset_id] = cand
+                break
     if parts_path is None:
         return None
     try:
@@ -312,9 +330,154 @@ def _load_registered_asset_objects(asset_id):
             continue
         object_id = str(part.get("id", "")).strip()
         geometry = part.get("geometry")
+        name = part.get("name")
         if object_id and isinstance(geometry, dict):
-            objects.append({"id": object_id, "geometry": geometry})
+            objects.append({"id": object_id, "name": name, "geometry": geometry})
     return objects or None
+
+
+_CLASSIFY_SCHEMA_ID = "gms.ai-classify-request/1"
+
+
+def _classify_job_snapshot(job_id):
+    with _CLASSIFY_JOBS_LOCK:
+        job = _CLASSIFY_JOBS.get(job_id)
+        if job is None:
+            return None
+        return dict(job)
+
+
+def _classify_job_worker(job_id, asset_id, part_ids=None, api_key=None, model=None, provider=None, endpoint=None):
+    from . import ai_classify
+    try:
+        asset_objects = _load_registered_asset_objects(asset_id)
+        if asset_objects is None:
+            raise ValueError("Asset geometry is unavailable on disk")
+        if part_ids:
+            by_id = {str(item["id"]): item for item in asset_objects}
+            selected = []
+            for part_id in part_ids:
+                item = by_id.get(str(part_id))
+                if item is not None:
+                    selected.append(item)
+        else:
+            selected = asset_objects
+        cache = ai_classify.ClassificationCache()
+        parts_payload = []
+        for item in selected:
+            parts_payload.append(
+                {
+                    "object_id": str(item.get("id")),
+                    "name": item.get("name"),
+                    "geometry": item.get("geometry") or {},
+                    "rule": {"component_type": "unresolved", "confidence": 0.0},
+                }
+            )
+        total = len(parts_payload)
+        with _CLASSIFY_JOBS_LOCK:
+            job = _CLASSIFY_JOBS.get(job_id)
+            if job is not None:
+                job["total"] = total
+                job["done"] = 0
+                job["status"] = "running"
+
+        def _on_progress(done_count, total_count):
+            with _CLASSIFY_JOBS_LOCK:
+                j = _CLASSIFY_JOBS.get(job_id)
+                if j is not None:
+                    j["done"] = done_count
+                    j["total"] = total_count
+
+        results = ai_classify.classify_parts(
+            parts_payload,
+            use_cache=True,
+            cache=cache,
+            api_key_value=api_key,
+            model=model,
+            provider=provider,
+            endpoint=endpoint,
+            on_progress=_on_progress,
+        )
+        with _CLASSIFY_JOBS_LOCK:
+            job = _CLASSIFY_JOBS.get(job_id)
+            if job is None:
+                return
+            job["done"] = len(results)
+            job["status"] = "done"
+            job["results"] = results
+    except Exception as exc:  # noqa: BLE001 - report job failure to the client
+        with _CLASSIFY_JOBS_LOCK:
+            job = _CLASSIFY_JOBS.get(job_id)
+            if job is None:
+                return
+            job["status"] = "error"
+            job["error"] = str(exc)
+
+
+def handle_classify_start(config, payload):
+    """Start an AI classification job for a registered STEP asset."""
+    if not isinstance(payload, dict):
+        return make_web_error(422, "E_INVALID_ENVELOPE", "classify payload must be an object")
+    asset_id = payload.get("asset_id")
+    if not isinstance(asset_id, str) or not _STEP_ASSET_ID_RE.fullmatch(asset_id):
+        return make_web_error(422, "E_INVALID_ASSET", "asset_id is not a registered STEP asset")
+    with _STEP_ASSET_REGISTRY_LOCK:
+        parts_path = _STEP_ASSET_PARTS_REGISTRY.get(asset_id)
+    if parts_path is None:
+        return make_web_error(422, "E_ASSET_NOT_FOUND", "registered STEP geometry is unavailable")
+    raw_ids = payload.get("part_ids")
+    part_ids = None
+    if raw_ids is not None:
+        if not isinstance(raw_ids, list) or not all(isinstance(item, str) for item in raw_ids):
+            return make_web_error(422, "E_INVALID_PART_IDS", "part_ids must be a list of strings")
+        part_ids = [str(item).strip() for item in raw_ids if str(item).strip()]
+    
+    api_key_val = str(payload.get("api_key")).strip() if payload.get("api_key") else None
+    model_val = str(payload.get("model")).strip() if payload.get("model") else None
+    provider_val = str(payload.get("provider")).strip() if payload.get("provider") else None
+    endpoint_val = str(payload.get("endpoint")).strip() if payload.get("endpoint") else None
+
+    job_id = "cj-" + os.urandom(8).hex()
+    with _CLASSIFY_JOBS_LOCK:
+        while len(_CLASSIFY_JOBS) >= _CLASSIFY_MAX_JOBS:
+            oldest = next(iter(_CLASSIFY_JOBS))
+            _CLASSIFY_JOBS.pop(oldest, None)
+        _CLASSIFY_JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "asset_id": asset_id,
+            "total": 0,
+            "done": 0,
+            "results": [],
+            "error": None,
+            "created": time.time(),
+        }
+    thread = threading.Thread(
+        target=_classify_job_worker,
+        args=(job_id, asset_id, part_ids, api_key_val, model_val, provider_val, endpoint_val),
+        name="ai-classify-{}".format(job_id),
+        daemon=True,
+    )
+    thread.start()
+    return (202, {"schema_id": _CLASSIFY_SCHEMA_ID, "job_id": job_id, "status": "queued"})
+
+
+def handle_classify_status(job_id):
+    if not _CLASSIFY_JOB_ID_RE.fullmatch(str(job_id or "")):
+        return make_web_error(404, "E_JOB_NOT_FOUND", "classify job not found")
+    snapshot = _classify_job_snapshot(str(job_id))
+    if snapshot is None:
+        return make_web_error(404, "E_JOB_NOT_FOUND", "classify job not found")
+    body = {
+        "schema_id": _CLASSIFY_SCHEMA_ID,
+        "job_id": snapshot["job_id"],
+        "status": snapshot.get("status", "queued"),
+        "total": snapshot.get("total", 0),
+        "done": snapshot.get("done", 0),
+        "results": snapshot.get("results", []),
+        "error": snapshot.get("error"),
+    }
+    return (200, body)
 
 
 def _quantity_si(properties, field_name):
@@ -863,6 +1026,10 @@ class WebApiHandler(BaseHTTPRequestHandler):
             return handle_baseline(self.config)
         if path == "/api/materials":
             return handle_materials(self.config)
+        prefix = "/api/classify/jobs/"
+        if path.startswith(prefix):
+            job_id = path[len(prefix):]
+            return handle_classify_status(job_id)
         return make_web_error(404, "E_NOT_FOUND", "unknown API path {!r}".format(path))
 
     def _serve_registered_asset(self, path, head_only=False):
@@ -1024,6 +1191,17 @@ class WebApiHandler(BaseHTTPRequestHandler):
                 status, payload = self._post_normalize(config)
             elif path == "/api/analyze":
                 status, payload = self._post_analyze(config)
+            elif path == "/api/classify":
+                content_type = self.headers.get("Content-Type") or ""
+                media_type = content_type.split(";", 1)[0].strip().lower()
+                if media_type not in _ANALYZE_MEDIA_TYPES:
+                    status, payload = make_web_error(
+                        415, "E_UNSUPPORTED_MEDIA_TYPE", "unsupported Content-Type {!r}".format(content_type)
+                    )
+                else:
+                    body = self._read_body(config.max_json_bytes)
+                    data = parse_json_object(body)
+                    status, payload = handle_classify_start(config, data)
             else:
                 status, payload = make_web_error(
                     404, "E_NOT_FOUND", "unknown API path {!r}".format(path)

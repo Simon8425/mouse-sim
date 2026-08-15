@@ -55,6 +55,52 @@ NAME_SYNONYMS = {
     ),
 }
 
+#: Canonical component-type taxonomy shared with the web frontend
+#: (``COMPONENT_ROLES`` in web/src/state/projectStore.ts) and the AI
+#: classifier (``mouse_sim/ai_classify.py``).  ``unresolved`` is the
+#: abstention label used when no classifier can decide.
+CANONICAL_COMPONENT_TYPES = frozenset(
+    (
+        "top_shell",
+        "bottom_shell",
+        "main_button",
+        "side_button",
+        "scroll_wheel",
+        "encoder",
+        "pcb",
+        "sensor",
+        "foot_pad",
+        "battery",
+        "internal_structure",
+        "screw_boss",
+        "unresolved",
+        "compound",
+    )
+)
+
+#: Legacy NAME_SYNONYMS keys -> canonical role names.  The conservative
+#: classifier still emits legacy keys internally (they also feed density and
+#: validation); consumers normalize via :func:`canonical_component_type`.
+_CANONICAL_ALIASES = {
+    "shell_top": "top_shell",
+    "shell_bottom": "bottom_shell",
+    "wheel": "scroll_wheel",
+    "skate": "foot_pad",
+    "screw": "screw_boss",
+    "button": "main_button",
+}
+
+
+def canonical_component_type(component_type):
+    """Map any legacy/alias component type onto the canonical taxonomy.
+
+    Unknown labels return ``"unresolved"`` so consumers always receive a
+    value inside :data:`CANONICAL_COMPONENT_TYPES`.
+    """
+    if component_type in CANONICAL_COMPONENT_TYPES:
+        return component_type
+    return _CANONICAL_ALIASES.get(component_type, "unresolved")
+
 _SYNONYM_TO_TYPE = {
     synonym: component_type
     for component_type, synonyms in NAME_SYNONYMS.items()
@@ -329,4 +375,10 @@ def classify_objects(objects):
     return ClassificationResult(tuple(_classify_one(identifier, value) for identifier, value in _entries(objects)))
 
 
-__all__ = ["ObjectClassification", "ClassificationResult", "classify_objects"]
+__all__ = [
+    "ObjectClassification",
+    "ClassificationResult",
+    "classify_objects",
+    "CANONICAL_COMPONENT_TYPES",
+    "canonical_component_type",
+]

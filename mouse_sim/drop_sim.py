@@ -342,6 +342,20 @@ def validate_config(config):
             raise DropSimulationError("drop_simulation.seed must be an integer")
         if seed < 0 or seed > 0xFFFFFFFF:
             raise DropSimulationError("drop_simulation.seed must be between 0 and 2^32-1")
+    # Inter-drop pause (the playback gap between consecutive drops).  The
+    # pipeline previously read this key from the VALIDATED config, which
+    # never carried it — the user setting was silently ignored and every
+    # run used the 0.5 s default.  ``drop_interval_s`` is accepted as a
+    # legacy alias.
+    pause = config.get("pause_between_drops_s", config.get("drop_interval_s", 0.50))
+    try:
+        pause = float(pause)
+    except (TypeError, ValueError):
+        raise DropSimulationError("drop_simulation.pause_between_drops_s must be numeric")
+    if not math.isfinite(pause) or pause < 0.05 or pause > 10.0:
+        raise DropSimulationError(
+            "drop_simulation.pause_between_drops_s must be between 0.05 and 10.0 s"
+        )
     validated = {
         "test": test,
         "height_m": height_m,
@@ -352,6 +366,7 @@ def validate_config(config):
         "mass_kg": mass_kg,
         "unit_seed": unit_seed,
         "seed": seed,
+        "pause_between_drops_s": pause,
     }
     if explicit_quaternion is not None:
         validated["orientation_quaternion_wxyz"] = explicit_quaternion
@@ -509,12 +524,13 @@ def _orientation_quaternion(mode, seed):
 
     u1 = next_unit()
     u2 = next_unit()
-    z = 2.0 * u1 - 1.0
-    angle = 2.0 * math.pi * u2
-    half = 0.5 * angle
-    x = math.sqrt(max(0.0, 1.0 - z * z)) * math.cos(half)
-    y = math.sqrt(max(0.0, 1.0 - z * z)) * math.sin(half)
-    return _normalize_quaternion((z, x, y, 0.0))
+    u3 = next_unit()
+    # Uniform Haar measure on SO(3) (Shoemake / Marsaglia formula)
+    q0 = math.sqrt(max(0.0, 1.0 - u1)) * math.sin(2.0 * math.pi * u2)
+    q1 = math.sqrt(max(0.0, 1.0 - u1)) * math.cos(2.0 * math.pi * u2)
+    q2 = math.sqrt(u1) * math.sin(2.0 * math.pi * u3)
+    q3 = math.sqrt(u1) * math.cos(2.0 * math.pi * u3)
+    return _normalize_quaternion((q0, q1, q2, q3))
 
 
 def _drop_variation(
@@ -2476,6 +2492,17 @@ def _simulate_drop(
     # reported settle time are part of the CURRENT drop's record, while
     # ``motion_stop_s`` is what the multi-drop loop uses to pace the next
     # drop (motion stops -> 0.5 s pause -> next drop starts).
+    #
+    # Degenerate fallback: if EVERY consecutive sample pair is identical
+    # (a fully frozen trajectory — the quiet stand-down can capture the
+    # rest pose at the very first sample), the loop below never finds a
+    # moving sample and motion_stop would be trajectory[0][0] == 0.0,
+    # making the multi-drop loop advance the timeline by only 0.5 s and
+    # OVERLAP this drop with the next one (the "drop spawns on the ground"
+    # playback bug).  A real drop always has release-to-ground motion, so
+    # a fully frozen trajectory can only be an artifact; fall back to the
+    # recorded settle time (the full drop duration) so the timeline can
+    # never collapse.
     motion_stop = trajectory[0][0] if trajectory else 0.0
     for index in range(len(trajectory) - 1, 0, -1):
         previous = trajectory[index - 1]
@@ -2491,6 +2518,9 @@ def _simulate_drop(
         ):
             motion_stop = current[0]
             break
+    else:
+        # No moving sample pair found (fully frozen trajectory).
+        motion_stop = settled
     return {
         "trajectory": trajectory,
         "impacts": impacts,
@@ -2525,6 +2555,7 @@ def simulate(
     inertia_scale=1.0,
     friction_scale=1.0,
     restitution_scale=1.0,
+    pause_between_drops_s=None,
 ):
     """Run a deterministic multi-drop simulation.
 
@@ -2563,6 +2594,9 @@ def simulate(
             "mass_kg": mass_kg,
             "unit_seed": unit_seed,
             "seed": seed,
+            "pause_between_drops_s": (
+                pause_between_drops_s if pause_between_drops_s is not None else 0.50
+            ),
         }
     )
     if mass_kg is None or not math.isfinite(mass_kg) or mass_kg <= 0.0:
@@ -2687,7 +2721,7 @@ def simulate(
     trajectory = []
     all_impacts = []
     all_checks = []
-    drop_interval_s = 0.50
+    drop_interval_s = float(config.get("pause_between_drops_s", config.get("drop_interval_s", 0.50)))
     t_offset = 0.0
     for drop_index in range(config["drop_count"]):
         explicit_quaternion = config.get("orientation_quaternion_wxyz")
@@ -2838,7 +2872,14 @@ def simulate(
         motion_stop = drop_result.get("motion_stop_s")
         if motion_stop is None:
             motion_stop = settled
-        t_offset += motion_stop + drop_interval_s
+        # Timeline floor: the next drop can never start before the previous
+        # drop's own fall has had time to play.  The floor is the free-fall
+        # time from the configured height (sqrt(2 h / g)) — a physical
+        # minimum for ANY drop — so even a pathological (near-zero)
+        # motion_stop can never collapse the timeline and overlap drops
+        # (the "drop spawns on the ground" playback bug).
+        fall_floor = math.sqrt(2.0 * config["height_m"] / gravity)
+        t_offset += max(motion_stop, fall_floor) + drop_interval_s
 
     peak_overall = max(all_impacts, key=lambda item: item["impact_speed_m_s"]) if all_impacts else None
     model = {

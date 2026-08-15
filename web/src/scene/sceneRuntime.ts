@@ -6,12 +6,20 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { OutlinePass } from 'three/examples/jsm/postprocessing/OutlinePass.js';
 import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 
-import type { Vec3, DropSimulationResult, DropTrajectorySample, FeaResult, RenderMode } from '../api/contracts';
+import type { Vec3, DropSimulationResult, DropTrajectorySample, FeaResult, RenderMode, PopulationResult } from '../api/contracts';
+import type { TelemetryEvent, TelemetryFrame, TelemetryLogSession } from '../api/telemetryDebuggerContracts';
+import { TelemetryCollector, type LiveTelemetryRecord } from '../lib/telemetryCollector';
+import { buildTelemetrySession } from '../lib/telemetrySessionBuilder';
+import { createPopulationFleet, type PopulationFleetManager, type FleetUnitData } from './populationFleetScene';
+import {
+  buildRapierDropSim,
+  type RapierDropSim,
+  type LiveBodyState,
+} from './rapierDropSim';
 import {
   MaterialPalette,
   FeaMaterialCache,
   type QualityTier,
-  SELECTION_ACCENT,
 } from './materialPalette';
 import {
   createFeaUniforms,
@@ -53,6 +61,7 @@ export interface SceneRuntimeOptions {
   onDoublePick?: (id: string | null) => void;
   onStats?: (stats: RenderStats) => void;
   onDropEnded?: () => void;
+  onFleetUnitPick?: (unit: FleetUnitData | null) => void;
 }
 
 export type ShaderPrecision = 'highp' | 'mediump' | 'lowp';
@@ -126,12 +135,32 @@ export interface SceneRuntime {
   setOverlays: (overlays: OverlaySpec | null) => void;
   setDropSimulation: (simulation: DropSimulationResult | null) => void;
   setDropPlayback: (playing: boolean) => void;
+  setPlaybackSpeed: (speed: number) => void;
   restartDropPlayback: () => void;
   getDropTime: () => number;
+  getLiveDropIndex: () => number;
+  /** Live physics frame (Rapier body state) when active, else null. */
+  getLiveFrame: () => LiveBodyState | null;
+  /** Seek live drop playback to an absolute time. */
+  seekDropTime: (target: number) => void;
+  /** Recorded telemetry frames (bounded ring). */
+  getTelemetryFrames: () => TelemetryFrame[];
+  /** Recorded telemetry events. */
+  getTelemetryEvents: () => TelemetryEvent[];
+  clearTelemetry: () => void;
+  /** Full debugger session (specs + frames) or null when idle. */
+  buildTelemetrySession: () => TelemetryLogSession | null;
   setRenderMode: (mode: RenderMode) => void;
   setFeaResult: (fea: FeaResult | null) => void;
+  setPopulationFleet: (population: PopulationResult | null, fleetMode: boolean) => void;
+  setFleetPlayback: (playing: boolean) => void;
+  restartFleetPlayback: () => void;
+  getFleetTime: () => number;
+  pickFleetUnit: (raycaster: THREE.Raycaster) => FleetUnitData | null;
+  highlightFleetUnit: (unitId: number | null) => void;
   fit: () => void;
   preset: (name: CameraPreset) => void;
+  setInsets: (insets: { left?: number; right?: number; top?: number; bottom?: number }) => void;
   getStats: () => RenderStats;
   dispose: () => void;
 }
@@ -405,6 +434,24 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   controls.maxDistance = 20;
   controls.screenSpacePanning = true;
 
+  const handleContextLost = (event: Event) => {
+    event.preventDefault();
+    if (animationFrameId !== null) {
+      cancelAnimationFrame(animationFrameId);
+      animationFrameId = null;
+    }
+  };
+
+  const handleContextRestored = () => {
+    if (!disposed && animationFrameId === null) {
+      lastFrameTime = performance.now();
+      animationFrameId = requestAnimationFrame(renderLoop);
+    }
+  };
+
+  canvas.addEventListener('webglcontextlost', handleContextLost, false);
+  canvas.addEventListener('webglcontextrestored', handleContextRestored, false);
+
   // Lighting setup
   const keyLight = new THREE.DirectionalLight(0xffffff, 2.4);
   keyLight.position.set(0.5, -0.8, 1);
@@ -431,6 +478,10 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   const objectsGroup = new THREE.Group();
   objectsGroup.name = 'ObjectsGroup';
   scene.add(objectsGroup);
+
+  const selectionHighlightGroup = new THREE.Group();
+  selectionHighlightGroup.name = 'SelectionHighlightGroup';
+  scene.add(selectionHighlightGroup);
 
   let gridHelper: THREE.GridHelper | null = null;
   let groundMesh: THREE.Mesh | null = null;
@@ -472,10 +523,10 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       groundMesh = null;
     }
 
-    const size = Math.max(maxDimension * 4, 0.4);
+    const size = Math.max(maxDimension * 20, 3.5);
     floorSize = size;
     const gridColor = theme === 'dark' ? 0x2e2c25 : 0xd8d5cc;
-    gridHelper = new THREE.GridHelper(size, 64, gridColor, gridColor);
+    gridHelper = new THREE.GridHelper(size, 80, gridColor, gridColor);
     gridHelper.rotation.x = Math.PI / 2;
     gridHelper.position.set(
       (boundsUnion.min[0] + boundsUnion.max[0]) / 2,
@@ -486,7 +537,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     scene.add(gridHelper);
 
     if (quality !== 'low') {
-      const thickness = 0.02; // 2 cm solid 3D ground slab
+      const thickness = 0.04; // 4 cm solid 3D ground slab
       const slabGeom = new THREE.BoxGeometry(size * 2, size * 2, thickness);
       const props = getSurfaceMaterialProps(currentSurfaceMaterial, theme);
       const groundMat = new THREE.MeshStandardMaterial({
@@ -566,10 +617,11 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
         scene,
         camera,
       );
-      outlinePass.edgeStrength = 4;
-      outlinePass.edgeGlow = 0.15;
-      outlinePass.edgeThickness = 1.5;
-      outlinePass.visibleEdgeColor.setHex(SELECTION_ACCENT);
+      outlinePass.edgeStrength = 6.0;
+      outlinePass.edgeGlow = 0.35;
+      outlinePass.edgeThickness = 2.2;
+      outlinePass.visibleEdgeColor.setHex(0xffffff);
+      outlinePass.hiddenEdgeColor.setHex(0x0ea5e9);
       composer.addPass(outlinePass);
 
       const smaaPass = new SMAAPass(width, height);
@@ -594,7 +646,23 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   let currentDropSimulation: DropSimulationResult | null = null;
   let dropTime = 0;
   let dropPlaying = false;
+  let playbackSpeed = 1.0;
   let lastFrameTime: number | null = null;
+  // Live Rapier simulation (null = fall back to sample playback).
+  let rapierSim: RapierDropSim | null = null;
+  let rapierBuildGeneration = 0;
+  let rapierCurrentDrop = -1;
+  let liveDropIndex = 0;
+  let liveDropRestTime = 0;
+  let lastLiveState: LiveBodyState | null = null;
+  let populationFleet: PopulationFleetManager | null = null;
+  let isFleetMode = false;
+  let fleetTime = 0;
+  let fleetPlaying = false;
+
+  // Telemetry debugger: live collector fed by the Rapier tap.
+  let telemetryCollector: TelemetryCollector | null = null;
+  let telemetryUnsub: (() => void) | null = null;
 
   // FEA material mode state: the current render mode, the per-vertex damage
   // field from the last result, the decorated-material cache, and the set of
@@ -659,13 +727,10 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   const applyModeDecoration = (): void => {
     feaDecorated.length = 0;
     if (currentRenderMode === 'default' || !currentFeaResult?.computed) return;
-    // A zero damage field has nothing to visualize: keep the palette
-    // materials so the model can never be blanked by the white base.
-    if (feaFieldMaxDamage(currentFeaResult) <= 1e-9) return;
     const fea = currentFeaResult;
     // Continuous plate-layer peak: min(1, shell peak / yield) — the field
     // maximum the contour is normalized against.
-    const platePeakDamage =
+    const rawPeak =
       typeof fea.peak?.stress_pa === 'number' &&
       Number.isFinite(fea.peak.stress_pa) &&
       fea.peak.stress_pa > 0 &&
@@ -673,7 +738,8 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       Number.isFinite(fea.yield_stress_pa) &&
       fea.yield_stress_pa > 0
         ? Math.min(1, fea.peak.stress_pa / fea.yield_stress_pa)
-        : 0;
+        : feaFieldMaxDamage(fea);
+    const platePeakDamage = rawPeak > 0 ? rawPeak : 0.45;
     for (const outer of objectsGroup.children) {
       const objectId = outer.userData.objectId;
       if (typeof objectId !== 'string') continue;
@@ -705,12 +771,107 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
           applyFeaPlateField(mesh, fea);
         }
         const material = mesh.material as THREE.MeshStandardMaterial;
+        if (!mesh.userData.baseMaterial) {
+          mesh.userData.baseMaterial = material;
+        }
         const decorated = feaMaterialCache.get(material, mesh.geometry, uniforms);
         if (decorated !== material) mesh.material = decorated;
         feaDecorated.push({ material: decorated, uniforms });
       }
     }
   };
+
+  /**
+   * Feed one live physics frame into the telemetry collector (no-op when the
+   * debugger is not collecting).
+   */
+  const pushLiveTelemetry = (delta: number): void => {
+    if (!telemetryCollector || !lastLiveState) return;
+    const state = lastLiveState;
+    const record: LiveTelemetryRecord = {
+      t_s: dropTime,
+      position_m: [state.position[0], state.position[1], state.position[2]],
+      quaternion_xyzw: [state.quaternion[0], state.quaternion[1], state.quaternion[2], state.quaternion[3]],
+      velocity_m_s: [state.linvel[0], state.linvel[1], state.linvel[2]],
+      angular_velocity_rad_s: [state.angvel[0], state.angvel[1], state.angvel[2]],
+      in_contact_window: telemetryCollectorContactWindow(),
+      settled: liveDropRestTime > 0 || (liveDropIndex >= (currentDropSimulation?.drops.length ?? 0)),
+    };
+    telemetryCollector.push(record);
+    void delta;
+  };
+
+  /**
+   * Live Rapier playback scheduler: tracks body motion in 3D, allows natural
+   * bouncing, rotational damping, and rolling until the model comes to a complete
+   * rest on the floor. Once resting, waits the pause_between_drops setting (0.6s)
+   * before starting the next drop.
+   */
+  const stepRapierPlayback = (delta: number): void => {
+    if (!currentDropSimulation || !rapierSim) return;
+    const drops = currentDropSimulation.drops;
+    if (drops.length === 0) return;
+
+    if (liveDropIndex >= drops.length) {
+      lastLiveState = rapierSim.getState();
+      return;
+    }
+
+    const active = drops[liveDropIndex];
+    const model = currentDropSimulation.model;
+
+    // Reset at the start of a new drop
+    if (rapierCurrentDrop !== liveDropIndex) {
+      rapierSim.reset(active, model);
+      rapierCurrentDrop = liveDropIndex;
+      liveDropRestTime = 0;
+      lastLiveState = rapierSim.getState();
+      return;
+    }
+
+    // Step the physics simulation
+    lastLiveState = rapierSim.step(delta);
+    pushLiveTelemetry(delta);
+
+    // Follow the body axis & velocities: check if the model has stopped moving
+    const resting = rapierSim.isResting();
+    if (resting) {
+      liveDropRestTime += delta;
+      // Wait the pause between drops setting (0.6s) before advancing to the next drop
+      if (liveDropRestTime >= 0.6) {
+        if (liveDropIndex + 1 < drops.length) {
+          liveDropIndex += 1;
+          liveDropRestTime = 0;
+          rapierSim.reset(drops[liveDropIndex], model);
+          rapierCurrentDrop = liveDropIndex;
+          lastLiveState = rapierSim.getState();
+        } else {
+          // All drops finished
+          liveDropIndex = drops.length;
+          dropPlaying = false;
+          lastFrameTime = null;
+          opts.onDropEnded?.();
+        }
+      }
+    } else {
+      liveDropRestTime = 0;
+    }
+  };
+
+  /**
+   * True while the live body is inside the FEA impact window (used to flag
+   * contact in the telemetry stream). Mirrors the render-loop window logic.
+   */
+  const telemetryCollectorContactWindow = (): boolean => {
+    if (!currentFeaResult?.computed) return false;
+    const windowS = currentFeaResult.impact_window_s ?? 0.3;
+    const impactTime = currentDropSimulation?.impacts?.[0]?.t_s ?? (currentDropSimulation?.drops[0]?.end_s ?? 1) * 0.38;
+    return impactWindowProgress(dropTime, impactTime, windowS > 0 ? windowS : 0.3) > 0 && impactWindowProgress(dropTime, impactTime, windowS > 0 ? windowS : 0.3) < 1;
+  };
+
+  const scratchQuatA = new THREE.Quaternion();
+  const scratchQuatB = new THREE.Quaternion();
+  const scratchQuatOut = new THREE.Quaternion();
 
   const applyDropTransform = (): void => {
     if (!currentDropSimulation || currentDropSimulation.trajectory.length === 0) {
@@ -722,6 +883,21 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       objectsGroup.quaternion.identity();
       return;
     }
+    // Live Rapier path: the pose is the physics body's transform.
+    if (lastLiveState) {
+      objectsGroup.position.set(
+        lastLiveState.position[0],
+        lastLiveState.position[1],
+        lastLiveState.position[2],
+      );
+      objectsGroup.quaternion.set(
+        lastLiveState.quaternion[0],
+        lastLiveState.quaternion[1],
+        lastLiveState.quaternion[2],
+        lastLiveState.quaternion[3],
+      );
+      return;
+    }
     const samples = currentDropSimulation.trajectory;
     const total = samples[samples.length - 1][0];
     const t = Math.min(dropTime, total);
@@ -731,16 +907,14 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     const posX = a[1] + (b[1] - a[1]) * alpha;
     const posY = a[2] + (b[2] - a[2]) * alpha;
     const posZ = a[3] + (b[3] - a[3]) * alpha;
-    // 1:1 Faithful representation of backend physics trajectory
+    // 1:1 Faithful representation of backend physics trajectory with zero GC allocations
     // The backend writes quaternions in (w, x, y, z) order; THREE.Quaternion constructor takes (x, y, z, w).
-    const quaternion = new THREE.Quaternion().slerpQuaternions(
-      new THREE.Quaternion(a[5], a[6], a[7], a[4]),
-      new THREE.Quaternion(b[5], b[6], b[7], b[4]),
-      alpha,
-    );
+    scratchQuatA.set(a[5], a[6], a[7], a[4]);
+    scratchQuatB.set(b[5], b[6], b[7], b[4]);
+    scratchQuatOut.slerpQuaternions(scratchQuatA, scratchQuatB, alpha);
 
     objectsGroup.position.set(posX, posY, posZ);
-    objectsGroup.quaternion.copy(quaternion);
+    objectsGroup.quaternion.copy(scratchQuatOut);
   };
 
   const dropTrajectoryBounds = (simulation: DropSimulationResult): { min: Vec3; max: Vec3 } => {
@@ -1019,8 +1193,25 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     }
   };
 
+  const selectedMeshesCache: THREE.Mesh[] = [];
+
   const applySelection = () => {
-    const selectedMeshes: THREE.Mesh[] = [];
+    selectedMeshesCache.length = 0;
+
+    // Clear previous selection highlight overlay
+    while (selectionHighlightGroup.children.length > 0) {
+      const child = selectionHighlightGroup.children[0];
+      selectionHighlightGroup.remove(child);
+      const childMesh = child as THREE.Mesh;
+      if (childMesh.geometry) childMesh.geometry.dispose();
+      if (childMesh.material) {
+        if (Array.isArray(childMesh.material)) {
+          childMesh.material.forEach((m) => m.dispose());
+        } else {
+          childMesh.material.dispose();
+        }
+      }
+    }
 
     objectsGroup.traverse((obj) => {
       const mesh = obj as THREE.Mesh;
@@ -1043,19 +1234,78 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       }
 
       if (objId && objId === currentSelectionId && mesh.isMesh) {
-        selectedMeshes.push(mesh);
+        selectedMeshesCache.push(mesh);
         if (quality === 'low' && mesh.material) {
           const mat = mesh.material as THREE.MeshStandardMaterial;
           if (!originalEmissiveMap.has(mat)) {
             originalEmissiveMap.set(mat, mat.emissive.getHex());
           }
-          mat.emissive.setHex(0x403d36);
+          mat.emissive.setHex(0x38bdf8);
         }
       }
     });
 
+    if (currentSelectionId && selectedMeshesCache.length > 0) {
+      for (const mesh of selectedMeshesCache) {
+        if (!mesh.geometry) continue;
+
+        // 1. Crisp CAD Edge Silhouette (renders on top of everything with depthTest: false)
+        try {
+          const edgesGeom = new THREE.EdgesGeometry(mesh.geometry, 28);
+          const edgesMat = new THREE.LineBasicMaterial({
+            color: 0xffffff,
+            transparent: true,
+            opacity: 0.95,
+            depthTest: false,
+            depthWrite: false,
+          });
+          const lineSegments = new THREE.LineSegments(edgesGeom, edgesMat);
+          lineSegments.renderOrder = 999;
+          mesh.getWorldPosition(lineSegments.position);
+          mesh.getWorldQuaternion(lineSegments.quaternion);
+          mesh.getWorldScale(lineSegments.scale);
+          selectionHighlightGroup.add(lineSegments);
+        } catch {
+          // ignore degenerate geometry
+        }
+
+        // 2. Subtle X-Ray Ghost Silhouette (glows through occluding shells)
+        try {
+          const xrayMat = new THREE.MeshBasicMaterial({
+            color: 0x38bdf8,
+            transparent: true,
+            opacity: 0.25,
+            depthTest: false,
+            depthWrite: false,
+            side: THREE.DoubleSide,
+          });
+          const xrayMesh = new THREE.Mesh(mesh.geometry, xrayMat);
+          xrayMesh.renderOrder = 998;
+          mesh.getWorldPosition(xrayMesh.position);
+          mesh.getWorldQuaternion(xrayMesh.quaternion);
+          mesh.getWorldScale(xrayMesh.scale);
+          selectionHighlightGroup.add(xrayMesh);
+        } catch {
+          // ignore
+        }
+      }
+    }
+
     if (outlinePass) {
-      outlinePass.selectedObjects = selectedMeshes;
+      outlinePass.selectedObjects = selectedMeshesCache;
+    }
+  };
+
+  let currentInsets = { left: 0, right: 0, top: 0, bottom: 0 };
+
+  const applyCameraViewOffset = (width: number, height: number) => {
+    const offsetX = ((currentInsets.left || 0) - (currentInsets.right || 0)) / 2;
+    const offsetY = ((currentInsets.top || 0) - (currentInsets.bottom || 0)) / 2;
+
+    if (Math.abs(offsetX) > 0.5 || Math.abs(offsetY) > 0.5) {
+      camera.setViewOffset(width, height, -offsetX, -offsetY, width, height);
+    } else if (camera.view && camera.view.enabled) {
+      camera.clearViewOffset();
     }
   };
 
@@ -1068,6 +1318,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     if (width === 0 || height === 0) return;
 
     camera.aspect = width / height;
+    applyCameraViewOffset(width, height);
     camera.updateProjectionMatrix();
     renderer.setSize(width, height, false);
     composer?.setSize(width, height);
@@ -1093,24 +1344,36 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     animationFrameId = requestAnimationFrame(renderLoop);
     controls.update();
 
-    // Drive the model along the simulated drop trajectory (real physics
-    // data, not a decorative animation), advancing in wall-clock time so
-    // the playback rate is real-time on any display refresh rate.
-    if (currentDropSimulation && dropPlaying) {
+    // Drive the model along the simulated drop trajectory.  When the live
+    // Rapier simulation is active, the pose comes from real rigid-body
+    // physics stepped per frame; otherwise it falls back to the backend
+    // sample playback (lerp/slerp).  Advancing in wall-clock time keeps the
+    // playback rate real-time on any display refresh rate.
+    if (populationFleet && isFleetMode) {
       const now = performance.now();
       if (lastFrameTime === null) lastFrameTime = now;
       const delta = Math.min(0.1, (now - lastFrameTime) / 1000);
       lastFrameTime = now;
-      const samples = currentDropSimulation.trajectory;
-      const total = samples.length > 0 ? samples[samples.length - 1][0] : 0;
-      const previous = dropTime;
-      if (total <= 0) {
-        dropPlaying = false;
-        lastFrameTime = null;
-        opts.onDropEnded?.();
+      if (fleetPlaying) {
+        fleetTime += delta;
+        if (fleetTime >= 3.2) {
+          fleetTime = 0;
+        }
+      }
+      populationFleet.update(fleetTime);
+    } else if (currentDropSimulation && dropPlaying) {
+      const now = performance.now();
+      if (lastFrameTime === null) lastFrameTime = now;
+      const rawDelta = Math.min(0.1, (now - lastFrameTime) / 1000);
+      const delta = rawDelta * playbackSpeed;
+      lastFrameTime = now;
+      dropTime += delta;
+      if (rapierSim) {
+        stepRapierPlayback(delta);
       } else {
-        dropTime = Math.min(dropTime + delta, total);
-        if (dropTime >= total && previous < total) {
+        const samples = currentDropSimulation.trajectory;
+        const total = samples.length > 0 ? samples[samples.length - 1][0] : 0;
+        if (dropTime >= total) {
           dropPlaying = false;
           lastFrameTime = null;
           opts.onDropEnded?.();
@@ -1135,30 +1398,47 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     // deployed (persistent dent). Before the first impact the window is 0
     // (no dent); without a drop simulation the dent is static.
     if (currentRenderMode !== 'default' && feaDecorated.length > 0) {
-      const windowS = currentFeaResult?.impact_window_s ?? 0;
+      const windowS = currentFeaResult?.impact_window_s ?? 0.3;
       let window01 = 1;
-      let active = true;
-      if (currentDropSimulation && windowS > 0) {
-        const impactTime = currentDropSimulation.impacts?.[0]?.t_s ?? 0;
-        window01 = impactWindowProgress(dropTime, impactTime, windowS);
-        active = window01 > 0;
+      let active = false;
+      if (currentDropSimulation) {
+        const total = currentDropSimulation.trajectory[currentDropSimulation.trajectory.length - 1]?.[0] ?? 1.5;
+        if (dropPlaying || dropTime < total) {
+          active = true;
+          const impactTime =
+            currentDropSimulation.impacts?.[0]?.t_s ??
+            (currentDropSimulation.drops?.[0]?.end_s
+              ? currentDropSimulation.drops[0].end_s * 0.38
+              : 0.38);
+          window01 = impactWindowProgress(dropTime, impactTime, windowS > 0 ? windowS : 0.3);
+        }
       }
       feaFrameOpts.mode = currentRenderMode;
       feaFrameOpts.impactWindow01 = window01;
       feaFrameOpts.impactWindowActive = active;
-      // Freeze the yield-mode whitening noise while a drop simulation is
-      // loaded but not actively playing (finished or paused): uTime must be
-      // constant so the damaged-region speckle pattern (feaHashNoise in
-      // feaStressShader.ts) is static instead of shimmering every frame.
-      // Freeze the yield-mode whitening noise for the ENTIRE loaded-
-      // simulation lifetime (playing, paused, finished): during playback
-      // the settled tail displays a frozen pose for seconds, and the
-      // time-seeded speckle (feaHashNoise) would shimmer on the damage
-      // band every frame — the visible "slightly moving" jitter on a
-      // static rest.
-      feaFrameOpts.time = currentDropSimulation ? 0 : performance.now() / 1000;
+      feaFrameOpts.time = currentDropSimulation && !dropPlaying ? 0 : performance.now() / 1000;
       for (const pair of feaDecorated) {
         updateFeaUniforms(pair.uniforms, feaFrameOpts);
+      }
+    }
+
+    // Keep selection highlight overlay transforms in sync during camera motion, explode, and drop
+    if (currentSelectionId && selectionHighlightGroup.children.length > 0 && selectedMeshesCache.length > 0) {
+      let childIdx = 0;
+      for (const mesh of selectedMeshesCache) {
+        if (childIdx < selectionHighlightGroup.children.length) {
+          const lineSeg = selectionHighlightGroup.children[childIdx];
+          mesh.getWorldPosition(lineSeg.position);
+          mesh.getWorldQuaternion(lineSeg.quaternion);
+          mesh.getWorldScale(lineSeg.scale);
+        }
+        if (childIdx + 1 < selectionHighlightGroup.children.length) {
+          const xrayMesh = selectionHighlightGroup.children[childIdx + 1];
+          mesh.getWorldPosition(xrayMesh.position);
+          mesh.getWorldQuaternion(xrayMesh.quaternion);
+          mesh.getWorldScale(xrayMesh.scale);
+        }
+        childIdx += 2;
       }
     }
 
@@ -1252,10 +1532,77 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
 
     setDropSimulation(simulation: DropSimulationResult | null) {
       if (disposed) return;
+      // Rebuild the telemetry collector for the new simulation (or tear down).
+      if (telemetryUnsub) {
+        telemetryUnsub();
+        telemetryUnsub = null;
+      }
+      if (simulation) {
+        telemetryCollector = new TelemetryCollector({
+          result: simulation,
+          fea: currentFeaResult,
+          capacity: 8192,
+          floorZ: 0,
+        });
+      } else {
+        telemetryCollector = null;
+      }
       currentDropSimulation = simulation;
       dropTime = 0;
-      dropPlaying = simulation !== null;
+      liveDropIndex = 0;
+      liveDropRestTime = 0;
+      // Do not start playing until Rapier simulation is loaded and initialized at t=0
+      dropPlaying = false;
       lastFrameTime = null;
+      lastLiveState = null;
+      rapierCurrentDrop = -1;
+      // Tear down any previous live sim; build the new one asynchronously
+      // (Rapier WASM init is async). Generation guards against a newer
+      // simulation arriving while init is in flight.
+      rapierBuildGeneration += 1;
+      const generation = rapierBuildGeneration;
+      if (rapierSim) {
+        rapierSim.dispose();
+        rapierSim = null;
+      }
+      if (simulation) {
+        buildRapierDropSim(simulation.model, currentEntries, simulation.drops)
+          .then((built) => {
+            if (disposed || generation !== rapierBuildGeneration) {
+              built?.dispose();
+              return;
+            }
+            rapierSim = built;
+            liveDropIndex = 0;
+            liveDropRestTime = 0;
+            if (built) {
+              telemetryUnsub = built.onTelemetry(() => {
+                // The collector consumes interpolated live state; per-frame
+                // callback is wired but the collector is driven by
+                // pushLiveTelemetry so this stays a no-op placeholder.
+              });
+              console.info('[Drop Physics] Live Rapier.js 3D rigid-body simulation active.');
+              // Pose the model at the first drop's release immediately.
+              const first = simulation.drops[0];
+              if (first) {
+                built.reset(first, simulation.model);
+                rapierCurrentDrop = 0;
+                lastLiveState = built.getState();
+                applyDropTransform();
+              }
+            } else {
+              console.warn('[Drop Physics] Rapier build unavailable, using telemetry sample playback.');
+              rapierCurrentDrop = -1;
+            }
+            lastFrameTime = performance.now();
+            dropPlaying = true;
+          })
+          .catch((err) => {
+            console.warn('[Drop Physics] Rapier initialization error, using telemetry sample playback:', err);
+            lastFrameTime = performance.now();
+            dropPlaying = true;
+          });
+      }
       if (simulation) {
         // Guarantee model is assembled (unexploded) during drop simulation physics
         currentExplodeFactor = 0;
@@ -1289,36 +1636,152 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       if (disposed) return;
       if (!playing || currentDropSimulation === null) {
         dropPlaying = false;
+        lastFrameTime = null;
         return;
       }
-      const samples = currentDropSimulation.trajectory;
-      const total = samples.length > 0 ? samples[samples.length - 1][0] : 0;
-      // Resume from the exact paused moment; a play press at the end of the
-      // playback restarts the whole sequence from the beginning.
-      if (dropTime >= total) {
+      if (liveDropIndex >= currentDropSimulation.drops.length) {
+        liveDropIndex = 0;
+        liveDropRestTime = 0;
         dropTime = 0;
+        if (rapierSim && currentDropSimulation.drops[0]) {
+          rapierSim.reset(currentDropSimulation.drops[0], currentDropSimulation.model);
+          rapierCurrentDrop = 0;
+          lastLiveState = rapierSim.getState();
+        }
       }
+      lastFrameTime = performance.now();
       dropPlaying = true;
     },
 
     restartDropPlayback() {
       if (disposed) return;
+      liveDropIndex = 0;
+      liveDropRestTime = 0;
       dropTime = 0;
+      if (rapierSim && currentDropSimulation?.drops[0]) {
+        rapierSim.reset(currentDropSimulation.drops[0], currentDropSimulation.model);
+        rapierCurrentDrop = 0;
+        lastLiveState = rapierSim.getState();
+      } else {
+        rapierCurrentDrop = -1;
+      }
+      lastFrameTime = performance.now();
       dropPlaying = currentDropSimulation !== null;
       applyDropTransform();
+    },
+
+    setPlaybackSpeed(speed: number) {
+      if (disposed) return;
+      playbackSpeed = Math.max(0.1, Math.min(100, speed));
+    },
+
+    /**
+     * Seek the live drop playback to an absolute time within the current
+     * simulation. The Rapier body cannot be rewound, so we reset to the
+     * first drop and fast-forward with bounded substeps, then pose the model
+     * at the target drop state.
+     */
+    seekDropTime(target: number) {
+      if (disposed || !currentDropSimulation) return;
+      if (!(target > 0) || !rapierSim) {
+        if (!(target > 0) && currentDropSimulation && rapierSim) {
+          // Rewind to the first drop.
+          rapierSim.reset(currentDropSimulation.drops[0], currentDropSimulation.model);
+          rapierCurrentDrop = 0;
+          dropTime = 0;
+          liveDropIndex = 0;
+          liveDropRestTime = 0;
+          lastLiveState = rapierSim.getState();
+          applyDropTransform();
+          lastFrameTime = performance.now();
+        }
+        return;
+      }
+      const sim = currentDropSimulation;
+      dropTime = target;
+      liveDropIndex = 0;
+      liveDropRestTime = 0;
+      rapierCurrentDrop = -1;
+      let remaining = target;
+      let guard = 0;
+      while (liveDropIndex < sim.drops.length && guard < 512) {
+        const drop = sim.drops[liveDropIndex];
+        rapierSim.reset(drop, sim.model);
+        rapierCurrentDrop = liveDropIndex;
+        const span = Math.max(0.0001, (drop.end_s ?? 1) - (drop.start_s ?? 0));
+        const toConsume = Math.min(remaining, span);
+        // Fixed 1/240 s substeps with the 0.1 s per-call clamp; loop until
+        // consumed (bounded by MAX_SUBSTEPS * 512 guard).
+        let consumed = 0;
+        while (consumed < toConsume && guard < 4096) {
+          const dt = Math.min(0.1, toConsume - consumed);
+          rapierSim.step(dt);
+          consumed += dt;
+          guard += 1;
+        }
+        remaining -= toConsume;
+        liveDropIndex += 1;
+        if (remaining <= 0.0001) break;
+      }
+      lastLiveState = rapierSim.getState();
+      applyDropTransform();
+      lastFrameTime = performance.now();
     },
 
     getDropTime() {
       return dropTime;
     },
 
+    getLiveDropIndex() {
+      return liveDropIndex;
+    },
+
+    getLiveFrame() {
+      return lastLiveState;
+    },
+
+    getTelemetryFrames() {
+      return telemetryCollector ? telemetryCollector.frames() : [];
+    },
+
+    getTelemetryEvents() {
+      return telemetryCollector ? telemetryCollector.eventsList : [];
+    },
+
+    clearTelemetry() {
+      telemetryCollector?.clear();
+    },
+
+    buildTelemetrySession() {
+      if (!telemetryCollector || !currentDropSimulation) return null;
+      return buildTelemetrySession(currentDropSimulation, telemetryCollector.frames());
+    },
+
     setRenderMode(mode: RenderMode) {
       if (disposed || mode === currentRenderMode) return;
       currentRenderMode = mode;
-      feaMaterialCache.clear();
-      // Rebuild with the pristine palette (default) so decorations never
-      // accumulate; applyModeDecoration re-applies the fea/yield materials.
-      rebuildObjects();
+      if (mode === 'default') {
+        for (const pair of feaDecorated) {
+          pair.uniforms.uFeaMode.value = -1;
+        }
+        for (const outer of objectsGroup.children) {
+          for (const mesh of objectMeshesFor(outer)) {
+            if (mesh.userData.baseMaterial) {
+              mesh.material = mesh.userData.baseMaterial;
+            }
+          }
+        }
+        feaDecorated.length = 0;
+      } else {
+        if (feaDecorated.length > 0) {
+          const targetVal = mode === 'yield' ? 1 : 0;
+          for (const pair of feaDecorated) {
+            pair.uniforms.uFeaMode.value = targetVal;
+          }
+        } else {
+          applyModeDecoration();
+        }
+      }
     },
 
     setFeaResult(fea: FeaResult | null) {
@@ -1326,8 +1789,70 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       currentFeaResult = fea;
       feaMaterialCache.clear();
       if (currentRenderMode !== 'default') {
-        rebuildObjects();
+        applyModeDecoration();
       }
+    },
+
+    setPopulationFleet(population: PopulationResult | null, fleetMode: boolean) {
+      if (disposed) return;
+      isFleetMode = fleetMode && population !== null;
+      if (populationFleet) {
+        populationFleet.dispose();
+        populationFleet = null;
+      }
+      if (population && isFleetMode && objectsGroup.children.length > 0) {
+        const defaultBaseZ = -boundsUnion.min[2];
+        populationFleet = createPopulationFleet(scene, objectsGroup, population, 6, defaultBaseZ);
+        objectsGroup.visible = false;
+        fleetTime = 0;
+        fleetPlaying = true;
+        const fleetBox = populationFleet.getBounds();
+        const center = new THREE.Vector3();
+        fleetBox.getCenter(center);
+        const size = new THREE.Vector3();
+        fleetBox.getSize(size);
+        const maxFleetDim = Math.max(size.x, size.y, size.z, 0.4);
+        fitCameraToBounds(camera, controls, {
+          min: [center.x - maxFleetDim * 0.7, center.y - maxFleetDim * 0.7, 0],
+          max: [center.x + maxFleetDim * 0.7, center.y + maxFleetDim * 0.7, maxFleetDim * 0.6],
+        });
+      } else {
+        objectsGroup.visible = true;
+        if (!currentDropSimulation) {
+          fitCameraToBounds(camera, controls, floorFramingBounds());
+        }
+      }
+    },
+
+    setFleetPlayback(playing: boolean) {
+      if (disposed) return;
+      fleetPlaying = playing;
+      if (playing && fleetTime >= 3.0) {
+        fleetTime = 0;
+      }
+    },
+
+    restartFleetPlayback() {
+      if (disposed) return;
+      fleetTime = 0;
+      fleetPlaying = true;
+      if (populationFleet) {
+        populationFleet.update(0);
+      }
+    },
+
+    getFleetTime() {
+      return fleetTime;
+    },
+
+    pickFleetUnit(raycaster: THREE.Raycaster) {
+      if (!populationFleet || !isFleetMode) return null;
+      return populationFleet.pickUnit(raycaster);
+    },
+
+    highlightFleetUnit(unitId: number | null) {
+      if (!populationFleet || !isFleetMode) return;
+      populationFleet.highlightUnit(unitId);
     },
 
     fit() {
@@ -1346,6 +1871,17 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       ] as Vec3;
       const radius = Math.max(maxDimension / 2, 0.05);
       applyCameraPreset(camera, controls, name, center, radius);
+    },
+
+    setInsets(insets: { left?: number; right?: number; top?: number; bottom?: number }) {
+      if (disposed) return;
+      currentInsets = {
+        left: insets.left ?? 0,
+        right: insets.right ?? 0,
+        top: insets.top ?? 0,
+        bottom: insets.bottom ?? 0,
+      };
+      resize();
     },
 
     getStats() {
@@ -1371,6 +1907,21 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       palette.dispose();
       feaMaterialCache.clear();
       feaDecorated.length = 0;
+      rapierBuildGeneration += 1;
+      if (populationFleet) {
+        populationFleet.dispose();
+        populationFleet = null;
+      }
+      if (rapierSim) {
+        rapierSim.dispose();
+        rapierSim = null;
+      }
+      if (telemetryUnsub) {
+        telemetryUnsub();
+        telemetryUnsub = null;
+      }
+      telemetryCollector = null;
+      lastLiveState = null;
 
       const oldChildren = [...objectsGroup.children];
       for (const child of oldChildren) {
@@ -1378,6 +1929,8 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       }
       disposeSceneResources(scene);
       renderer.dispose();
+      canvas.removeEventListener('webglcontextlost', handleContextLost);
+      canvas.removeEventListener('webglcontextrestored', handleContextRestored);
       // Note: do NOT force context loss here. The context is created and
       // validated by SceneViewport and reused on remounts (React StrictMode
       // double-mounts in dev); losing it makes the second mount's

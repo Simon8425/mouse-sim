@@ -14,6 +14,7 @@ import type {
   PipelineResult,
   FeaResult,
   RenderMode,
+  AiClassification,
 } from '../api/contracts';
 import { isGeometryJson, isRecord } from '../api/contracts';
 
@@ -68,6 +69,8 @@ export interface ProjectState {
   qualityTier: 'ultra' | 'high' | 'medium' | 'low' | null;
   navOpen: boolean;
   inspectorOpen: boolean;
+  /** Telemetry Log Debugger drawer visibility. */
+  debuggerOpen: boolean;
   webglError: string | null;
   previewRequestVersion: number;
   controlOpen: boolean;
@@ -75,6 +78,20 @@ export interface ProjectState {
   runNonce: number;
   objectMaterials: Record<string, string>;
   objectClassifications: Record<string, string>;
+  /** AI component-type suggestions (objectId → suggestion) from /api/classify. */
+  aiClassifications: Record<string, AiClassification>;
+  /**
+   * Object ids the user dismissed / applied / manually overrode during an
+   * in-flight classify job.  CLASSIFY_POLL skips these so a late poll tick
+   * cannot resurrect a dismissed suggestion.
+   */
+  dismissedClassifyIds: Record<string, true>;
+  /** AI provider, model name, and API key settings */
+  aiConfig: AiConfig;
+  /** Active classify job state (null when idle). */
+  classifyJob: { jobId: string; status: string; total: number; done: number; error: string | null } | null;
+  /** Whether the AI classification review modal is open. */
+  classifyModalOpen: boolean;
   defaultMaterialKey: string;
   partGeometry: Record<string, GeometryJson> | null;
   /** Viewport material mode: default palette, FEA heatmap, or yield shader. */
@@ -87,6 +104,13 @@ export interface ProjectState {
   dropPlaying: boolean;
   /** Legacy load gate retained for persisted/reducer compatibility. */
   skipAutoRun: boolean;
+}
+
+export interface AiConfig {
+  provider: string;
+  model: string;
+  apiKey: string;
+  endpoint?: string;
 }
 
 /** Union of all actions accepted by the project reducer. */
@@ -124,7 +148,7 @@ export type ProjectAction =
   | { type: 'UPDATE_DRAFT'; patch: Partial<PipelineRequest> }
   | {
       type: 'RUN_DROP_TEST';
-      test: 'drop' | 'impact' | 'tumble';
+      test: 'drop' | 'impact' | 'tumble' | 'population';
       config: {
         height_m: number;
         surface: 'concrete' | 'wood' | 'foam' | 'steel';
@@ -132,6 +156,8 @@ export type ProjectAction =
         orientation: 'flat' | 'edge' | 'corner' | 'random';
         spin_rps?: number;
         mass_kg?: number | null;
+        seed?: number;
+        pause_between_drops_s?: number;
         structure?: Record<string, unknown> | null;
         load_case?: Record<string, unknown> | null;
       };
@@ -145,12 +171,22 @@ export type ProjectAction =
   | { type: 'SET_QUALITY_TIER'; tier: 'ultra' | 'high' | 'medium' | 'low' | null }
   | { type: 'SET_NAV_OPEN'; open: boolean }
   | { type: 'SET_INSPECTOR_OPEN'; open: boolean }
+  | { type: 'SET_DEBUGGER_OPEN'; open: boolean }
   | { type: 'SET_WEBGL_ERROR'; message: string | null }
   | { type: 'SET_CONTROL_OPEN'; open: boolean; mode?: 'settings' | 'simulation' }
+  | { type: 'SET_CLASSIFY_MODAL_OPEN'; open: boolean }
+  | { type: 'SET_AI_CONFIG'; config: Partial<AiConfig> }
   | { type: 'RUN_STUDY' }
   | { type: 'RUN_POPULATION'; worst_case?: boolean }
   | { type: 'SET_OBJECT_MATERIAL'; objectId: string; materialKey: string | null }
   | { type: 'SET_OBJECT_CLASSIFICATION'; objectId: string; role: string | null }
+  | { type: 'CLASSIFY_START'; jobId: string }
+  | { type: 'CLASSIFY_POLL'; status: string; total: number; done: number; error: string | null; results: AiClassification[] }
+  | { type: 'CLASSIFY_APPLY_ALL' }
+  | { type: 'CLASSIFY_DISMISS_ALL' }
+  | { type: 'CLASSIFY_APPLY_ONE'; objectId: string; role?: string }
+  | { type: 'CLASSIFY_CLEAR'; objectId: string }
+  | { type: 'CLASSIFY_ERROR'; message: string }
   | { type: 'SET_DEFAULT_MATERIAL'; key: string }
   | { type: 'SET_RENDER_MODE'; mode: RenderMode }
   | { type: 'SET_DROP_PLAYING'; playing: boolean }
@@ -366,6 +402,7 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
       // (e.g. RUN_STUDY) must not label its own fresh result stale.
       return {
         ...state,
+        renderMode: 'default',
         requestVersion: action.version,
         runStatus: 'running',
         stale: state.lastResult != null && action.requestKey !== state.resultRequestKey,
@@ -497,6 +534,15 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
       ) {
         config.mass_kg = action.config.mass_kg;
       }
+      if (action.config.seed !== undefined && action.config.seed !== null) {
+        config.seed = action.config.seed;
+      }
+      if (
+        action.config.pause_between_drops_s !== undefined &&
+        action.config.pause_between_drops_s !== null
+      ) {
+        config.pause_between_drops_s = action.config.pause_between_drops_s;
+      }
       // W4-04: a stale validation section (or validation mode) from a
       // previous RUN VALIDATION silently pinned the shell chain and
       // discarded the user's test configuration.  A drop test is an
@@ -517,6 +563,7 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
         ...state,
         explode: 0,
         mode: 'exploration',
+        renderMode: 'default',
         stale: state.lastResult != null,
         runStatus:
           state.project !== null || state.preview?.supported === true ? 'loading' : 'idle',
@@ -603,8 +650,141 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
       } else {
         objectClassifications[action.objectId] = action.role;
       }
-      return { ...state, objectClassifications, stale: state.lastResult != null };
+      // A manual role overrides the AI suggestion for that part.
+      const aiClassifications = { ...state.aiClassifications };
+      delete aiClassifications[action.objectId];
+      // Tombstone the id so a late poll tick cannot resurrect the suggestion.
+      const dismissedClassifyIds: Record<string, true> = {
+        ...state.dismissedClassifyIds,
+        [action.objectId]: true,
+      };
+      return {
+        ...state,
+        objectClassifications,
+        aiClassifications,
+        dismissedClassifyIds,
+        stale: state.lastResult != null,
+      };
     }
+    case 'SET_CLASSIFY_MODAL_OPEN':
+      return { ...state, classifyModalOpen: action.open };
+    case 'CLASSIFY_START':
+      return {
+        ...state,
+        // A new job means a fresh review cycle: forget prior dismissals.
+        dismissedClassifyIds: {},
+        classifyJob: { jobId: action.jobId, status: 'queued', total: 0, done: 0, error: null },
+      };
+    case 'CLASSIFY_POLL': {
+      const aiClassifications = { ...state.aiClassifications };
+      for (const result of action.results) {
+        if (result && result.object_id && result.component_type) {
+          if (state.dismissedClassifyIds[result.object_id]) continue;
+          aiClassifications[result.object_id] = result;
+        }
+      }
+      const hasSuggestions = Object.keys(aiClassifications).length > 0;
+      const justFinished = action.status === 'done' && state.classifyJob?.status === 'running';
+      return {
+        ...state,
+        aiClassifications,
+        classifyModalOpen: justFinished && hasSuggestions ? true : state.classifyModalOpen,
+        classifyJob: {
+          jobId: state.classifyJob?.jobId ?? '',
+          status: action.status,
+          total: action.total,
+          done: action.done,
+          error: action.error,
+        },
+      };
+    }
+    case 'SET_AI_CONFIG': {
+      const aiConfig = { ...state.aiConfig, ...action.config };
+      if (typeof window !== 'undefined') {
+        try {
+          window.localStorage.setItem(AI_CONFIG_STORAGE_KEY, JSON.stringify(aiConfig));
+        } catch {
+          // ignore
+        }
+      }
+      return { ...state, aiConfig };
+    }
+    case 'CLASSIFY_APPLY_ALL': {
+      const objectClassifications = { ...state.objectClassifications };
+      const dismissedClassifyIds = { ...state.dismissedClassifyIds };
+      for (const [objectId, suggestion] of Object.entries(state.aiClassifications)) {
+        dismissedClassifyIds[objectId] = true;
+        if (
+          suggestion &&
+          suggestion.component_type &&
+          suggestion.component_type !== 'unresolved' &&
+          (suggestion.confidence ?? 0) > 0
+        ) {
+          objectClassifications[objectId] = suggestion.component_type;
+        }
+      }
+      return {
+        ...state,
+        objectClassifications,
+        dismissedClassifyIds,
+        aiClassifications: {},
+        classifyModalOpen: false,
+        stale: state.lastResult != null,
+      };
+    }
+    case 'CLASSIFY_DISMISS_ALL': {
+      const dismissedClassifyIds = { ...state.dismissedClassifyIds };
+      for (const objectId of Object.keys(state.aiClassifications)) {
+        dismissedClassifyIds[objectId] = true;
+      }
+      return {
+        ...state,
+        dismissedClassifyIds,
+        aiClassifications: {},
+        classifyModalOpen: false,
+      };
+    }
+    case 'CLASSIFY_APPLY_ONE': {
+      const suggestion = state.aiClassifications[action.objectId];
+      const objectClassifications = { ...state.objectClassifications };
+      const roleToApply = action.role || suggestion?.component_type;
+      if (roleToApply && roleToApply !== 'unresolved') {
+        objectClassifications[action.objectId] = roleToApply;
+      }
+      const aiClassifications = { ...state.aiClassifications };
+      delete aiClassifications[action.objectId];
+      const remaining = Object.keys(aiClassifications).length;
+      return {
+        ...state,
+        objectClassifications,
+        aiClassifications,
+        dismissedClassifyIds: { ...state.dismissedClassifyIds, [action.objectId]: true },
+        classifyModalOpen: remaining === 0 ? false : state.classifyModalOpen,
+        stale: state.lastResult != null,
+      };
+    }
+    case 'CLASSIFY_CLEAR': {
+      const aiClassifications = { ...state.aiClassifications };
+      delete aiClassifications[action.objectId];
+      const remaining = Object.keys(aiClassifications).length;
+      return {
+        ...state,
+        aiClassifications,
+        dismissedClassifyIds: { ...state.dismissedClassifyIds, [action.objectId]: true },
+        classifyModalOpen: remaining === 0 ? false : state.classifyModalOpen,
+      };
+    }
+    case 'CLASSIFY_ERROR':
+      return {
+        ...state,
+        classifyJob: {
+          jobId: state.classifyJob?.jobId ?? '',
+          status: 'error',
+          total: 0,
+          done: 0,
+          error: action.message,
+        },
+      };
     case 'SET_DEFAULT_MATERIAL':
       if (typeof window !== 'undefined') {
         try {
@@ -628,6 +808,8 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
       return { ...state, partGeometry: null, stale: state.lastResult != null };
     case 'SET_INSPECTOR_OPEN':
       return { ...state, inspectorOpen: action.open };
+    case 'SET_DEBUGGER_OPEN':
+      return { ...state, debuggerOpen: action.open };
     case 'SET_WEBGL_ERROR':
       return { ...state, webglError: action.message };
     case 'SET_CONTROL_OPEN':
@@ -690,6 +872,7 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
         sample_count: 10000,
         profile: 'esports_fps',
         lifespan_days: 730,
+        contact_stiffness_n_per_m: 1e5,
       };
       if (action.worst_case) {
         population.worst_case = WORST_CASE_POPULATION_SPEC;
@@ -702,7 +885,9 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
       delete rest.mode;
       const nextState: ProjectState = {
         ...state,
+        explode: 0,
         mode: 'exploration',
+        renderMode: 'default',
         stale: state.lastResult != null,
         runStatus:
           state.project !== null || state.preview?.supported === true ? 'loading' : 'idle',
@@ -772,6 +957,7 @@ export const initialState: ProjectState = {
   qualityTier: null,
   navOpen: false,
   inspectorOpen: false,
+  debuggerOpen: false,
   webglError: null,
   previewRequestVersion: 0,
   controlOpen: false,
@@ -779,6 +965,11 @@ export const initialState: ProjectState = {
   runNonce: 0,
   objectMaterials: {},
   objectClassifications: {},
+  aiClassifications: {},
+  dismissedClassifyIds: {},
+  aiConfig: loadPersistedAiConfig(),
+  classifyJob: null,
+  classifyModalOpen: false,
   defaultMaterialKey: loadPersistedDefaultMaterial(),
   partGeometry: null,
   renderMode: 'default',
@@ -789,6 +980,28 @@ export const initialState: ProjectState = {
 };
 
 const DEFAULT_MATERIAL_STORAGE_KEY = 'mouse-sim-default-material';
+const AI_CONFIG_STORAGE_KEY = 'mouse-sim-ai-config';
+
+function loadPersistedAiConfig(): AiConfig {
+  if (typeof window === 'undefined') {
+    return { provider: 'OpenAI', model: 'openai/gpt-5.6-luna-pro', apiKey: '', endpoint: '' };
+  }
+  try {
+    const raw = window.localStorage.getItem(AI_CONFIG_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      return {
+        provider: typeof parsed.provider === 'string' ? parsed.provider : 'OpenAI',
+        model: typeof parsed.model === 'string' ? parsed.model : 'openai/gpt-5.6-luna-pro',
+        apiKey: typeof parsed.apiKey === 'string' ? parsed.apiKey : '',
+        endpoint: typeof parsed.endpoint === 'string' ? parsed.endpoint : '',
+      };
+    }
+  } catch {
+    // fallback
+  }
+  return { provider: 'OpenAI', model: 'openai/gpt-5.6-luna-pro', apiKey: '', endpoint: '' };
+}
 
 /** Read the persisted default material key, falling back to 'default'. */
 function loadPersistedDefaultMaterial(): string {
@@ -810,6 +1023,10 @@ function resetGeometryView(state: ProjectState): ProjectState {
     visibility: {},
     objectMaterials: {},
     objectClassifications: {},
+    aiClassifications: {},
+    dismissedClassifyIds: {},
+    classifyJob: null,
+    classifyModalOpen: false,
     partGeometry: null,
   };
 }
@@ -842,8 +1059,10 @@ export function createAnalysisRequest(state: ProjectState): PipelineRequest | nu
     if (parts && parts.length > 0 && geometries && parts.every((part) => geometries[part.id])) {
       const objects = parts.map((part) => {
         const materialKey = state.objectMaterials[part.id];
+        const role = state.objectClassifications[part.id];
         const entry: Record<string, unknown> = { id: part.id, geometry: geometries[part.id] };
         if (materialKey) entry.material = materialKey;
+        if (role) entry.classification = { component_type: role, confidence: 0.95, source: 'user' };
         return entry;
       });
       if (state.preview?.display_asset?.parts_url) {
@@ -859,15 +1078,15 @@ export function createAnalysisRequest(state: ProjectState): PipelineRequest | nu
     } else {
       const objectId = state.preview?.source_name ?? 'upload';
       const materialKey = state.objectMaterials[objectId];
+      const role = state.objectClassifications[objectId];
       if (state.preview?.display_asset?.parts_url) {
         request.geometry_asset_id = state.preview.display_asset.asset_id;
         delete request.objects;
       } else {
-        request.objects = [
-          materialKey
-            ? { id: objectId, geometry: previewGeometry, material: materialKey }
-            : { id: objectId, geometry: previewGeometry },
-        ];
+        const entry: Record<string, unknown> = { id: objectId, geometry: previewGeometry };
+        if (materialKey) entry.material = materialKey;
+        if (role) entry.classification = { component_type: role, confidence: 0.95, source: 'user' };
+        request.objects = [entry];
       }
     }
     // Kernel-backed STEP previews are CAD display tessellations (open,
