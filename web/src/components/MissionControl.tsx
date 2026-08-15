@@ -15,6 +15,10 @@ import { SHELL_FLEX_LOAD_CASE, shellDims } from './RunControls';
 import type { DropTestKind, DropSurface, DropOrientation } from '../api/contracts';
 
 const AI_MODELS = [
+  { id: 'xiaomi/mimo-v2.5', label: 'xiaomi/mimo-v2.5', provider: 'Xiaomi', endpoint: '', apiKey: '' },
+  { id: 'openai/gpt-5.6-luna-pro', label: 'gpt 5.6 luna', provider: 'OpenAI', endpoint: '', apiKey: '' },
+  { id: 'google/gemini-3.7-flash', label: 'google/gemini-3.7-flash', provider: 'Google', endpoint: '', apiKey: '' },
+  { id: 'x-ai/grok-4.6', label: 'x-ai/grok-4.6', provider: 'xAI', endpoint: '', apiKey: '' },
   {
     id: 'qwen3.5-4b',
     label: 'Local (qwen3.5-4b @ 127.0.0.1:1234)',
@@ -22,9 +26,6 @@ const AI_MODELS = [
     endpoint: 'http://127.0.0.1:1234',
     apiKey: '',
   },
-  { id: 'openai/gpt-5.6-luna-pro', label: 'gpt 5.6 luna', provider: 'OpenAI', endpoint: '', apiKey: '' },
-  { id: 'google/gemini-3.7-flash', label: 'google/gemini-3.7-flash', provider: 'Google', endpoint: '', apiKey: '' },
-  { id: 'x-ai/grok-4.6', label: 'x-ai/grok-4.6', provider: 'xAI', endpoint: '', apiKey: '' },
 ];
 
 export interface MissionControlProps {
@@ -181,7 +182,7 @@ export function MissionControl({ onClose }: MissionControlProps): React.ReactEle
                         (m.endpoint || '') === (state.aiConfig?.endpoint || '')
                     )
                       ? 'custom'
-                      : (state.aiConfig?.model || 'openai/gpt-5.6-luna-pro')
+                      : (state.aiConfig?.model || 'xiaomi/mimo-v2.5')
                   }
                   onChange={(e) => {
                     const val = e.target.value;
@@ -194,7 +195,7 @@ export function MissionControl({ onClose }: MissionControlProps): React.ReactEle
                         type: 'SET_AI_CONFIG',
                         config: {
                           model: val,
-                          provider: modelObj?.provider || 'OpenAI',
+                          provider: modelObj?.provider || 'Xiaomi',
                           endpoint: modelObj?.endpoint || '',
                           apiKey: modelObj?.apiKey ?? state.aiConfig?.apiKey ?? '',
                         },
@@ -202,6 +203,7 @@ export function MissionControl({ onClose }: MissionControlProps): React.ReactEle
                     }
                   }}
                 >
+                  <option value="xiaomi/mimo-v2.5">xiaomi/mimo-v2.5</option>
                   <option value="openai/gpt-5.6-luna-pro">gpt 5.6 luna</option>
                   <option value="google/gemini-3.7-flash">google/gemini-3.7-flash</option>
                   <option value="x-ai/grok-4.6">x-ai/grok-4.6</option>

@@ -40,13 +40,14 @@ from .classification import CANONICAL_COMPONENT_TYPES, canonical_component_type
 # ---------------------------------------------------------------------------
 
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = "openai/gpt-5.6-luna-pro"
+DEFAULT_MODEL = "xiaomi/mimo-v2.5"
 DEFAULT_EMBEDDING_MODEL = "openai/text-embedding-3-small"
-DEFAULT_PROVIDER = "OpenAI"
+DEFAULT_PROVIDER = "Xiaomi"
 
 #: Estimated USD per 1M input / 1M output tokens for known models (kept in a
 #: small table so the UI can estimate cost before running).
 MODEL_PRICES_USD_PER_1M = {
+    "xiaomi/mimo-v2.5": (0.10, 0.40),
     "openai/gpt-5.6-luna-pro": (0.15, 0.60),
     "openai/gpt-5.6-luna": (0.15, 0.60),
     "google/gemini-3.7-flash": (0.10, 0.40),

@@ -984,15 +984,15 @@ const AI_CONFIG_STORAGE_KEY = 'mouse-sim-ai-config';
 
 function loadPersistedAiConfig(): AiConfig {
   if (typeof window === 'undefined') {
-    return { provider: 'OpenAI', model: 'openai/gpt-5.6-luna-pro', apiKey: '', endpoint: '' };
+    return { provider: 'Xiaomi', model: 'xiaomi/mimo-v2.5', apiKey: '', endpoint: '' };
   }
   try {
     const raw = window.localStorage.getItem(AI_CONFIG_STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
       return {
-        provider: typeof parsed.provider === 'string' ? parsed.provider : 'OpenAI',
-        model: typeof parsed.model === 'string' ? parsed.model : 'openai/gpt-5.6-luna-pro',
+        provider: typeof parsed.provider === 'string' ? parsed.provider : 'Xiaomi',
+        model: typeof parsed.model === 'string' ? parsed.model : 'xiaomi/mimo-v2.5',
         apiKey: typeof parsed.apiKey === 'string' ? parsed.apiKey : '',
         endpoint: typeof parsed.endpoint === 'string' ? parsed.endpoint : '',
       };
@@ -1000,7 +1000,7 @@ function loadPersistedAiConfig(): AiConfig {
   } catch {
     // fallback
   }
-  return { provider: 'OpenAI', model: 'openai/gpt-5.6-luna-pro', apiKey: '', endpoint: '' };
+  return { provider: 'Xiaomi', model: 'xiaomi/mimo-v2.5', apiKey: '', endpoint: '' };
 }
 
 /** Read the persisted default material key, falling back to 'default'. */
