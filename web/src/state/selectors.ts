@@ -112,7 +112,19 @@ export function selectHasStaleResult(state: ProjectState): boolean {
 
 export function selectMassObject(state: ProjectState, id: string | null): MassObjectResult | null {
   if (id === null || !state.lastResult?.mass?.objects) return null;
-  return state.lastResult.mass.objects.find((o) => o.object_id === id) ?? null;
+  const entry = selectObjectById(state, id);
+  const targetId = entry?.id ?? id;
+  const targetName = entry?.name ?? null;
+  return (
+    state.lastResult.mass.objects.find(
+      (o) =>
+        o.object_id === targetId ||
+        o.object_id === id ||
+        (targetName !== null && o.object_id === targetName) ||
+        (targetName !== null && (o as { name?: string }).name === targetName) ||
+        (o as { name?: string }).name === id,
+    ) ?? null
+  );
 }
 
 export function selectSourceLabel(state: ProjectState): string {

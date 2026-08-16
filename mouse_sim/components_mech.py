@@ -49,6 +49,18 @@ _ABS_YIELD_PA = 40e6
 _ABS_COMPRESSIVE_PA = 60e6
 _ABS_MODULUS_PA = 2.0e9
 
+_MATERIAL_YIELDS = {
+    "abs": 40e6,
+    "polycarbonate": 65e6,
+    "pc": 65e6,
+    "polypropylene": 30e6,
+    "pp": 30e6,
+    "pom": 65e6,
+    "acetal": 65e6,
+    "nylon": 70e6,
+    "pa": 70e6,
+}
+
 # Boss thread-stripping shear allowable: molded-plastic boss pull-out data
 # lands at ~0.75-1.0x the tensile yield of the boss material; the screening
 # constant is 1.0 * S_y (the classic F = pi * d_major * h_engagement * S_y
@@ -223,12 +235,9 @@ def _analyze_screw(spec, context):
     accel_g = _accel_g(context)
     if d <= 0.0 or engagement <= 0.0:
         return _not_evaluated("screw", "screw geometry must be positive")
-    # Plastic boss thread-stripping screening: tau = S_y of the boss material
-    # (molded-plastic shear-out at ~1x tensile yield; ABS-class S_y = 40 MPa
-    # hardcoded — the boss material field is not read).  The standard
-    # stripping formula is F = pi * d_major * h_engagement * tau, where
-    # h_engagement is the ENGAGED thread length, not the full screw length.
-    tau = _BOSS_SHEAR_FRACTION * _ABS_YIELD_PA
+    mat_key = str(spec.get("boss_material") or spec.get("material") or "abs").strip().lower()
+    yield_pa = _MATERIAL_YIELDS.get(mat_key, _ABS_YIELD_PA)
+    tau = _BOSS_SHEAR_FRACTION * yield_pa
     pullout = math.pi * d * engagement * tau
     # Drop-shock load path: prefer the impact module's peak_force_n (split
     # across the fastener count) when the pipeline supplies it; fall back to
@@ -259,7 +268,8 @@ def _analyze_screw(spec, context):
                 {"code": "SCREW_PULLOUT_RISK", "severity": "error", "message": "applied load exceeds the boss thread-stripping force (margin {:.2f}); beyond the class-constant screening uncertainty band".format(margin)}
             )
         elif margin <= _MARGIN_WARN:
-            status = "warn"
+            if status == "pass":
+                status = "warn"
             findings.append(
                 {"code": "SCREW_PULLOUT_MARGINAL", "severity": "warning", "message": "thread-stripping margin {:.2f} at the screening boundary; within the class-constant screening uncertainty band".format(margin)}
             )
@@ -276,9 +286,9 @@ def _analyze_screw(spec, context):
             status = "warn"
     # Boss hoop stress from the radial thread-expansion pressure: the axial
     # thread load spread over the engaged cylindrical bore area acts
-    # radially at the boss ID (thin-cylinder hoop law sigma = p * d_inner /
-    # (2 * t_wall)).  The screening allowable is the tensile yield of the
-    # boss material; a thin-walled boss splits before it pulls out.
+    # radially at the boss ID. Lamé thick-cylinder hoop law:
+    # sigma = p * (d_outer^2 + d_inner^2) / (d_outer^2 - d_inner^2).
+    # The screening allowable is the tensile yield of the boss material.
     d_inner = max(0.0, _finite(spec.get("boss_inner_diameter_m"), d))
     d_outer = max(0.0, _finite(spec.get("boss_outer_diameter_m"), 2.0 * d))
     t_wall = (d_outer - d_inner) / 2.0
@@ -287,21 +297,17 @@ def _analyze_screw(spec, context):
     if t_wall > 0.0 and engagement > 0.0 and total_load > 0.0:
         pressure = total_load / (math.pi * d_inner * engagement)
         hoop = pressure * d_inner / (2.0 * t_wall)
-        hoop_ratio = hoop / _ABS_YIELD_PA
+        hoop_ratio = hoop / yield_pa
         if hoop_ratio >= _FAIL_RATIO:
             status = "fail"
             findings.append(
                 {"code": "SCREW_BOSS_HOOP_FAIL", "severity": "error", "message": "boss hoop stress {:.1f} MPa exceeds the yield strength beyond the class-constant screening uncertainty band; boss radial crack risk".format(hoop / 1e6)}
             )
-        elif hoop_ratio >= _WARN_RATIO:
-            status = "warn"
+        elif hoop_ratio >= _WARN_RATIO or hoop_ratio > 0.7:
+            if status == "pass":
+                status = "warn"
             findings.append(
                 {"code": "SCREW_BOSS_HOOP_MARGINAL", "severity": "warning", "message": "boss hoop utilization {:.0%} at the screening boundary; within the class-constant screening uncertainty band".format(hoop_ratio)}
-            )
-        elif hoop_ratio > 0.7:
-            status = "warn"
-            findings.append(
-                {"code": "SCREW_BOSS_HOOP_MARGINAL", "severity": "warning", "message": "boss hoop utilization {:.0%} above 0.7".format(hoop_ratio)}
             )
     # Boss sizing recommendations (self-tapping screws): engaged thread
     # length >= 2.5 x screw diameter and boss wall thickness >= 0.5 mm (or
@@ -404,7 +410,8 @@ def _analyze_clip(spec, context):
             {"code": "CLIP_RETENTION_LOST", "severity": "error", "message": "creep-derated retention {:.1f} N below the disassembly force {:.1f} N".format(derated_retention, disassembly)}
         )
     elif derated_retention < 1.5 * disassembly:
-        status = "warn"
+        if status == "pass":
+            status = "warn"
         findings.append(
             {"code": "CLIP_RETENTION_MARGIN_LOW", "severity": "warning", "message": "creep-derated retention {:.1f} N below 1.5x the disassembly force {:.1f} N".format(derated_retention, disassembly)}
         )

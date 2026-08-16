@@ -1947,7 +1947,7 @@ def repair_open_mesh(mesh):
     diagonal = math.sqrt(sum(item * item for item in size)) if all(item > 0.0 for item in size) else 0.0
     if diagonal <= 0.0:
         return mesh, ()
-    tolerance = max(1e-12, diagonal * MESH_WELD_TOLERANCE_FRACTION)
+    tolerance = max(2e-6, diagonal * MESH_WELD_TOLERANCE_FRACTION)
     welded, rebuilt = _weld_vertices(mesh.vertices, mesh.triangles, tolerance)
     if len(welded) == len(mesh.vertices) and len(rebuilt) == len(mesh.triangles):
         return mesh, ()

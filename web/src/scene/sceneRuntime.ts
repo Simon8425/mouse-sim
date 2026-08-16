@@ -171,141 +171,115 @@ export interface SceneRuntime {
   dispose: () => void;
 }
 
-export function hashString(str: string): number {
-  let hash = 2166136261;
-  for (let i = 0; i < str.length; i++) {
-    hash ^= str.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  return hash >>> 0;
+/**
+ * Exploded-view offset computation.
+ *
+ * The model is "unstacked" vertically: every part lifts off the assembly and
+ * rises above the floor, with its height driven by its vertical position in
+ * the assembly (parts that were already higher end up higher in the explode),
+ * plus a modest outward lateral spread away from the assembly center. Nothing
+ * ever moves below the assembly — the exploded view can never go under the
+ * floor. Deterministic, id-independent, and purely display-only.
+ */
+export interface ExplodePart {
+  id: string;
+  /** Part AABB center (must share the frame of assemblyCenter). */
+  center: Vec3;
+  /** Part AABB size, used for the vertical stacking and lateral spread. */
+  size: Vec3;
 }
 
-export function mulberry32(seed: number): () => number {
-  return function () {
-    let t = (seed += 0x6d2b79f5);
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
+const EXPLODE_LIFT_BASE = 0;
+const EXPLODE_LIFT_RANGE = 1.1;
+const EXPLODE_LATERAL = 0.3;
 
 /**
- * World-Class CAD Exploded View Offset System:
- * Computes structured, axis-aligned, non-colliding explosion offset vectors
- * for assembly components (top shell, bottom case, PCB, buttons, scroll wheel).
- *
- * DISPLAY ONLY — never sent to structural analysis or pipeline requests.
+ * Compute the full-explode offset for every part. Targets are cached once per
+ * rebuild (they do not depend on the current explode factor), so the per-frame
+ * apply step only scales them by an eased factor.
  */
-export function explodeOffsetFor(
-  id: string,
+export function computeExplodeOffsets(
+  parts: ExplodePart[],
+  assemblyCenter: Vec3,
   maxDim: number,
-  boundsCenter?: Vec3,
-  partCenter?: Vec3,
-): Vec3 {
-  const lowerId = id.toLowerCase();
+): Map<string, Vec3> {
+  const targets = new Map<string, Vec3>();
+  if (parts.length === 0) return targets;
 
-  let dirX = 0;
-  let dirY = 0;
-  let dirZ = 0.3;
-
-  if (
-    lowerId.includes('button') ||
-    lowerId.includes('clicker') ||
-    lowerId.includes('paddle')
-  ) {
-    // Click buttons MUST float HIGHEST above the top shell
-    dirZ = 1.3;
-    dirY = 0.25;
-  } else if (
-    lowerId.includes('top') ||
-    lowerId.includes('upper') ||
-    lowerId.includes('cover') ||
-    lowerId.includes('shell_top')
-  ) {
-    dirZ = 0.95;
-    dirY = -0.05;
-  } else if (
-    lowerId.includes('wheel') ||
-    lowerId.includes('scroll') ||
-    lowerId.includes('encoder') ||
-    lowerId.includes('c-wheel') ||
-    lowerId.includes('c-pq')
-  ) {
-    if (
-      lowerId.includes('c-pq') ||
-      lowerId.includes('ring') ||
-      lowerId.includes('tire') ||
-      lowerId.includes('rubber')
-    ) {
-      // Outer rubber scroll ring / tire (e.g. C-PQ-2_7): slides off upward and right
-      dirZ = 0.85;
-      dirY = 0.42;
-      dirX = 0.22;
-    } else if (lowerId.includes('encoder')) {
-      dirZ = 0.55;
-      dirY = 0.18;
-      dirX = -0.3;
-    } else {
-      // Inner plastic wheel hub / axle (e.g. C-WHEEL-01FK): shifts lower and left
-      dirZ = 0.65;
-      dirY = 0.22;
-      dirX = -0.18;
-    }
-  } else if (lowerId.includes('switch') || lowerId.includes('microswitch')) {
-    dirZ = 0.55;
-    dirY = 0.1;
-  } else if (lowerId.includes('battery') || lowerId.includes('cell') || lowerId.includes('accu')) {
-    dirZ = 0.45;
-    dirX = -0.3;
-  } else if (
-    lowerId.includes('pcb') ||
-    lowerId.includes('board') ||
-    lowerId.includes('sensor') ||
-    lowerId.includes('mcu')
-  ) {
-    dirZ = 0.2;
-    dirY = -0.05;
-  } else if (
-    lowerId.includes('bottom') ||
-    lowerId.includes('lower') ||
-    lowerId.includes('base') ||
-    lowerId.includes('chassis')
-  ) {
-    dirZ = -0.45;
-  } else if (lowerId.includes('skate') || lowerId.includes('feet') || lowerId.includes('foot')) {
-    dirZ = -0.9;
-    dirY = 0.05;
-  } else if (boundsCenter && partCenter) {
-    const dz = partCenter[2] - boundsCenter[2];
-    const dy = partCenter[1] - boundsCenter[1];
-    const dx = partCenter[0] - boundsCenter[0];
-    dirZ = (dz + maxDim * 0.5) / maxDim;
-    if (Math.abs(dx) > maxDim * 0.08) {
-      dirX = Math.sign(dx) * 0.6;
-    }
-    if (Math.abs(dy) > maxDim * 0.08) {
-      dirY = Math.sign(dy) * 0.25;
-    }
+  // Vertical rank: 0 = lowest part, 1 = highest part, by center Z.
+  const sorted = [...parts].sort((a, b) => a.center[2] - b.center[2]);
+  const zMin = sorted[0].center[2];
+  const zMax = sorted[sorted.length - 1].center[2];
+  const zSpan = Math.max(zMax - zMin, 1e-9);
+  const rankByPart = new Map<string, number>();
+  for (const part of parts) {
+    rankByPart.set(part.id, (part.center[2] - zMin) / zSpan);
   }
 
-  // Handle side buttons and grips with clear outward lateral separation
-  if (lowerId.includes('left')) dirX = -0.85;
-  if (lowerId.includes('right')) dirX = 0.85;
-  if (lowerId.includes('side') || lowerId.includes('grip')) {
-    const side = hashString(id) % 2 === 0 ? 0.85 : -0.85;
-    dirX = side;
-    dirZ = Math.max(0.3, dirZ);
+  // Distance from assembly center on the X/Y plane (0 = innermost).
+  let maxLateral = 0;
+  for (const part of parts) {
+    const dx = part.center[0] - assemblyCenter[0];
+    const dy = part.center[1] - assemblyCenter[1];
+    maxLateral = Math.max(maxLateral, Math.sqrt(dx * dx + dy * dy));
+  }
+  const lateralSpan = Math.max(maxLateral, 1e-9);
+
+  for (const part of parts) {
+    const rank01 = rankByPart.get(part.id) ?? 0.5;
+    // All parts rise; higher parts rise more. The base lift keeps even the
+    // lowest parts well above the assembly (never under the floor).
+    const lift = maxDim * (EXPLODE_LIFT_BASE + EXPLODE_LIFT_RANGE * rank01);
+
+    // Modest outward lateral spread, away from the assembly center.
+    const dx = part.center[0] - assemblyCenter[0];
+    const dy = part.center[1] - assemblyCenter[1];
+    const lateralDist = Math.sqrt(dx * dx + dy * dy);
+    const lateralDirX = lateralDist > 1e-9 ? dx / lateralDist : 0;
+    const lateralDirY = lateralDist > 1e-9 ? dy / lateralDist : 0;
+    const lateral = maxDim * EXPLODE_LATERAL * (0.4 + 0.6 * (lateralDist / lateralSpan));
+
+    targets.set(part.id, [lateralDirX * lateral, lateralDirY * lateral, lift]);
   }
 
-  // Deterministic subtle jitter for generic/manifold parts to prevent overlaps
-  const hash = hashString(id);
-  const angle = (hash % 12) * (Math.PI / 6);
-  const jitterRadius = 0.12;
-  dirX += Math.cos(angle) * jitterRadius;
-  dirY += Math.sin(angle) * jitterRadius;
+  // Vertical de-overlap (single-pass stack resolution): sort parts by their
+  // exploded center Z and walk top-down. Whenever two parts overlap, push the
+  // higher one up just enough to clear the lower one — the stack compresses
+  // upward deterministically and can never move anything below the assembly.
+  // This handles nested/concentric parts (wheel hub inside the ring, buttons
+  // on the shell) without oscillating pairwise pushes.
+  const order = [...parts].sort((a, b) => {
+    const za = a.center[2] + (targets.get(a.id)?.[2] ?? 0);
+    const zb = b.center[2] + (targets.get(b.id)?.[2] ?? 0);
+    return za - zb;
+  });
+  const minGap = maxDim * 0.03;
+  const resolved = new Map<string, { center: Vec3; size: Vec3 }>();
+  for (const part of order) {
+    const ta = targets.get(part.id);
+    if (!ta) continue;
+    const ca = [
+      part.center[0] + ta[0],
+      part.center[1] + ta[1],
+      part.center[2] + ta[2],
+    ];
+    // Find the highest already-resolved part this one still overlaps.
+    let minLift = 0;
+    for (const other of resolved.values()) {
+      const overlapX = Math.abs(ca[0] - other.center[0]) < (part.size[0] + other.size[0]) / 2 + minGap;
+      const overlapY = Math.abs(ca[1] - other.center[1]) < (part.size[1] + other.size[1]) / 2 + minGap;
+      if (!overlapX || !overlapY) continue;
+      const required = (part.size[2] + other.size[2]) / 2 + minGap - (ca[2] - other.center[2]);
+      if (required > 0) minLift = Math.max(minLift, required);
+    }
+    if (minLift > 0) {
+      ta[2] += minLift;
+      ca[2] += minLift;
+    }
+    resolved.set(part.id, { center: [ca[0], ca[1], ca[2]], size: part.size });
+  }
 
-  const radius = maxDim * 0.85;
-  return [dirX * radius, dirY * radius, dirZ * radius];
+  return targets;
 }
 
 export function detectQualityTier(): QualityTier {
@@ -422,6 +396,8 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   renderer.shadowMap.enabled = quality !== 'low';
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
+  let composer: EffectComposer | null = null;
+
   const updatePixelRatio = () => {
     const dpr = window.devicePixelRatio || 1;
     const maxRatio = quality === 'ultra' ? 2.5 : quality === 'high' ? 2 : 1.5;
@@ -447,6 +423,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   controls.maxDistance = 20;
   controls.screenSpacePanning = true;
 
+  let onContextRestored: (() => void) | null = null;
   const handleContextLost = (event: Event) => {
     event.preventDefault();
     if (animationFrameId !== null) {
@@ -456,9 +433,18 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   };
 
   const handleContextRestored = () => {
-    if (!disposed && animationFrameId === null) {
-      lastFrameTime = performance.now();
-      animationFrameId = requestAnimationFrame(renderLoop);
+    if (!disposed) {
+      if (onContextRestored) {
+        try {
+          onContextRestored();
+        } catch (err) {
+          console.warn('[SceneRuntime] Context restore error:', err);
+        }
+      }
+      if (animationFrameId === null) {
+        lastFrameTime = performance.now();
+        animationFrameId = requestAnimationFrame(renderLoop);
+      }
     }
   };
 
@@ -606,7 +592,6 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   };
 
   // Post processing
-  let composer: EffectComposer | null = null;
   let outlinePass: OutlinePass | null = null;
   const originalEmissiveMap = new WeakMap<THREE.MeshStandardMaterial, number>();
 
@@ -663,6 +648,16 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   let instancedBatches: InstancedBatchGroup | null = null;
   /** Per-object explode translation (objectId → offset), consumed by syncInstancedPose. */
   const explodeByObjectId = new Map<string, THREE.Vector3>();
+  /**
+   * Full-explode target offset per object, computed once per rebuild from
+   * part AABBs (see computeExplodeOffsets). Factor-independent — the per-frame
+   * apply step only scales these by an eased factor.
+   */
+  const explodeTargets = new Map<string, Vec3>();
+  /** Per-part stagger (0..1) so parts bloom outward in distance order. */
+  const explodeStagger = new Map<string, number>();
+  /** Scratch matrix for composing explode translations onto instanced shells. */
+  const scratchExplodeMatrix = new THREE.Matrix4();
   let dropTime = 0;
   let dropPlaying = false;
   let playbackSpeed = 1.0;
@@ -907,8 +902,13 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
    * contact in the telemetry stream). Mirrors the render-loop window logic.
    */
   const telemetryCollectorContactWindow = (): boolean => {
-    if (!currentFeaResult?.computed) return false;
-    const windowS = currentFeaResult.impact_window_s ?? 0.3;
+    if (lastLiveState && lastLiveState.position[2] < 0.05) return true;
+    if (!currentDropSimulation) return false;
+    for (const impact of currentDropSimulation.impacts ?? []) {
+      const t = impact.t_s;
+      if (Math.abs(dropTime - t) < 0.15) return true;
+    }
+    const windowS = currentFeaResult?.impact_window_s ?? 0.3;
     const impactTime = currentDropSimulation?.impacts?.[0]?.t_s ?? (currentDropSimulation?.drops[0]?.end_s ?? 1) * 0.38;
     return impactWindowProgress(dropTime, impactTime, windowS > 0 ? windowS : 0.3) > 0 && impactWindowProgress(dropTime, impactTime, windowS > 0 ? windowS : 0.3) < 1;
   };
@@ -1067,6 +1067,8 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       instancedBatches = null;
     }
     explodeByObjectId.clear();
+    explodeTargets.clear();
+    explodeStagger.clear();
 
     // Instancing is mutually exclusive with FEA decoration: per-vertex
     // attributes (aDamage/aDisplacement) are per-geometry, not per-instance,
@@ -1081,6 +1083,10 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
 
     let hasFiniteBounds = false;
+
+    // Part AABBs (analytical, from entry geometry — no scene traversal) feed
+    // both the assembly bounds and the explode targets.
+    const explodeParts: ExplodePart[] = [];
 
     for (const entry of currentEntries) {
       const outerGroup = new THREE.Group();
@@ -1102,6 +1108,19 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
         maxX = Math.max(maxX, bounds.max[0]);
         maxY = Math.max(maxY, bounds.max[1]);
         maxZ = Math.max(maxZ, bounds.max[2]);
+        explodeParts.push({
+          id: entry.id,
+          center: [
+            (bounds.min[0] + bounds.max[0]) / 2,
+            (bounds.min[1] + bounds.max[1]) / 2,
+            (bounds.min[2] + bounds.max[2]) / 2,
+          ],
+          size: [
+            Math.max(bounds.max[0] - bounds.min[0], 1e-6),
+            Math.max(bounds.max[1] - bounds.min[1], 1e-6),
+            Math.max(bounds.max[2] - bounds.min[2], 1e-6),
+          ],
+        });
       }
 
       // Batch the part instead of rendering it as its own mesh when it is
@@ -1131,13 +1150,16 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       });
       objectsGroup.add(instancedBatches.group);
       // Instanced parts keep an invisible outer shell so applyExplode's
-      // setFromObject bounds and the picker's id walk keep working.
+      // bounds and the picker's id walk keep working.
       for (const { entry, matrix } of instancedParts) {
         const shell = new THREE.Group();
         shell.userData.objectId = entry.id;
         shell.userData.instanced = true;
         shell.matrixAutoUpdate = false;
         shell.matrix.copy(matrix);
+        // Keep the baked transform around so applyExplode can compose the
+        // explode translation on top without losing the part's placement.
+        shell.userData.bakedMatrix = matrix.clone();
         shell.visible = true;
         objectsGroup.add(shell);
       }
@@ -1157,6 +1179,26 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       maxDimension = 0.1;
     }
 
+    // Build the full-explode targets once from the analytical AABBs. The
+    // targets are factor-independent; the per-frame apply step scales them by
+    // an eased factor.
+    if (explodeParts.length > 0) {
+      const assemblyCenter: Vec3 = [
+        (boundsUnion.min[0] + boundsUnion.max[0]) / 2,
+        (boundsUnion.min[1] + boundsUnion.max[1]) / 2,
+        (boundsUnion.min[2] + boundsUnion.max[2]) / 2,
+      ];
+      const computed = computeExplodeOffsets(explodeParts, assemblyCenter, maxDimension);
+      // All parts rise together with a single smooth ease — no per-part
+      // stagger, so the explode reads as one coherent unstack instead of a
+      // chaotic wave.
+      for (const part of explodeParts) {
+        const target = computed.get(part.id);
+        if (target) explodeTargets.set(part.id, target);
+        explodeStagger.set(part.id, 0);
+      }
+    }
+
     syncGridAndGround();
     overlayLayer.setPlaneRadius(maxDimension / 2);
     overlayLayer.setContactPlaneRadius(floorSize / 2);
@@ -1166,7 +1208,6 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   };
 
   const tempBox = new THREE.Box3();
-  const tempCenter = new THREE.Vector3();
 
   const applyExplode = () => {
     const defaultBaseZ = -boundsUnion.min[2];
@@ -1174,127 +1215,52 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
 
     if (currentExplodeFactor <= 0) {
       for (const outer of objectsGroup.children) {
-        outer.position.set(0, 0, 0);
+        if (typeof outer.userData?.objectId !== 'string') continue;
+        if (outer.userData.instanced) {
+          const baked = outer.userData.bakedMatrix as THREE.Matrix4 | undefined;
+          if (baked) outer.matrix.copy(baked);
+        } else {
+          outer.position.set(0, 0, 0);
+        }
       }
       explodeByObjectId.clear();
       syncInstancedPose(instancedBatches, explodeByObjectId, currentVisibility);
       return;
     }
 
-    const children = objectsGroup.children.filter(
-      (c) => typeof c.userData?.objectId === 'string',
-    );
-    if (children.length === 0) return;
-
-    const assemblyCenter: Vec3 = boundsUnion
-      ? [
-          (boundsUnion.min[0] + boundsUnion.max[0]) / 2,
-          (boundsUnion.min[1] + boundsUnion.max[1]) / 2,
-          (boundsUnion.min[2] + boundsUnion.max[2]) / 2,
-        ]
-      : [0, 0, 0];
-
-    // Measure unexploded local Z centroid for spatial rank sorting
-    const partList: { outer: THREE.Object3D; id: string; centerZ: number; partCenter: Vec3 }[] = [];
-    for (const outer of children) {
-      const id = outer.userData.objectId as string;
-      tempBox.setFromObject(outer);
-      if (!tempBox.isEmpty()) {
-        tempBox.getCenter(tempCenter);
-        partList.push({
-          outer,
-          id,
-          centerZ: tempCenter.z,
-          partCenter: [tempCenter.x, tempCenter.y, tempCenter.z],
-        });
-      } else {
-        partList.push({ outer, id, centerZ: 0, partCenter: [0, 0, 0] });
-      }
-    }
-
-    // Sort parts from bottom to top along Z height
-    partList.sort((a, b) => a.centerZ - b.centerZ);
-
-    const count = partList.length;
-    const minZ = partList[0].centerZ;
-    const maxZ = partList[count - 1].centerZ;
-    const zRange = Math.max(maxZ - minZ, 0.001);
-
-    // 1. Calculate raw base target positions and rank ratios for all parts
-    const targets: { outer: THREE.Object3D; id: string; targetPos: Vec3; rankRatio: number }[] = [];
-
-    for (let i = 0; i < count; i++) {
-      const { outer, id, centerZ, partCenter } = partList[i];
-      const baseOffset = explodeOffsetFor(id, maxDimension, assemblyCenter, partCenter);
-
-      const spatialRankRatio = count > 1 ? (centerZ - minZ) / zRange : 0.5;
-      const indexRankRatio = count > 1 ? i / (count - 1) : 0;
-      const rankRatio = spatialRankRatio * 0.6 + indexRankRatio * 0.4;
-
-      const rankZ = rankRatio * maxDimension * 0.55;
-      const finalZ = baseOffset[2] * 0.35 + rankZ;
-
-      targets.push({
-        outer,
-        id,
-        targetPos: [baseOffset[0], baseOffset[1], finalZ],
-        rankRatio,
-      });
-    }
-
-    // 2. Dynamic Concentric & Overlap Repulsion Pass:
-    // Guarantees that concentric or nested parts (such as wheel hub vs rubber ring,
-    // or concentric switches/buttons) push away from each other so NO TWO components overlap!
-    const minDistance = maxDimension * 0.20;
-    for (let i = 0; i < count; i++) {
-      for (let j = i + 1; j < count; j++) {
-        const a = targets[i];
-        const b = targets[j];
-        const dx = a.targetPos[0] - b.targetPos[0];
-        const dy = a.targetPos[1] - b.targetPos[1];
-        const dz = a.targetPos[2] - b.targetPos[2];
-        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-
-        if (dist < minDistance) {
-          const push = (minDistance - Math.max(dist, 0.001)) * 0.55;
-          let nx = dist > 0.001 ? dx / dist : 0.707;
-          const ny = dist > 0.001 ? dy / dist : 0.707;
-          const nz = dist > 0.001 ? dz / dist : 0.5;
-
-          // If parts are heavily co-centered along X/Y (like scroll wheel rings), force a strong lateral split
-          if (Math.abs(dx) < maxDimension * 0.05) {
-            nx = (i % 2 === 0 ? 1 : -1) * 0.8;
-          }
-
-          a.targetPos[0] += nx * push;
-          a.targetPos[1] += ny * push;
-          a.targetPos[2] += nz * push;
-
-          b.targetPos[0] -= nx * push;
-          b.targetPos[1] -= ny * push;
-          b.targetPos[2] -= nz * push;
-        }
-      }
-    }
-
-    // 3. Apply positions with smooth staggered easing. Instanced parts get
-    // their explode translation recorded into explodeByObjectId (the outer
-    // shell position stays zero) and the batch matrices are rewritten once.
     explodeByObjectId.clear();
-    for (let i = 0; i < count; i++) {
-      const { outer, targetPos, rankRatio } = targets[i];
-      const staggerDelay = (1.0 - rankRatio) * 0.35;
-      const rawPartFactor = Math.min(
-        1.0,
-        Math.max(0.0, (currentExplodeFactor - staggerDelay) / Math.max(0.001, 1.0 - staggerDelay)),
-      );
-      const easedFactor = rawPartFactor * rawPartFactor * (3 - 2 * rawPartFactor);
+    for (const outer of objectsGroup.children) {
+      const id = outer.userData?.objectId as string | undefined;
+      if (typeof id !== 'string') continue;
+      const target = explodeTargets.get(id);
+      if (!target) continue;
 
-      const tx = targetPos[0] * easedFactor;
-      const ty = targetPos[1] * easedFactor;
-      const tz = targetPos[2] * easedFactor;
+      // Per-part stagger so parts bloom outward in distance order (inner parts
+      // leave first, outer parts follow).
+      const stagger = explodeStagger.get(id) ?? 0;
+      const local01 =
+        stagger > 0.999 ? 1 : Math.min(1, Math.max(0, (currentExplodeFactor - stagger) / (1 - stagger)));
+      const eased = local01 * local01 * (3 - 2 * local01);
+
+      const tx = target[0] * eased;
+      const ty = target[1] * eased;
+      const tz = target[2] * eased;
+
       if (outer.userData.instanced) {
-        explodeByObjectId.set(outer.userData.objectId as string, new THREE.Vector3(tx, ty, tz));
+        // The shell carries the baked part transform in `matrix`
+        // (matrixAutoUpdate=false), so compose the explode translation on top
+        // of the baked matrix — position alone is ignored when
+        // matrixAutoUpdate is false. syncInstancedPose adds the map value to
+        // the instance's baked position, so the map stores the offset only.
+        const baked = outer.userData.bakedMatrix as THREE.Matrix4 | undefined;
+        if (baked) {
+          const composed = scratchExplodeMatrix.copy(baked);
+          composed.elements[12] += tx;
+          composed.elements[13] += ty;
+          composed.elements[14] += tz;
+          outer.matrix.copy(composed);
+        }
+        explodeByObjectId.set(id, new THREE.Vector3(tx, ty, tz));
       } else {
         outer.position.set(tx, ty, tz);
       }
@@ -1441,6 +1407,11 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     resizeObserver.observe(canvas.parentElement);
   }
   resize();
+  onContextRestored = () => {
+    updatePixelRatio();
+    rebuildObjects();
+    resize();
+  };
 
   // Picker
   const picker = createPicker(canvas, camera, objectsGroup, {
@@ -1494,9 +1465,14 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     } else {
       lastFrameTime = null;
     }
-    // Smoothly animate exploded view transition (60 FPS spring lerp)
+    // Smoothly animate the exploded-view transition. The ease is driven by
+    // wall-clock delta so the rate is identical at any refresh rate (a fixed
+    // per-frame factor would explode twice as fast on 120 Hz displays).
     if (Math.abs(targetExplodeFactor - currentExplodeFactor) > 0.0005) {
-      currentExplodeFactor += (targetExplodeFactor - currentExplodeFactor) * 0.12;
+      const now = performance.now();
+      const delta = lastFrameTime === null ? 0.016 : Math.min(0.1, (now - lastFrameTime) / 1000);
+      const k = 1 - Math.exp(-10 * delta);
+      currentExplodeFactor += (targetExplodeFactor - currentExplodeFactor) * k;
       applyExplode();
     } else if (currentExplodeFactor !== targetExplodeFactor) {
       currentExplodeFactor = targetExplodeFactor;
@@ -1597,7 +1573,9 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
 
       if (first || idSignature !== currentIdSignature) {
         currentIdSignature = idSignature;
-        fitCameraToBounds(camera, controls, floorFramingBounds());
+        // Lower camera elevation on model load so the model sits closer to
+        // the bottom of the frame.
+        fitCameraToBounds(camera, controls, floorFramingBounds(), 0.28);
       }
     },
 
@@ -1621,14 +1599,14 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       if (disposed || currentDropSimulation) return;
       targetExplodeFactor = Math.min(1, Math.max(0, factor));
     },
-
     setTheme(newTheme: 'light' | 'dark') {
       if (disposed || newTheme === theme) return;
       theme = newTheme;
-      palette.dispose();
+      const oldPalette = palette;
       palette = new MaterialPalette(theme);
       scene.background = new THREE.Color(theme === 'dark' ? 0x121212 : 0xf7f7f4);
       rebuildObjects();
+      oldPalette.dispose();
     },
 
     setQuality(newQuality: QualityTier) {
@@ -1775,7 +1753,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
         });
       } else {
         // Reset camera back to standard CAD model framing when leaving test mode
-        fitCameraToBounds(camera, controls, floorFramingBounds());
+        fitCameraToBounds(camera, controls, floorFramingBounds(), 0.28);
       }
     },
 
@@ -1980,7 +1958,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       } else {
         objectsGroup.visible = true;
         if (!currentDropSimulation) {
-          fitCameraToBounds(camera, controls, floorFramingBounds());
+          fitCameraToBounds(camera, controls, floorFramingBounds(), 0.28);
         }
       }
     },
@@ -2018,7 +1996,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
 
     fit() {
       if (disposed) return;
-      fitCameraToBounds(camera, controls, floorFramingBounds());
+      fitCameraToBounds(camera, controls, floorFramingBounds(), 0.28);
     },
 
     preset(name: CameraPreset) {

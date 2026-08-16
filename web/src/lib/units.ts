@@ -62,6 +62,22 @@ export function formatMass(kg: number | null): string {
   return `${formatSig(kg, 3)} kg`;
 }
 
+export function formatVolume(m3: number | null): string {
+  if (m3 === null || !Number.isFinite(m3)) return '—';
+  const abs = Math.abs(m3);
+  if (abs === 0) return '0 m³';
+  if (abs < 1e-6) {
+    return `${formatSig(m3 * 1e9, 3)} mm³`;
+  }
+  if (abs < 1e-3) {
+    return `${formatSig(m3 * 1e6, 3)} cm³`;
+  }
+  if (abs < 1) {
+    return `${formatSig(m3 * 1000, 3)} L`;
+  }
+  return `${formatSig(m3, 3)} m³`;
+}
+
 export function formatForce(n: number | null): string {
   if (n === null || !Number.isFinite(n)) return '—';
   const abs = Math.abs(n);

@@ -85,14 +85,13 @@ function quatRotateVector(q: number[], v: number[]): [number, number, number] {
   if (q.length !== 4 || v.length !== 3) return [v[0] ?? 0, v[1] ?? 0, v[2] ?? 0];
   const [w, x, y, z] = q;
   const [vx, vy, vz] = v;
-  const ix = w * vx + y * vz - z * vy;
-  const iy = w * vy + z * vx - x * vz;
-  const iz = w * vz + x * vy - y * vx;
-  const iw = -x * vx - y * vy - z * vz;
+  const tx = 2 * (y * vz - z * vy);
+  const ty = 2 * (z * vx - x * vz);
+  const tz = 2 * (x * vy - y * vx);
   return [
-    ix * w + iw * -x + iy * -z - iz * -y,
-    iy * w + iw * -y + iz * -x - ix * -z,
-    iz * w + iw * -z + ix * -y - iy * -x,
+    vx + w * tx + (y * tz - z * ty),
+    vy + w * ty + (z * tx - x * tz),
+    vz + w * tz + (x * ty - y * tx),
   ];
 }
 
@@ -170,12 +169,13 @@ export async function buildRapierDropSim(
     z: Math.max(1e-7, inertia[2]?.[2] ?? 1e-4),
   };
 
-  // Collider: convex hull of the display mesh vertices (the same
-  // convex-contact philosophy as the backend hull fix).
+  // Collider: convex hull of the display mesh vertices.
   const collider = buildCollider(RAPIER, entries);
   if (collider !== null) {
+    if (typeof collider.setMassProperties === 'function') {
+      collider.setMassProperties(mass, { x: com[0], y: com[1], z: com[2] }, principal, { x: 0, y: 0, z: 0, w: 1 });
+    }
     collider
-      .setMassProperties(mass, { x: com[0], y: com[1], z: com[2] }, principal, { x: 0, y: 0, z: 0, w: 1 })
       .setRestitution(restitution)
       .setRestitutionCombineRule(RAPIER.CoefficientCombineRule.Max)
       .setFriction(friction);
@@ -458,14 +458,15 @@ function readBodyState(
 ): LiveBodyState {
   const p = body.translation();
   const r = body.rotation();
+  const sleeping = typeof body.isSleeping === 'function' && body.isSleeping();
   const v = body.linvel();
   const w = body.angvel();
-  const vx = Math.abs(v.x) < 1e-5 ? 0 : v.x;
-  const vy = Math.abs(v.y) < 1e-5 ? 0 : v.y;
-  const vz = Math.abs(v.z) < 1e-5 ? 0 : v.z;
-  const wx = Math.abs(w.x) < 1e-5 ? 0 : w.x;
-  const wy = Math.abs(w.y) < 1e-5 ? 0 : w.y;
-  const wz = Math.abs(w.z) < 1e-5 ? 0 : w.z;
+  const vx = sleeping || Math.abs(v.x) < 1e-4 ? 0 : v.x;
+  const vy = sleeping || Math.abs(v.y) < 1e-4 ? 0 : v.y;
+  const vz = sleeping || Math.abs(v.z) < 1e-4 ? 0 : v.z;
+  const wx = sleeping || Math.abs(w.x) < 1e-4 ? 0 : w.x;
+  const wy = sleeping || Math.abs(w.y) < 1e-4 ? 0 : w.y;
+  const wz = sleeping || Math.abs(w.z) < 1e-4 ? 0 : w.z;
   if (out) {
     out.position[0] = p.x;
     out.position[1] = p.y;

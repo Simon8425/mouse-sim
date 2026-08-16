@@ -292,7 +292,7 @@ def validate_config(config):
                     "drop_simulation.orientation.quaternion_wxyz must contain finite components"
                 )
             components.append(numeric)
-        if _norm(components) <= 0.0:
+        if sum(c * c for c in components) <= 0.0:
             raise DropSimulationError(
                 "drop_simulation.orientation.quaternion_wxyz must have a non-zero norm"
             )
@@ -488,7 +488,7 @@ def _gyroscopic_update(angular_body, inertia_body, inverse_inertia_body, dt):
     # it below ~1e-5 of the rotational energy per substep even at
     # lever-amplified spins, so free-flight stretches stay within the energy
     # drift check.
-    substeps = max(1, int(math.ceil(asym * magnitude * dt / 0.0045)))
+    substeps = max(1, min(2048, int(math.ceil(asym * magnitude * dt / 0.0045))))
     step_dt = dt / substeps
     for _ in range(substeps):
         inertia_omega = _matvec(inertia_body, angular_body)
@@ -2008,8 +2008,8 @@ def _simulate_drop(
             if (
                 acceptance_rejected
                 and not budget_exhausted
-                and up_world[2] < 0.7
                 and not quiet_pinned
+                and _quaternion_rotate(quaternion, (0.0, 0.0, 1.0))[2] < 0.7
             ):
                 # METASTABLE rest: the floor cannot hold the CoM outside the
                 # contact face (a narrow edge/corner/rounded feature), or
@@ -2128,20 +2128,9 @@ def _simulate_drop(
                 ledger_losses["resting_clamp_ke_j"] += clamp_loss
                 accounted_losses += clamp_loss
         else:
-            pre_drag_energy = total_energy()
-            drag_factor = 1.0 - 0.15 * dt
-            angular_body = (
-                angular_body[0] * drag_factor,
-                angular_body[1] * drag_factor,
-                angular_body[2] * drag_factor,
-            )
-            drag_step_loss = max(0.0, pre_drag_energy - total_energy())
-            lost_drag += drag_step_loss
-            accounted_losses += drag_step_loss
-            flight_drag_loss += drag_step_loss
-            # The semi-implicit Euler free-flight sag is booked inside the
-            # window loop per flight segment (with the actual segment size);
-            # the outer no-contact branch must NOT book it again.
+            # Free flight: exact conservation of angular momentum in the body frame
+            # (Euler gyroscopic equations). Contact-phase damping handles energy dissipation.
+            pass
 
         # The rest criterion is evaluated on the CONTACT-TIME velocity: after
         # the remainder integration a resting body always carries the

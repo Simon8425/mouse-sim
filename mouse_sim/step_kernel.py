@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -54,16 +55,24 @@ _STEP_MARKERS = (
 _STEP_UNIT_NAMES = {
     "METRE": "m",
     "METER": "m",
+    "METRES": "m",
+    "METERS": "m",
     "MILLIMETRE": "mm",
     "MILLIMETER": "mm",
+    "MILLIMETRES": "mm",
+    "MILLIMETERS": "mm",
     "CENTIMETRE": "cm",
     "CENTIMETER": "cm",
+    "CENTIMETRES": "cm",
+    "CENTIMETERS": "cm",
     "MICROMETRE": "um",
     "MICROMETER": "um",
     "KILOMETRE": "km",
     "KILOMETER": "km",
     "INCH": "in",
+    "INCHES": "in",
     "FOOT": "ft",
+    "FEET": "ft",
 }
 _UNIT_SCALE_TO_M = {
     "m": 1.0,
@@ -158,6 +167,49 @@ def kernel_available():
         return False
 
 
+def _run_worker(script_path, args, timeout=DEFAULT_TIMEOUT):
+    """Run the worker script inside FreeCADCmd with resource limits and timeout."""
+    cmd = freecadcmd_path()
+    if cmd is None:
+        raise StepKernelUnavailable("FreeCADCmd is not installed or configured")
+    full_cmd = [str(cmd), str(script_path)] + list(args)
+    env = dict(os.environ)
+    # Ensure FreeCAD does not pop up GUI or interactive dialogs
+    env["FREECAD_USER_DATA"] = str(_PROCESS_ASSET_DIR)
+    kwargs = {}
+    if os.name != "nt":
+        kwargs["start_new_session"] = True
+    try:
+        process = subprocess.Popen(
+            full_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            **kwargs
+        )
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if os.name != "nt":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except Exception:
+                process.kill()
+        else:
+            process.kill()
+        process.communicate()
+        raise StepKernelFailure(
+            "FreeCAD STEP worker timed out after {:.1f} s".format(timeout)
+        )
+    except OSError as exc:
+        raise StepKernelFailure("failed to launch FreeCAD worker: {}".format(exc))
+    if process.returncode != 0:
+        err_msg = stderr.decode("utf-8", errors="replace").strip()
+        out_msg = stdout.decode("utf-8", errors="replace").strip()
+        msg = err_msg or out_msg or "exit code {}".format(process.returncode)
+        raise StepKernelFailure("FreeCAD worker failed: {}".format(msg))
+    return stdout.decode("utf-8", errors="replace")
+
+
 def requires_kernel(data, backend="auto"):
     """Return whether a STEP payload must use the FreeCAD/OCCT backend."""
     mode = str(backend or "auto").strip().lower()
@@ -190,12 +242,14 @@ def step_unit_hint(data):
         (rb"\.MICRO\.\s*,\s*\.METRE\.", "um"),
         (rb"\.KILO\.\s*,\s*\.METRE\.", "km"),
         (rb"\$\s*,\s*\.METRE\.", "m"),
+        (rb"\.METRE\.", "m"),
     )
     for pattern, unit in patterns:
-        if re.search(rb"SI_UNIT\s*\(\s*" + pattern, upper):
+        if re.search(rb"SI_UNIT\s*\([^)]*" + pattern, upper):
             return unit
     for raw_name in re.findall(rb"CONVERSION_BASED_UNIT\s*\(\s*'([^']+)'", upper):
-        unit = _STEP_UNIT_NAMES.get(raw_name.decode("ascii", errors="ignore").strip())
+        clean_name = raw_name.decode("ascii", errors="ignore").strip().upper()
+        unit = _STEP_UNIT_NAMES.get(clean_name)
         if unit is not None:
             return unit
     return None

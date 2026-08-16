@@ -370,11 +370,13 @@ def _analyze_battery(spec, context):
     transmitted = 0.5 * impact_force
     crush_margin = transmitted / crush if crush > 0.0 else 1.0
     shock_margin = accel_g / shock_limit if shock_limit > 0.0 else 1.0
-    # Snap-fit latch retention: if the transmitted cell inertia
-    # F_inertia = m_battery * a_peak (chassis-attenuated) exceeds the
-    # retention hook force, the cell dislodges.  BLOCKER-class finding; the
-    # latch channel never drives the status below "warn" on its own.
     latch_inertia = latch_transmission * impact_force
+    latch_normal = spec.get("latch_normal") or spec.get("latch_direction")
+    accel_vec = drop.get("accel_vector_g") or context.get("peak_accel_vector_g")
+    if isinstance(latch_normal, (list, tuple)) and len(latch_normal) == 3 and isinstance(accel_vec, (list, tuple)) and len(accel_vec) == 3:
+        proj_g = sum(float(a) * float(n) for a, n in zip(accel_vec, latch_normal))
+        latch_inertia = latch_transmission * max(0.0, mass * proj_g * 9.80665)
+    latch_usage = latch_inertia / latch_retention if latch_retention > 0.0 else 1.0
     latch_margin = latch_retention / latch_inertia if latch_inertia > 0.0 else 1.0
     findings = []
     status = "pass"
@@ -394,12 +396,14 @@ def _analyze_battery(spec, context):
                 {"code": "BATTERY_SHOCK_EXCEEDED", "severity": "error", "message": "peak drop acceleration {:.0f} g exceeds the cell shock limit {:.0f} g beyond the class-constant screening uncertainty band".format(accel_g, shock_limit)}
             )
     elif crush_margin >= _WARN_RATIO or shock_margin >= _WARN_RATIO:
-        status = "warn"
+        if status == "pass":
+            status = "warn"
         findings.append(
             {"code": "BATTERY_SHOCK_MARGINAL", "severity": "warning", "message": "drop shock utilization {:.0%} of the screening limit at the boundary; within the class-constant screening uncertainty band".format(max(crush_margin, shock_margin))}
         )
     elif crush_margin > 0.8 or shock_margin > 0.8:
-        status = "warn"
+        if status == "pass":
+            status = "warn"
         findings.append(
             {"code": "BATTERY_SHOCK_MARGINAL", "severity": "warning", "message": "drop shock utilization {:.0%} of the screening limit; within class-data scatter".format(max(crush_margin, shock_margin))}
         )
@@ -418,6 +422,7 @@ def _analyze_battery(spec, context):
         "latch_inertia_n": round(latch_inertia, 3),
         "latch_retention_n": round(latch_retention, 3),
         "latch_margin": round(latch_margin, 6),
+        "latch_usage": round(latch_usage, 6),
     }
     assumptions = [
         "chassis-to-cell force transmission factor 0.5 (screening; rigid-mount bound ~1.0, foam-mount lower)",
@@ -426,7 +431,7 @@ def _analyze_battery(spec, context):
         "crush channel loads the cell by its OWN inertia; the chassis-level force path is not separately modeled (screening)",
         "latch channel: transmitted cell inertia m * a_peak * 0.5 vs the retention hook force; hook force class 8 N for a cantilever snap-fit cell cradle (assembly-force class data)",
     ]
-    return _result("battery", "battery", status, metrics, findings, assumptions, max(crush_margin, shock_margin, latch_margin))
+    return _result("battery", "battery", status, metrics, findings, assumptions, max(crush_margin, shock_margin, latch_usage))
 
 
 def _analyze_switch(spec, context):

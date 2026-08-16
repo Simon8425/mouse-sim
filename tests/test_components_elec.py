@@ -241,7 +241,7 @@ class KnifeEdgeBoundaryTests(unittest.TestCase):
         # shock_margin = accel_g / shock_limit; crush channel stays ~0.45.
         for ratio, expected in ((1.0, "warn"), (1.19, "warn"), (1.2, "fail"), (1.21, "fail")):
             result = analyze(
-                {"component_id": "b", "type": "battery", "shock_limit_g": 500.0},
+                {"component_id": "b", "type": "battery", "shock_limit_g": 500.0, "latch_retention_n": 100.0},
                 {"drop": {"peak_accel_g": 500.0 * ratio}},
             )
             self.assertEqual(result["status"], expected, "shock ratio {:.2f}".format(ratio))

@@ -60,7 +60,7 @@ export class TelemetryCollector {
     const floorZ = opts.floorZ ?? 0;
     const diag: [number, number, number] = [inertia[0]?.[0] ?? 0, inertia[1]?.[1] ?? 0, inertia[2]?.[2] ?? 0];
     const drop0 = result.drops?.[0];
-    const releaseJ = drop0?.energy?.release_j ?? 0.5 * mass * gravity * (result.config?.height_m ?? 0.75);
+    const releaseJ = drop0?.energy?.release_j ?? mass * gravity * (result.config?.height_m ?? 0.75);
     this.fea = opts.fea ?? null;
     this.ring = new RingBuffer<TelemetryFrame>(opts.capacity ?? 4096);
     this.auditor = new EnergyAuditor({

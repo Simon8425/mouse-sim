@@ -15,7 +15,7 @@ import { isFiniteNumber } from '../api/contracts';
 import type { LiveDropData } from '../scene/SceneViewport';
 import { useProjectStore } from '../state/projectStore';
 import { selectHasStaleResult } from '../state/selectors';
-import { severityLabel, severityTone } from '../lib/status';
+import { severityTone } from '../lib/status';
 import {
   formatForce,
   formatLength,
@@ -312,7 +312,7 @@ function buildMetrics(result: PipelineResult, liveDropData?: LiveDropData | null
     result.mass?.mass_kg ??
     (isFiniteNumber(dropSim?.model?.mass_kg) ? (dropSim?.model?.mass_kg as number) : null) ??
     null;
-  const mass = rawMass ?? 0.06;
+  const mass = rawMass;
 
   // Live active drop telemetry takes precedence during playback
   const activeDrop = liveDropData?.activeDrop ?? null;
@@ -328,24 +328,19 @@ function buildMetrics(result: PipelineResult, liveDropData?: LiveDropData | null
       ? (dropSim?.peak_force_estimate_n as number)
       : null) ??
     null;
-  const basePeakForce =
-    rawPeakForce ??
-    (isFiniteNumber(dropSim?.config?.height_m)
-      ? Math.sqrt(2 * 9.80665 * (dropSim?.config?.height_m as number) * mass * 450000)
-      : 148.5);
 
-  const peakForce = activeDrop && activeDrop.peak_impact_speed_m_s > 0
-    ? Math.max(10, basePeakForce * (activeDrop.peak_impact_speed_m_s / 3.83))
-    : basePeakForce;
+  const peakForce =
+    activeDrop && activeDrop.peak_impact_speed_m_s > 0 && rawPeakForce != null
+      ? Math.max(10, rawPeakForce * (activeDrop.peak_impact_speed_m_s / 3.83))
+      : rawPeakForce;
 
   const rawPeakAccel =
     (impact !== null && impact !== undefined && isFiniteNumber(impact.peak_acceleration_m_s2)
       ? (impact.peak_acceleration_m_s2 as number) / 9.80665
       : null);
-  const peakAccel = rawPeakAccel ?? peakForce / (mass * 9.80665);
-
-  // Calculate physically realistic drop stress based on peak impact deceleration
-  const dynamicDropStress = Math.min(85e6, Math.max(18e6, (peakForce * 0.07) / (6 * 0.0015 * 0.0015 * 0.04)));
+  const peakAccel =
+    rawPeakAccel ??
+    (peakForce != null && mass != null && mass > 0 ? peakForce / (mass * 9.80665) : null);
 
   const rawMaxStress =
     (fea?.peak?.stress_mpa != null && isFiniteNumber(fea.peak.stress_mpa)
@@ -358,7 +353,7 @@ function buildMetrics(result: PipelineResult, liveDropData?: LiveDropData | null
       ? (structural?.max_stress_pa as number)
       : null) ??
     null;
-  const maxStress = rawMaxStress ?? dynamicDropStress;
+  const maxStress = rawMaxStress;
 
   const rawSafetyFactor =
     (isFiniteNumber(fea?.safety_factor) ? (fea?.safety_factor as number) : null) ??
@@ -376,7 +371,7 @@ function buildMetrics(result: PipelineResult, liveDropData?: LiveDropData | null
       ? impact.safety_factor
       : null) ??
     null;
-  const safetyFactor = rawSafetyFactor ?? Math.max(0.4, Math.min(4.5, 45e6 / maxStress));
+  const safetyFactor = rawSafetyFactor;
 
   const rawMaxDeformation =
     (isFiniteNumber(shell?.max_displacement_m)
@@ -391,37 +386,37 @@ function buildMetrics(result: PipelineResult, liveDropData?: LiveDropData | null
       ? (impact.contact_compression_m as number)
       : null) ??
     null;
-  const maxDeformation = rawMaxDeformation ?? Math.min(0.002, peakForce / 450000);
+  const maxDeformation = rawMaxDeformation;
 
   return [
     {
       label: 'Mass',
-      value: formatMass(mass),
+      value: mass != null ? formatMass(mass) : '—',
       raw: mass,
     },
     {
       label: 'Impact force',
-      value: formatForce(peakForce),
+      value: peakForce != null ? formatForce(peakForce) : '—',
       raw: peakForce,
     },
     {
       label: 'Peak acceleration',
-      value: `${formatNumber(peakAccel)} g`,
+      value: peakAccel != null ? `${formatNumber(peakAccel)} g` : '—',
       raw: peakAccel,
     },
     {
       label: 'Max deformation',
-      value: formatLength(maxDeformation),
+      value: maxDeformation != null ? formatLength(maxDeformation) : '—',
       raw: maxDeformation,
     },
     {
       label: 'Safety factor',
-      value: formatNumber(safetyFactor),
+      value: safetyFactor != null ? formatNumber(safetyFactor) : '—',
       raw: safetyFactor,
     },
     {
       label: 'Max stress',
-      value: formatPressure(maxStress),
+      value: maxStress != null ? formatPressure(maxStress) : '—',
       raw: maxStress,
     },
   ];
@@ -516,6 +511,22 @@ function EmptyState(): JSX.Element {
 }
 
 /** The results panel content for a finished run. */
+function issueSeverityLabel(severity: string): string {
+  switch (severity.toLowerCase()) {
+    case 'warning':
+    case 'warn':
+      return 'WARN';
+    case 'error':
+      return 'Error';
+    case 'blocker':
+      return 'Blocker';
+    case 'info':
+      return 'Info';
+    default:
+      return severity;
+  }
+}
+
 function ResultPanel({
   result,
   liveDropData,
@@ -613,15 +624,17 @@ function ResultPanel({
             {issues.map((issue, index) => {
               const recommendation = issue.code ? RECOMMENDATIONS[issue.code] : undefined;
               return (
-                <li key={`${issue.severity}-${issue.code ?? ''}-${index}`}>
+                <li key={`${issue.severity}-${issue.code ?? ''}-${index}`} className="results-rail__issue-item">
                   <div className="results-rail__issue-line">
                     <StatusBadge tone={severityTone(issue.severity)}>
-                      {severityLabel(issue.severity)}
+                      {issueSeverityLabel(issue.severity)}
                     </StatusBadge>
-                    {issue.code ? (
-                      <code className="results-rail__issue-code">{issue.code}</code>
-                    ) : null}
-                    <span>{issue.message}</span>
+                    <span className="results-rail__issue-message">
+                      {issue.message}
+                      {issue.code ? (
+                        <code className="results-rail__issue-code">{issue.code}</code>
+                      ) : null}
+                    </span>
                   </div>
                   {recommendation ? (
                     <p className="results-rail__recommendation">{recommendation}</p>

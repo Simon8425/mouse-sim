@@ -116,6 +116,20 @@ export function FileDropzone({ onClose, variant = 'modal' }: FileDropzoneProps):
   const handleFileSelect = (file: File) => {
     if (processingRef.current) return;
     const name = file.name.toLowerCase();
+    if (file.size > 250 * 1024 * 1024) {
+      const version = invalidateUpload();
+      processingRef.current = false;
+      processingNameRef.current = null;
+      setIsParsing(false);
+      setSelectedFile(null);
+      dispatch({ type: 'PREVIEW_START', temp: null, version });
+      reportPreviewError(
+        version,
+        `File ${file.name} exceeds the 250 MB maximum upload limit (${(file.size / (1024 * 1024)).toFixed(1)} MB)`,
+        null,
+      );
+      return;
+    }
     if (name.endsWith('.json') || name.endsWith('.step') || name.endsWith('.stp')) {
       const version = invalidateUpload();
       const controller = new AbortController();
@@ -239,129 +253,256 @@ export function FileDropzone({ onClose, variant = 'modal' }: FileDropzoneProps):
   const isFlat = variant === 'flat';
   const processingName = processingNameRef.current ?? 'geometry file';
 
-  const innerContent = (
-    <>
-      <input
-        ref={inputRef}
-        type="file"
-        accept=".json,.obj,.stl,.step,.stp"
-        style={{ display: 'none' }}
-        onChange={(e) => {
-          if (e.target.files && e.target.files[0]) {
-            handleFileSelect(e.target.files[0]);
-          }
-        }}
-      />
-
-      {isParsing && !selectedFile ? (
-        <div className="dropzone-processing" role="status" aria-live="polite">
-          <div className="import-progress-minimal">
-            <div className="import-progress-minimal__text">
-              <span>Importing <code>{processingName}</code></span>
-            </div>
-            <div className="import-progress-minimal__track" aria-hidden="true">
-              <span />
-            </div>
-          </div>
-        </div>
-      ) : !selectedFile ? (
-        <div
-          role="button"
-          tabIndex={0}
-          aria-label="Drop geometry file (.json, .obj, .stl, .step/.stp) or click to browse"
-          className="dropzone-area"
-          onClick={() => inputRef.current?.click()}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              inputRef.current?.click();
-            }
-          }}
-          onDragOver={(e) => e.preventDefault()}
-          onDrop={(e) => {
-            e.preventDefault();
-            if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-              handleFileSelect(e.dataTransfer.files[0]);
-            }
-          }}
-        >
-          <div className="dropzone-icon-container">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
-              <path d="M12 16.5V9.75m0 0l-3 3m3-3l3 3M6.75 19.5a4.5 4.5 0 01-1.41-8.775 5.25 5.25 0 0110.233-2.33 3 3 0 013.758 3.848A3.752 3.752 0 0118 19.5H6.75z" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-          </div>
-          <p className="dropzone-prompt">Drop geometry file (.json, .obj, .stl, .step/.stp) or click to browse</p>
-        </div>
-      ) : (
-        <div className="dropzone-unit-selector">
-          <p>Select input length units for <strong>{selectedFile.name}</strong>:</p>
-          <select
-            value={selectedUnits}
-            onChange={(e) => setSelectedUnits(e.target.value as LengthUnit)}
-          >
-            {LENGTH_UNITS.map((u) => (
-              <option key={u} value={u}>
-                {u}
-              </option>
-            ))}
-          </select>
-          <div className="dropzone-actions">
-            <button
-              type="button"
-              className="btn btn--primary"
-              disabled={isParsing}
-              onClick={processMeshFile}
-            >
-              {isParsing ? 'Processing...' : 'Import Geometry'}
-            </button>
-            <button
-              type="button"
-              className="btn btn--ghost"
-              onClick={() => {
-                invalidateUpload();
-                setIsParsing(false);
-                setSelectedFile(null);
-                if (!isFlat) {
-                  onClose?.();
-                }
-              }}
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      )}
-
-      {state.previewError ? (
-        <p className="dropzone-error badge badge--error">{state.previewError}</p>
-      ) : null}
-    </>
-  );
-
-
   if (isFlat) {
     return (
-      <div className="file-dropzone-container">
-        {innerContent}
+      <div
+        className="intro-dropzone"
+        role="button"
+        tabIndex={0}
+        aria-label="Drop geometry file (.json, .obj, .stl, .step/.stp) or click to browse"
+        onClick={() => inputRef.current?.click()}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            inputRef.current?.click();
+          }
+        }}
+        onDragOver={(e) => e.preventDefault()}
+        onDrop={(e) => {
+          e.preventDefault();
+          if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+            handleFileSelect(e.dataTransfer.files[0]);
+          }
+        }}
+      >
+        <input
+          ref={inputRef}
+          type="file"
+          accept=".json,.obj,.stl,.step,.stp"
+          style={{ display: 'none' }}
+          onChange={(e) => {
+            if (e.target.files && e.target.files[0]) {
+              handleFileSelect(e.target.files[0]);
+            }
+          }}
+        />
+
+        {isParsing && !selectedFile ? (
+          <div className="dropzone-processing" role="status" aria-live="polite">
+            <div className="import-progress-minimal">
+              <div className="import-progress-minimal__text">
+                <span>
+                  Importing <code>{processingName}</code>
+                </span>
+              </div>
+              <div className="import-progress-minimal__track" aria-hidden="true">
+                <span />
+              </div>
+            </div>
+          </div>
+        ) : !selectedFile ? (
+          <div className="intro-dropzone__center">
+            <div className="intro-dropzone__icon">
+              <svg
+                width="20"
+                height="20"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                aria-hidden="true"
+              >
+                <path
+                  d="M12 16.5V9.75m0 0l-3 3m3-3l3 3M6.75 19.5a4.5 4.5 0 01-1.41-8.775 5.25 5.25 0 0110.233-2.33 3 3 0 013.758 3.848A3.752 3.752 0 0118 19.5H6.75z"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </div>
+            <p className="intro-dropzone__prompt">
+              Drop CAD file (.step, .stl, .obj, .json) or browse
+            </p>
+          </div>
+        ) : (
+          <div
+            className="dropzone-unit-selector intro-dropzone__unit-selector"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <p>
+              Select input length units for <strong>{selectedFile.name}</strong>:
+            </p>
+            <select
+              value={selectedUnits}
+              onChange={(e) => setSelectedUnits(e.target.value as LengthUnit)}
+            >
+              {LENGTH_UNITS.map((u) => (
+                <option key={u} value={u}>
+                  {u}
+                </option>
+              ))}
+            </select>
+            <div className="dropzone-actions">
+              <button
+                type="button"
+                className="btn btn--primary"
+                disabled={isParsing}
+                onClick={processMeshFile}
+              >
+                {isParsing ? 'Processing...' : 'Import Geometry'}
+              </button>
+              <button
+                type="button"
+                className="btn btn--ghost"
+                onClick={() => {
+                  invalidateUpload();
+                  setIsParsing(false);
+                  setSelectedFile(null);
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
+        {state.previewError ? (
+          <p className="dropzone-error badge badge--error">{state.previewError}</p>
+        ) : null}
       </div>
     );
   }
 
   return (
     <div className="file-dropzone-modal" onClick={onClose}>
-      <div className="file-dropzone-panel" role="dialog" aria-modal="true" aria-label="Upload geometry dialog" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="file-dropzone-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Upload geometry dialog"
+        onClick={(e) => e.stopPropagation()}
+      >
         <header className="file-dropzone-header">
           <h2 className="file-dropzone-title">Upload Geometry</h2>
-          <button
-            type="button"
-            className="btn btn--close-modal"
-            onClick={onClose}
-            aria-label="Close upload dialog"
-          >
-            ✕
-          </button>
+          {onClose ? (
+            <button
+              type="button"
+              className="btn btn--close-modal"
+              onClick={onClose}
+              aria-label="Close upload dialog"
+            >
+              ✕
+            </button>
+          ) : null}
         </header>
-        {innerContent}
+
+        <input
+          ref={inputRef}
+          type="file"
+          accept=".json,.obj,.stl,.step,.stp"
+          style={{ display: 'none' }}
+          onChange={(e) => {
+            if (e.target.files && e.target.files[0]) {
+              handleFileSelect(e.target.files[0]);
+            }
+          }}
+        />
+
+        {isParsing && !selectedFile ? (
+          <div className="dropzone-processing" role="status" aria-live="polite">
+            <div className="import-progress-minimal">
+              <div className="import-progress-minimal__text">
+                <span>
+                  Importing <code>{processingName}</code>
+                </span>
+              </div>
+              <div className="import-progress-minimal__track" aria-hidden="true">
+                <span />
+              </div>
+            </div>
+          </div>
+        ) : !selectedFile ? (
+          <div
+            role="button"
+            tabIndex={0}
+            aria-label="Drop geometry file (.json, .obj, .stl, .step/.stp) or click to browse"
+            className="dropzone-area"
+            onClick={() => inputRef.current?.click()}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                inputRef.current?.click();
+              }
+            }}
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => {
+              e.preventDefault();
+              if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+                handleFileSelect(e.dataTransfer.files[0]);
+              }
+            }}
+          >
+            <div className="dropzone-icon-container">
+              <svg
+                width="20"
+                height="20"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                aria-hidden="true"
+              >
+                <path
+                  d="M12 16.5V9.75m0 0l-3 3m3-3l3 3M6.75 19.5a4.5 4.5 0 01-1.41-8.775 5.25 5.25 0 0110.233-2.33 3 3 0 013.758 3.848A3.752 3.752 0 0118 19.5H6.75z"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </div>
+            <p className="dropzone-prompt">Drop CAD file (.step, .stl, .obj, .json) or browse</p>
+          </div>
+        ) : (
+          <div className="dropzone-unit-selector">
+            <p>
+              Select input length units for <strong>{selectedFile.name}</strong>:
+            </p>
+            <select
+              value={selectedUnits}
+              onChange={(e) => setSelectedUnits(e.target.value as LengthUnit)}
+            >
+              {LENGTH_UNITS.map((u) => (
+                <option key={u} value={u}>
+                  {u}
+                </option>
+              ))}
+            </select>
+            <div className="dropzone-actions">
+              <button
+                type="button"
+                className="btn btn--primary"
+                disabled={isParsing}
+                onClick={processMeshFile}
+              >
+                {isParsing ? 'Processing...' : 'Import Geometry'}
+              </button>
+              <button
+                type="button"
+                className="btn btn--ghost"
+                onClick={() => {
+                  invalidateUpload();
+                  setIsParsing(false);
+                  setSelectedFile(null);
+                  onClose?.();
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
+        {state.previewError ? (
+          <p className="dropzone-error badge badge--error">{state.previewError}</p>
+        ) : null}
       </div>
     </div>
   );

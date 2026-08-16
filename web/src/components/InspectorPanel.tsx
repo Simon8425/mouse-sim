@@ -2,7 +2,6 @@ import { useProjectStore, COMPONENT_ROLES } from '../state/projectStore';
 import {
   selectObjectById,
   selectFindingsFor,
-  selectObjectFindingCodes,
   selectMassObject,
   selectWarningsCount,
 } from '../state/selectors';
@@ -13,8 +12,8 @@ import {
   boundsCenter,
 } from '../lib/geometryBounds';
 import { formatVector3, formatMatrix3, formatNumber } from '../lib/format';
-import { formatMass } from '../lib/units';
-import { severityTone, severityLabel, dispositionLabel } from '../lib/status';
+import { formatMass, formatVolume } from '../lib/units';
+import { severityTone, dispositionLabel } from '../lib/status';
 import { StatusBadge } from './StatusBadge';
 import { isRecord } from '../api/contracts';
 import type { GeometryJson } from '../api/contracts';
@@ -131,6 +130,50 @@ function dimensionLine(geometry: GeometryJson): string {
   }
 }
 
+function computeGeometryVolume(geometry: GeometryJson): number | null {
+  const g = geometry as unknown as Record<string, unknown>;
+  if (geometry.type === 'mesh' && Array.isArray(g.vertices) && Array.isArray(g.triangles)) {
+    const verts = g.vertices as number[][];
+    const tris = g.triangles as number[][];
+    let totalSignedVolume = 0;
+    for (const tri of tris) {
+      const i0 = tri[0];
+      const i1 = tri[1];
+      const i2 = tri[2];
+      const v0 = verts[i0];
+      const v1 = verts[i1];
+      const v2 = verts[i2];
+      if (!v0 || !v1 || !v2) continue;
+      const crossX = v1[1] * v2[2] - v1[2] * v2[1];
+      const crossY = v1[2] * v2[0] - v1[0] * v2[2];
+      const crossZ = v1[0] * v2[1] - v1[1] * v2[0];
+      totalSignedVolume += v0[0] * crossX + v0[1] * crossY + v0[2] * crossZ;
+    }
+    const vol = Math.abs(totalSignedVolume / 6);
+    return vol > 1e-15 ? vol : null;
+  }
+  if (geometry.type === 'box' && Array.isArray(g.size)) {
+    const s = g.size as number[];
+    if (s.length === 3 && s.every((v) => typeof v === 'number' && v > 0)) {
+      return s[0] * s[1] * s[2];
+    }
+  }
+  if (geometry.type === 'cylinder') {
+    const radius = num(g.radius);
+    const height = num(g.height);
+    if (radius !== null && height !== null && radius > 0 && height > 0) {
+      return Math.PI * radius * radius * height;
+    }
+  }
+  if (geometry.type === 'sphere') {
+    const radius = num(g.radius);
+    if (radius !== null && radius > 0) {
+      return (4 / 3) * Math.PI * Math.pow(radius, 3);
+    }
+  }
+  return null;
+}
+
 /**
  * Finds the material name attached to the object with the given id, searching
  * the project's objects list or id-keyed mapping.
@@ -177,7 +220,23 @@ function approvalTone(approval: string): Tone {
  * Side panel inspecting the currently selected object: geometry, material,
  * mass properties and validation findings.
  */
-export function InspectorPanel() {
+function issueSeverityLabel(severity: string): string {
+  switch (severity.toLowerCase()) {
+    case 'warning':
+    case 'warn':
+      return 'WARN';
+    case 'error':
+      return 'Error';
+    case 'blocker':
+      return 'Blocker';
+    case 'info':
+      return 'Info';
+    default:
+      return severity;
+  }
+}
+
+export function InspectorPanel(): JSX.Element | null {
   const { state, dispatch } = useProjectStore();
   // Material/role assignment is locked while a test is running or loading:
   // the analysis snapshot must reflect the model as it was submitted.
@@ -219,18 +278,19 @@ export function InspectorPanel() {
   const confidence = displayText(material?.confidence);
   const hasNoMaterial =
     materialName === null && state.materials !== null && state.materials.length > 0;
-  const hasUnresolvedClassification = entry.id
-    ? selectObjectFindingCodes(state, entry.id).has('CLASSIFICATION_UNRESOLVED')
-    : false;
 
-  const massObj = selectMassObject(state, state.selectedId);
+  const massObj = selectMassObject(state, entry.id) ?? selectMassObject(state, state.selectedId);
   const massRecord = isRecord(massObj) ? massObj : null;
-  const mass = num(massRecord?.mass_kg);
-  const volume = num(massRecord?.volume_m3);
-  const massStatus = readString(massRecord?.mass_status);
-  const sourceStatus = readString(massRecord?.source_status);
-  const reviewStatus = readString(massRecord?.review_status);
-  const completeness = num(massRecord?.completeness);
+  const geomVolume = computeGeometryVolume(geometry);
+
+  const rawMass = num(massRecord?.mass_kg);
+  const rawVolume = num(massRecord?.volume_m3);
+  const volume = rawVolume ?? geomVolume;
+  const mass = rawMass ?? (volume !== null && density !== null && density > 0 ? volume * density : null);
+  const massStatus = readString(massRecord?.mass_status) ?? (mass !== null ? 'computed' : volume !== null ? 'unassigned' : null);
+  const sourceStatus = readString(massRecord?.source_status) ?? (materialName ? 'assigned' : 'default');
+  const reviewStatus = readString(massRecord?.review_status) ?? (approval ?? 'draft');
+  const completeness = num(massRecord?.completeness) ?? (mass !== null ? 1.0 : volume !== null ? 0.5 : null);
 
   const findings = selectFindingsFor(state, state.selectedId);
   const warnings = selectWarningsCount(state, state.selectedId);
@@ -259,13 +319,13 @@ export function InspectorPanel() {
           <button
             type="button"
             className="inspector-panel__close-btn"
-            aria-label="Close inspector"
             onClick={() => dispatch({ type: 'SET_INSPECTOR_OPEN', open: false })}
             title="Close inspector"
+            aria-label="Close inspector"
           >
             <svg
-              width="13"
-              height="13"
+              width="14"
+              height="14"
               viewBox="0 0 24 24"
               fill="none"
               stroke="currentColor"
@@ -284,7 +344,6 @@ export function InspectorPanel() {
       <div className="inspector-panel__body">
         <h3 className="section-title">Mouse Part Role</h3>
       <label className="inspector-material-select">
-        <span>Part of the mouse (e.g. Top Shell, PCB, Wheel)</span>
         <select
           aria-label="Component role classification"
           value={state.objectClassifications?.[entry.id] ?? ''}
@@ -331,11 +390,11 @@ export function InspectorPanel() {
         </div>
       ) : null}
 
-      <h3 className="section-title">Material</h3>
+      <h3 className="section-title section-title--no-border">Material</h3>
       {state.materials && state.materials.length > 0 ? (
         <label className="inspector-material-select">
-          <span>Assign material for analysis</span>
           <select
+            aria-label="Material assignment"
             value={materialName ?? ''}
             disabled={isRunning}
             onChange={(event) =>
@@ -398,35 +457,31 @@ export function InspectorPanel() {
       <h3 className="section-title">
         Diagnostics{warnings > 0 ? ` · ${warnings} warning${warnings === 1 ? '' : 's'}` : ''}
       </h3>
-      {hasUnresolvedClassification ? (
-        <p className="inspector-hint inspector-hint--classification">
-          Component classification is unresolved. Assign a component role so results
-          can be interpreted by function.
-        </p>
-      ) : null}
       {findings.length === 0 ? (
         <p className="inspector-hint">No findings</p>
       ) : (
-        <table className="dense-table">
-          <tbody>
-            {findings.map((finding, index) => {
-              const severity = finding.severity || 'info';
-              const message = displayText(finding.message) ?? '—';
-              const code = displayText(finding.code);
-              return (
-                <tr key={index}>
-                  <td>
-                    <StatusBadge tone={severityTone(severity)}>{severityLabel(severity)}</StatusBadge>
-                  </td>
-                  <td>
+        <ul className="inspector-findings-list">
+          {findings.map((finding, index) => {
+            const severity = finding.severity || 'info';
+            const message = displayText(finding.message) ?? '—';
+            const code = displayText(finding.code);
+            return (
+              <li key={index} className="inspector-finding-item">
+                <div className="inspector-finding-line">
+                  <StatusBadge tone={severityTone(severity)}>
+                    {issueSeverityLabel(severity)}
+                  </StatusBadge>
+                  <span className="inspector-finding-message">
                     {message}
-                    {code !== null ? <code>{code}</code> : null}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+                    {code !== null ? (
+                      <code className="inspector-finding-code">{code}</code>
+                    ) : null}
+                  </span>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
       )}
 
       <h3 className="section-title">Geometry</h3>
@@ -450,7 +505,7 @@ export function InspectorPanel() {
           </tr>
           <tr>
             <th scope="row">Volume</th>
-            <td>{volume !== null ? `${formatNumber(volume)} m³` : '—'}</td>
+            <td>{volume !== null ? formatVolume(volume) : '—'}</td>
           </tr>
           <tr>
             <th scope="row">Mass status</th>

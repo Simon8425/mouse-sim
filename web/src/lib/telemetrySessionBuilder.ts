@@ -228,7 +228,7 @@ export function buildTelemetrySession(
   const config = result.config;
   const drop0 = result.drops?.[0];
   const gravity = model && result.model.gravity_m_s2 > 0 ? result.model.gravity_m_s2 : 9.80665;
-  const releaseJ = drop0?.energy?.release_j ?? 0.5 * model.mass_kg * gravity * (config?.height_m ?? 0.75);
+  const releaseJ = drop0?.energy?.release_j ?? model.mass_kg * gravity * (config?.height_m ?? 0.75);
   const summary = summarizeFrames(frames, releaseJ);
   return {
     session_id: `telemetry-${Date.now()}`,

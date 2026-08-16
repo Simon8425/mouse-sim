@@ -14,6 +14,7 @@ export function fitCameraToBounds(
   camera: THREE.PerspectiveCamera,
   controls: OrbitControls,
   bounds: { min: Vec3; max: Vec3 },
+  elevation = 0.4,
 ): void {
   const cx = (bounds.min[0] + bounds.max[0]) / 2;
   const cy = (bounds.min[1] + bounds.max[1]) / 2;
@@ -31,7 +32,7 @@ export function fitCameraToBounds(
   camera.position.set(
     cx + dist * 0.7071,
     cy - dist * 0.7071,
-    cz + dist * 0.4,
+    cz + dist * elevation,
   );
 
   camera.near = Math.max(radius / 1000, 0.0005);

@@ -391,7 +391,15 @@ def mass_properties(document, material_by_object, mass_overrides=None):
             except (TypeError, ValueError) as exc:
                 density = None
                 diagnostics.append("density_unknown: {}".format(exc))
-            if density is not None and geometry_value is not None and (geometry_value.closed or geometry_value.estimated) and tensor_unit is not None and center is not None:
+            if (
+                density is not None
+                and geometry_value is not None
+                and (geometry_value.closed or geometry_value.estimated)
+                and tensor_unit is not None
+                and center is not None
+                and volume is not None
+                and volume > 1e-15
+            ):
                 mass = density * volume
                 status = "estimated" if (getattr(geometry_value, "estimated", False) or self_intersection_unverified) else "calculated"
                 tensor = _tensor_scale(tensor_unit, density)

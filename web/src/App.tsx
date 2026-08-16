@@ -223,8 +223,7 @@ export function App(): React.ReactElement {
     [state.project, state.preview, state.tempPreview, state.partGeometry],
   );
 
-  // Nothing loaded yet: show the geometry guide card instead of an empty scene.
-  const showGuideCard = entries.length === 0 && !state.webglError;
+
 
   // Visibility is applied per object inside the scene runtime (no rebuild);
   // isolation still filters the entry set.
@@ -347,17 +346,19 @@ export function App(): React.ReactElement {
     return spec;
   }, [lastResult, analysisRequest, shownEntries, state.preview?.display_asset, state.renderMode, state.stale, state.draft?.drop_simulation, state.playbackDismissed]);
 
-  const leftInset = showGuideCard ? 0 : (state.navOpen ? 294 : 0);
+  const isIntro = entries.length === 0 && !state.webglError;
+
+  const leftInset = isIntro ? 0 : (state.navOpen ? 294 : 0);
   const rightDrawerOpen =
     state.classifyModalOpen ||
     (state.inspectorOpen && state.selectedId !== null);
   const rightInset =
     (rightDrawerOpen ? 374 : 0) +
-    (showGuideCard ? 0 : resultsOpen ? 334 : 42);
+    (isIntro ? 0 : resultsOpen ? 334 : 42);
 
   const topBarRightOffset = rightDrawerOpen
-    ? 374 + (showGuideCard ? 0 : resultsOpen ? 334 : 42) + 14
-    : showGuideCard
+    ? 374 + (isIntro ? 0 : resultsOpen ? 334 : 42) + 14
+    : isIntro
     ? 14
     : resultsOpen
     ? 334 + 14
@@ -371,7 +372,7 @@ export function App(): React.ReactElement {
   return (
     <div className="app" data-theme={state.theme}>
       <div className="workspace">
-        {!showGuideCard ? (
+        {!isIntro ? (
           <aside
             className={`drawer drawer--nav${state.navOpen ? ' is-open' : ''}`}
             aria-label="Model navigator"
@@ -383,82 +384,68 @@ export function App(): React.ReactElement {
           className="viewport-column"
           onDragOver={(e) => {
             e.preventDefault();
-            // The empty-state flat dropzone is already the active uploader;
-            // do not open a second modal over it while dragging a file.
-            if (!showGuideCard && e.dataTransfer.types.includes('Files')) {
+            if (!isIntro && e.dataTransfer.types.includes('Files')) {
               setUploadOpen(true);
             }
           }}
         >
-          {!showGuideCard && !state.webglError ? (
-            <div className="viewport-column__top-bar" style={{ right: `${topBarRightOffset}px` }}>
-              <ViewportToolbar viewportRef={viewportRef} stats={stats} />
-              <div className="viewport-column__header">
-                <RunControls
-                  onReplaceModel={() => setUploadOpen(!uploadOpen)}
-                  uploadOpen={uploadOpen}
-                />
-              </div>
-            </div>
-          ) : !showGuideCard ? (
-            <div className="viewport-column__top-bar viewport-column__top-bar--end-only" style={{ right: `${topBarRightOffset}px` }}>
-              <div className="viewport-column__header">
-                <RunControls
-                  onReplaceModel={() => setUploadOpen(!uploadOpen)}
-                  uploadOpen={uploadOpen}
-                />
-              </div>
-            </div>
-          ) : null}
-          {uploadOpen ? (
-            <FileDropzone onClose={() => setUploadOpen(false)} />
-          ) : null}
           {state.webglError ? (
             <WebGLFallback reason={state.webglError} />
-          ) : showGuideCard && !uploadOpen ? (
+          ) : isIntro ? (
             <FileDropzone variant="flat" />
           ) : (
-            <SceneViewport
-              ref={viewportRef}
-              insets={insets}
-              entries={sceneEntries}
-              visibility={state.visibility}
-              selectedId={state.selectedId}
-              explode={state.explode}
-              theme={state.theme}
-              quality={quality}
-              overlays={overlays}
-              dropSimulation={
-                // A stale result's trajectory belongs to the previous
-                // model/inputs; replaying it against the current model can
-                // render the model displaced (floating or under the floor).
-                // Only playback trajectories that match the current inputs,
-                // and only while the test has not been dismissed (LEAVE_TEST
-                // keeps the results visible but exits playback).
-                state.stale || state.playbackDismissed
-                  ? null
-                  : (state.lastResult?.drop_simulation ?? null)
-              }
-              populationResult={
-                state.stale || state.playbackDismissed
-                  ? null
-                  : (state.lastResult?.population ?? null)
-              }
-              renderMode={state.renderMode}
-              feaResult={state.lastResult?.fea ?? null}
-              onDropEnded={() => viewportRef.current?.setDropPlayback?.(false)}
-              onPlaybackStateChange={(playing) => dispatch({ type: 'SET_DROP_PLAYING', playing })}
-              onLiveDropData={setLiveDropData}
-              onPick={(id) => {
-                dispatch({ type: 'SELECT', id });
-                // Clicking an object opens the inspector; clicking empty space closes it.
-                dispatch({ type: 'SET_INSPECTOR_OPEN', open: id !== null });
-              }}
-              onStats={setStats}
-              onWebGLUnsupported={(reason) =>
-                dispatch({ type: 'SET_WEBGL_ERROR', message: reason })
-              }
-            />
+            <>
+              <div className="viewport-column__top-bar" style={{ right: `${topBarRightOffset}px` }}>
+                <ViewportToolbar viewportRef={viewportRef} stats={stats} />
+                <div className="viewport-column__header">
+                  <RunControls
+                    onReplaceModel={() => setUploadOpen(!uploadOpen)}
+                    uploadOpen={uploadOpen}
+                  />
+                </div>
+              </div>
+              <SceneViewport
+                ref={viewportRef}
+                insets={insets}
+                entries={sceneEntries}
+                visibility={state.visibility}
+                selectedId={state.selectedId}
+                explode={state.explode}
+                theme={state.theme}
+                quality={quality}
+                overlays={overlays}
+                dropSimulation={
+                  // A stale result's trajectory belongs to the previous
+                  // model/inputs; replaying it against the current model can
+                  // render the model displaced (floating or under the floor).
+                  // Only playback trajectories that match the current inputs,
+                  // and only while the test has not been dismissed (LEAVE_TEST
+                  // keeps the results visible but exits playback).
+                  state.stale || state.playbackDismissed
+                    ? null
+                    : (state.lastResult?.drop_simulation ?? null)
+                }
+                populationResult={
+                  state.stale || state.playbackDismissed
+                    ? null
+                    : (state.lastResult?.population ?? null)
+                }
+                renderMode={state.renderMode}
+                feaResult={state.lastResult?.fea ?? null}
+                onDropEnded={() => viewportRef.current?.setDropPlayback?.(false)}
+                onPlaybackStateChange={(playing) => dispatch({ type: 'SET_DROP_PLAYING', playing })}
+                onLiveDropData={setLiveDropData}
+                onPick={(id) => {
+                  dispatch({ type: 'SELECT', id });
+                  // Clicking an object opens the inspector; clicking empty space closes it.
+                  dispatch({ type: 'SET_INSPECTOR_OPEN', open: id !== null });
+                }}
+                onStats={setStats}
+                onWebGLUnsupported={(reason) =>
+                  dispatch({ type: 'SET_WEBGL_ERROR', message: reason })
+                }
+              />
+            </>
           )}
         </main>
         {state.classifyModalOpen ? (
@@ -477,7 +464,7 @@ export function App(): React.ReactElement {
           </aside>
         )}
 
-        {!showGuideCard ? (
+        {!isIntro ? (
           <div className={`results-rail-dock${resultsOpen ? ' is-open' : ''}`}>
             <ResultsRail
               open={resultsOpen}
@@ -491,6 +478,9 @@ export function App(): React.ReactElement {
         <MissionControl
           onClose={() => dispatch({ type: 'SET_CONTROL_OPEN', open: false })}
         />
+      ) : null}
+      {uploadOpen && !isIntro ? (
+        <FileDropzone variant="modal" onClose={() => setUploadOpen(false)} />
       ) : null}
     </div>
   );

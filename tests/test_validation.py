@@ -279,7 +279,7 @@ class OpticalDefocusTests(unittest.TestCase):
 
     def test_high_shock_triggers_lod_shift_warning(self):
         findings = check_optical_defocus(
-            self._pcb(), self._sensor(), "sensor-01", 300.0, lens_height_m=1.2e-3
+            self._pcb(thickness=0.0008), self._sensor(), "sensor-01", 300.0, lens_height_m=1.2e-3
         )
         self.assertEqual(len(findings), 1)
         finding = findings[0]
@@ -318,7 +318,7 @@ class OpticalDefocusTests(unittest.TestCase):
 
     def test_run_validation_wires_optical_check(self):
         report = run_validation(
-            {"pcb": self._pcb(), "sensor": self._sensor()},
+            {"pcb": self._pcb(thickness=0.0008), "sensor": self._sensor()},
             {},
             {},
             {

@@ -511,18 +511,14 @@ describe('createFeaUniforms / updateFeaUniforms (no per-frame allocation)', () =
       shader as unknown as THREE.WebGLProgramParametersWithUniforms,
     );
 
-    // Heatmap mode must replace the base material color entirely...
+    // Heatmap mode must replace the base material color entirely with the gradient contour...
     expect(shader.fragmentShader).toContain(
-      'diffuseColor.rgb = feaGradientColorFrag( feaDamageVis );',
+      'diffuseColor.rgb = feaGradientColorFrag( feaVisDithered );',
     );
     // ...never blending with it, and no stale FEA_HEATMAP_MIX interpolation.
     expect(shader.fragmentShader).not.toContain('mix( diffuseColor.rgb, feaGradientColorFrag');
     expect(shader.fragmentShader).not.toContain('FEA_HEATMAP_MIX');
-    // FEA modes render a neutral WHITE base so the heatmap reads clearly on
-    // colorful CAD/palette materials; damaged regions get the gradient.
-    expect(shader.fragmentShader).toContain('diffuseColor.rgb = vec3( 1.0 );');
     expect(shader.fragmentShader).toContain('if ( uFeaMode > -0.5 ) {');
-    expect(shader.fragmentShader).toContain('if ( feaDamageVis > 0.0005 ) {');
     // The continuous procedural Gaussian + plate-field layers keep the
     // heatmap visible on sparse meshes and edge-only primitives — and every
     // uniform they use MUST be declared in the fragment prefix (an
@@ -544,7 +540,6 @@ describe('createFeaUniforms / updateFeaUniforms (no per-frame allocation)', () =
     // GLSL ES 1.00 float literals: no bare integers (t - 0 would fail to compile).
     expect(shader.fragmentShader).toContain('f = ( t - 0.0 ) / 0.28;');
     expect(shader.fragmentShader).not.toContain('( t - 0 ) /');
-    expect(shader.fragmentShader).toContain('if ( feaDamageVis > 0.0005 ) {');
     // The vertex shader complements the attribute dent procedurally, with
     // the backend-parity depth factor: amp capped at 3.0, the 1.5 cap on
     // the COMBINED gauss*amp product.  GLSL ES 1.00 float literals only.

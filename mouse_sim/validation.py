@@ -397,40 +397,45 @@ def check_optical_defocus(
     a = min(length, width)
     b = max(length, width)
     aspect = b / a if a > 0.0 else 1.0
+    if pcb_poissons_ratio is None or not (-0.99 <= pcb_poissons_ratio <= 0.49):
+        pcb_poissons_ratio = 0.35  # standard FR4 screening default
+    if pcb_density_kg_m3 is None or pcb_density_kg_m3 <= 0.0:
+        pcb_density_kg_m3 = 1850.0  # standard FR4 density
     # Simply-supported plate coefficients (Roark 11.4 case 1 uniform load
-    # alpha_u, case 7 central point load alpha_p; nu = 0.3 tables).  The
-    # standoff-mounted board sits between the clamped and simply-supported
+    # alpha_u, case 7 central point load alpha_p; Navier series for SS plate).
+    # The standoff-mounted board sits between the clamped and simply-supported
     # bounds; the simply-supported case is the screening choice because the
     # sensor cutout and mounting-hole pattern soften the panel.
     if aspect <= 1.0:
         alpha_u = 0.00406
-        alpha_p = 0.1267
+        alpha_p = 0.01160
     elif aspect <= 1.2:
         alpha_u = 0.00564
-        alpha_p = 0.1240
+        alpha_p = 0.00750
     elif aspect <= 1.4:
         alpha_u = 0.00705
-        alpha_p = 0.1210
+        alpha_p = 0.00510
     elif aspect <= 1.6:
         alpha_u = 0.00773
-        alpha_p = 0.1200
+        alpha_p = 0.00365
     elif aspect <= 1.8:
         alpha_u = 0.00832
-        alpha_p = 0.1190
+        alpha_p = 0.00270
     elif aspect <= 2.0:
         alpha_u = 0.01013
-        alpha_p = 0.1180
+        alpha_p = 0.00207
     else:
         alpha_u = 0.01013
-        alpha_p = 0.1180
+        alpha_p = 0.00207
     # Combined shock load: uniform load from the whole accelerated board
     # mass PLUS a central point load from the sensor package inertia.
     pcb_mass = pcb_density_kg_m3 * a * b * pcb_thickness_m
-    sensor_mass = max(0.0, sensor_mass_kg)
+    sensor_mass = max(0.0, float(sensor_mass_kg or 0.0))
     q = (pcb_mass + sensor_mass) * float(drop_peak_accel_g) * 9.80665 / (a * b)
     point_load = sensor_mass * float(drop_peak_accel_g) * 9.80665
-    d = pcb_young_modulus_pa * pcb_thickness_m ** 3 / (12.0 * (1.0 - pcb_poissons_ratio * pcb_poissons_ratio))
-    deflection = alpha_u * q * a ** 4 / d + alpha_p * point_load * a ** 2 / d
+    denom = max(1e-12, 12.0 * (1.0 - pcb_poissons_ratio * pcb_poissons_ratio))
+    d = max(1e-12, pcb_young_modulus_pa * (pcb_thickness_m ** 3) / denom)
+    deflection = alpha_u * q * (a ** 4) / d + alpha_p * point_load * (a ** 2) / d
     # Sensor z-offset from the PCB mid-plane (lens height class 1.2-1.5 mm)
     # amplifies the plate slope; the lever contribution is bounded by the
     # local slope at the sensor x a half-span.  Screening-level estimate.

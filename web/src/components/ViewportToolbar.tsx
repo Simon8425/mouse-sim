@@ -33,7 +33,7 @@ export function ViewportToolbar({ stats, viewportRef }: ViewportToolbarProps) {
   const showFeaSwitch = feaAvailable && !testModeActive;
 
   const renderModeButtons: Array<{ mode: RenderMode; label: string }> = [
-    { mode: 'fea', label: 'FEA Stress Heatmap' },
+    { mode: 'fea', label: 'FEA Heatmap' },
     { mode: 'yield', label: 'Yield Shader' },
   ];
 

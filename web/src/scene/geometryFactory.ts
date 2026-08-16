@@ -182,9 +182,12 @@ export function syncInstancedPose(
         scratch.decompose(pos, quat, scale);
         const explode = explodeByObjectId.get(id);
         if (explode) {
-          pos.x = explode.x;
-          pos.y = explode.y;
-          pos.z = explode.z;
+          // The instance matrix bakes the part's placement; the explode map
+          // stores the ADDITIONAL display offset, so add it on top of the
+          // baked position instead of replacing it.
+          pos.x += explode.x;
+          pos.y += explode.y;
+          pos.z += explode.z;
         }
         scratch.compose(pos, quat, scale);
       }
@@ -795,6 +798,12 @@ export function disposeObjectGroup(group: THREE.Object3D): void {
   group.traverse((obj) => {
     const anyObj = obj as unknown as { geometry?: THREE.BufferGeometry };
     if (anyObj.geometry) anyObj.geometry.dispose();
+    const instanced = obj as unknown as {
+      instanceMatrix?: { dispose?: () => void };
+      instanceColor?: { dispose?: () => void };
+    };
+    if (typeof instanced.instanceMatrix?.dispose === 'function') instanced.instanceMatrix.dispose();
+    if (typeof instanced.instanceColor?.dispose === 'function') instanced.instanceColor.dispose();
     const mesh = obj as unknown as { material?: THREE.Material | THREE.Material[] };
     if (mesh.material) {
       const list = Array.isArray(mesh.material) ? mesh.material : [mesh.material];

@@ -1691,15 +1691,15 @@ def _weibull_fit(bins, survivors, n):
             times.extend([(k - 0.5) / 10.0] * count)
     times.sort()
     m = len(times)
-    if m < 3:
-        # Fewer than 3 failures cannot support a 2-parameter regression.
+    if m < 3 or len(set(times)) < 2:
+        # Fewer than 3 failures or zero variance cannot support a 2-parameter regression.
         return None
     xs = []
     ys = []
     for i, t in enumerate(times, start=1):
-        # Median rank F_hat = (i - 0.3) / (m + 0.4); require the point to be
-        # strictly inside (0, 1) so ln(-ln(1-F)) is finite.
-        f = (i - 0.3) / (m + 0.4)
+        # Median rank for right-censored data: F_hat = (i - 0.3) / (n + 0.4);
+        # require the point to be strictly inside (0, 1) so ln(-ln(1-F)) is finite.
+        f = (i - 0.3) / (n + 0.4)
         if f <= 0.0 or f >= 1.0:
             continue
         if t <= 0.0:
@@ -1723,11 +1723,13 @@ def _weibull_fit(bins, survivors, n):
     eta = math.exp(-intercept / beta)
     if not math.isfinite(eta) or eta <= 0.0:
         return None
+    eta_rounded = _sig(eta)
+    beta_rounded = round(beta, 3)
     # B10 life: t_10 = eta * (-ln(0.9))^(1/beta).
-    b10 = eta * ((-math.log(0.9)) ** (1.0 / beta))
+    b10 = eta_rounded * ((-math.log(0.9)) ** (1.0 / beta_rounded))
     return {
-        "eta": _sig(eta),
-        "beta": round(beta, 3),
+        "eta": eta_rounded,
+        "beta": beta_rounded,
         "b10_usage_fraction": _sig(b10),
         "failures_fit": m,
         "note": (

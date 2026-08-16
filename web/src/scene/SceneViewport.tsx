@@ -13,7 +13,6 @@ import type { OverlaySpec } from './overlays';
 import type { ObjectSceneEntry } from './geometryFactory';
 import type { DropSimulationDrop, DropSimulationResult, FeaResult, RenderMode, PopulationResult } from '../api/contracts';
 import { FeaHud } from '../components/FeaHud';
-import { DropPhysicsDebug } from '../components/DropPhysicsDebug';
 import { PopulationFleetHud } from '../components/PopulationFleetHud';
 import type { FleetUnitData } from './populationFleetScene';
 
@@ -313,17 +312,14 @@ export const SceneViewport = React.forwardRef<
     runtimeRef.current?.setFloorMaterial(surfaceKey);
   }, [props.dropSimulation, props.overlays]);
 
+  const prevDropSimRef = React.useRef<DropSimulationResult | null | undefined>(undefined);
   React.useEffect(() => {
-    // Changing or ending a drop test (floor/surface switch, LEAVE_TEST, new
-    // config) must drop every stale overlay glyph — load vector arrow, stress
-    // badge, fixtures, contact plane. Clear first, then reapply the current
-    // spec so geometry-derived overlays (e.g. severity markers) stay live.
-    runtimeRef.current?.clearOverlays();
-    runtimeRef.current?.setOverlays(props.overlays);
+    if (props.dropSimulation === prevDropSimRef.current) return;
+    prevDropSimRef.current = props.dropSimulation;
     runtimeRef.current?.setDropSimulation(props.dropSimulation ?? null);
     setDropPlaying(props.dropSimulation !== null && props.dropSimulation !== undefined);
     setDropTime(0);
-  }, [props.dropSimulation, props.overlays]);
+  }, [props.dropSimulation]);
 
   const dropEndedRef = React.useRef<() => void>(() => {});
   const { onDropEnded: onDropEndedProp } = props;
@@ -515,10 +511,6 @@ export const SceneViewport = React.forwardRef<
         fea={props.feaResult ?? null}
         liveDropData={liveDropData}
       />
-      {!props.populationResult ? (
-        <DropPhysicsDebug simulation={props.dropSimulation ?? null} dropTime={dropTime} liveFrame={liveFrame} />
-      ) : null}
-      
       {props.populationResult ? (
         <PopulationFleetHud
           population={props.populationResult}

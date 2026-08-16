@@ -61,35 +61,60 @@ function getSingletonWorker(): Worker {
         pending.reject(error);
       }
       pendingMap.clear();
+      if (workerInstance) {
+        workerInstance.terminate();
+        workerInstance = null;
+      }
     };
   }
   return workerInstance;
 }
 
 /**
- * Cancels every in-flight parse job. The worker itself cannot be interrupted
- * mid-parse (it is a single synchronous task per message), but dropping all
- * pending promises here guarantees a superseded upload's result can never
- * resolve into a stale preview: the FileDropzone already guards with a
- * version check, and this makes the guard immediate instead of waiting for
- * the old job to finish.
+ * Cancels every in-flight parse job and terminates the active worker so a
+ * superseded upload never starves behind an earlier compute-heavy file.
  */
 export function cancelPendingParses(): void {
   for (const pending of pendingMap.values()) {
     pending.reject(new Error('Parse superseded by a newer upload'));
   }
   pendingMap.clear();
+  if (workerInstance) {
+    workerInstance.terminate();
+    workerInstance = null;
+  }
 }
 
 export function parseInWorker(
   format: PreviewFormat,
   units: string,
   buffer: ArrayBuffer,
+  timeoutMs = 30000,
 ): Promise<ParseOk> {
   const worker = getSingletonWorker();
   const id = `parse-${nextId++}`;
   return new Promise((resolve, reject) => {
-    pendingMap.set(id, { resolve, reject });
+    const timer = setTimeout(() => {
+      if (pendingMap.has(id)) {
+        pendingMap.delete(id);
+        reject(new Error(`Geometry parse timed out after ${timeoutMs / 1000}s`));
+        if (workerInstance) {
+          workerInstance.terminate();
+          workerInstance = null;
+        }
+      }
+    }, timeoutMs);
+
+    pendingMap.set(id, {
+      resolve: (res) => {
+        clearTimeout(timer);
+        resolve(res);
+      },
+      reject: (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    });
     const msg: WorkerRequestMessage = {
       id,
       kind: 'parse',

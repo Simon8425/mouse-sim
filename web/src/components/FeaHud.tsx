@@ -113,8 +113,9 @@ export function FeaHud({
   let impactProgress: number | null = null;
   let impactPulse: number | null = null;
   const liveDropTime = liveDropData?.dropTime ?? null;
-  const impactTime =
-    liveDropData?.activeDrop?.end_s != null ? liveDropData.activeDrop.end_s * 0.38 : null;
+  const startS = liveDropData?.activeDrop?.start_s ?? 0;
+  const endS = liveDropData?.activeDrop?.end_s ?? null;
+  const impactTime = endS != null ? startS + (endS - startS) * 0.38 : null;
   if (liveDropTime !== null && impactTime !== null && impactWindowS > 0) {
     impactProgress = Math.min(1, Math.max(0, (liveDropTime - impactTime) / impactWindowS));
     // Mirror impactPulseFor(): 1 at the impact moment, ~1/e decay per 1/6 s.

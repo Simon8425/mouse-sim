@@ -1353,11 +1353,8 @@ def _outer(first, second):
 
 
 def _mesh_inertia_from_integrals(volume, first, second, density=1.0):
-    if abs(volume) <= 1e-15:
-        raise ValueError(
-            "mesh volume is below the supported physical scale "
-            "(absolute floor 1e-15 m3); mass/inertia cannot be certified"
-        )
+    if abs(volume) <= 1e-36:
+        raise ValueError("mesh volume is zero; mass/inertia cannot be certified")
     sign = 1.0 if volume > 0.0 else -1.0
     positive_volume = sign * volume
     positive_first = _scale(first, sign)
@@ -1748,7 +1745,21 @@ class Compound(Geometry):
 
     def geometric_properties(self):
         volume, centroid, tensor = self._properties()
-        return GeometricProperties(volume, self.surface_area(), centroid, tensor, all(child.geometric_properties().closed for child in self.children))
+        child_props = [child.geometric_properties() for child in self.children]
+        closed = all(p.closed for p in child_props)
+        estimated = any(p.estimated for p in child_props)
+        diag_list = []
+        for p in child_props:
+            diag_list.extend(p.diagnostics)
+        return GeometricProperties(
+            volume,
+            self.surface_area(),
+            centroid,
+            tensor,
+            closed=closed,
+            diagnostics=tuple(dict.fromkeys(diag_list)),
+            estimated=estimated,
+        )
 
     def to_dict(self):
         return {"type": self.kind, "children": [child.to_dict() for child in self.children], "transform": self.transform.to_dict()}

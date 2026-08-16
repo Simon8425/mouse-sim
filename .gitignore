@@ -17,3 +17,4 @@ reports/
 G3-20260320.stp
 
 .dev-cache/
+telemetry-*.json

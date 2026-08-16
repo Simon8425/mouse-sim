@@ -130,6 +130,9 @@ self.onmessage = (event: MessageEvent<WorkerRequestMessage>) => {
             const x = view.getFloat32(vOffset, true) * factor;
             const y = view.getFloat32(vOffset + 4, true) * factor;
             const z = view.getFloat32(vOffset + 8, true) * factor;
+            if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+              throw new Error(`Binary STL triangle ${i + 1}: contains non-finite vertex coordinate`);
+            }
             const key = `${x.toFixed(6)},${y.toFixed(6)},${z.toFixed(6)}`;
 
             let idx = vertexMap.get(key);

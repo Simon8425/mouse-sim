@@ -3,7 +3,7 @@
   "note": "the first physical comparison MUST be against this untouched baseline; never fit parameters to individual tests (freeze-phase items 10-11)",
   "engine": {
     "version": "0.1.0",
-    "engine_hash": "57d11bdca9d91afe2b5394c09e8c8b0a5f2348cfcfb042ccfac00108bf0dede1"
+    "engine_hash": "05ca4d5e18ad3289d82983c23e7cab42a4dccf58cccface50ef30707c8450fc5"
   },
   "config_hashes": {
     "geometry_digest": "b853630b3d6f1db19aafb79e38631cf54328f9f57d24c1c177a76b80ae5bc5b0",
@@ -11,7 +11,7 @@
     "load_case_digest": "2e9cadc4407c360883b623d439e8506b7f124bcb848cdadd58130f37016475ca",
     "validation_digest": "dd3ce8aee8e74b48f10a9d497f69066d4d0c966dd0271ffe05c4fddabf211ce1",
     "request_digest": "944d1ed50b89a300bfc503c8c592c10a9a78332421cc3fbf9e2cb25b4aef1136",
-    "run_id": "37980d11c4fe9a39122328c782e59b92c1cef24a00fd391998602e0110bb623d"
+    "run_id": "8dc01cb697f7b0d8ba12a4119000169e3efbc73bc2093d1f102717d7959cc0cc"
   },
   "request": {
     "load_case": {
@@ -261,7 +261,7 @@
     },
     "engine": {
       "version": "0.1.0",
-      "engine_hash": "57d11bdca9d91afe2b5394c09e8c8b0a5f2348cfcfb042ccfac00108bf0dede1"
+      "engine_hash": "05ca4d5e18ad3289d82983c23e7cab42a4dccf58cccface50ef30707c8450fc5"
     },
     "seed": 0
   },
@@ -551,15 +551,15 @@
       "raw_kinetic_energy_j": 0.441279
     },
     "drop_first": {
-      "settled_s": 1.008,
+      "settled_s": 1.029,
       "settled": true,
       "energy": {
         "release_j": 0.459517,
         "first_impact_j": 0.441279,
-        "settled_j": 0.00239,
-        "lost_contact_j": 0.213911,
-        "lost_drag_j": 6.9e-05,
-        "drift_pct": 0.0189
+        "settled_j": 0.002391,
+        "lost_contact_j": 0.214342,
+        "lost_drag_j": 0.0,
+        "drift_pct": 0.0007
       },
       "peak_impact_speed_m_s": 4.409,
       "peak_kinetic_energy_j": 0.441279
@@ -719,8 +719,8 @@
           "outputs": [
             {
               "output": "settle_s",
-              "sensitivity_up": 0.4563,
-              "sensitivity_down": 0.6151
+              "sensitivity_up": -0.5637,
+              "sensitivity_down": 0.6511
             },
             {
               "output": "peak_acceleration_m_s2",
@@ -815,8 +815,8 @@
           "outputs": [
             {
               "output": "settle_s",
-              "sensitivity_up": 0.0397,
-              "sensitivity_down": -0.0397
+              "sensitivity_up": -0.2235,
+              "sensitivity_down": 0.2235
             },
             {
               "output": "peak_acceleration_m_s2",
@@ -880,8 +880,8 @@
           "outputs": [
             {
               "output": "settle_s",
-              "sensitivity_up": 0.4563,
-              "sensitivity_down": 0.6151
+              "sensitivity_up": -0.5637,
+              "sensitivity_down": 0.6511
             },
             {
               "output": "peak_acceleration_m_s2",
@@ -913,8 +913,8 @@
           "outputs": [
             {
               "output": "settle_s",
-              "sensitivity_up": 0.129,
-              "sensitivity_down": 0.5357
+              "sensitivity_up": 0.0389,
+              "sensitivity_down": 0.8455
             },
             {
               "output": "peak_acceleration_m_s2",
@@ -946,8 +946,8 @@
           "outputs": [
             {
               "output": "settle_s",
-              "sensitivity_up": -0.2083,
-              "sensitivity_down": -0.2877
+              "sensitivity_up": -0.8941,
+              "sensitivity_down": 0.1652
             },
             {
               "output": "peak_acceleration_m_s2",

@@ -549,14 +549,10 @@ const FEA_FRAGMENT_BODY = /* glsl */ `
 			discard;
 		}
 	} else if ( uFeaMode > -0.5 ) {
-		// FEA HEATMAP: Clean neutral white base with full von Mises stress gradient contour.
-		diffuseColor.rgb = vec3( 1.0 );
-		if ( feaDamageVis > 0.0005 ) {
-			// Deterministic per-fragment dither so the 8-bit banded gradient reads smooth without shimmering.
-			float feaDither = ( feaHashNoise( vFeaPosition, 0.37 ) - 0.5 ) / 48.0;
-			feaDamageVis = clamp( feaDamageVis + feaDither, 0.0, 1.0 );
-			diffuseColor.rgb = feaGradientColorFrag( feaDamageVis );
-		}
+		// FEA HEATMAP: Full von Mises stress gradient contour mapped across the full range.
+		float feaDither = ( feaHashNoise( vFeaPosition, 0.37 ) - 0.5 ) / 48.0;
+		float feaVisDithered = clamp( feaDamageVis + feaDither, 0.0, 1.0 );
+		diffuseColor.rgb = feaGradientColorFrag( feaVisDithered );
 	}
 	// --- end FEA fragment ---
 `;

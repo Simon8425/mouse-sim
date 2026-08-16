@@ -157,7 +157,7 @@ describe('ViewportToolbar', () => {
     await user.click(screen.getByRole('button', { name: 'Leave test' }));
 
     const group = screen.getByRole('group', { name: 'Render mode' });
-    const feaButton = within(group).getByRole('button', { name: 'FEA Stress Heatmap' });
+    const feaButton = within(group).getByRole('button', { name: 'FEA Heatmap' });
     const yieldButton = within(group).getByRole('button', { name: 'Yield Shader' });
     expect(feaButton).toBeEnabled();
 
@@ -242,7 +242,7 @@ describe('ViewportToolbar', () => {
 
     await user.click(screen.getByRole('button', { name: 'Leave test' }));
     const group = screen.getByRole('group', { name: 'Render mode' });
-    expect(within(group).getByRole('button', { name: 'FEA Stress Heatmap' })).toBeEnabled();
+    expect(within(group).getByRole('button', { name: 'FEA Heatmap' })).toBeEnabled();
   });
 
   it('opens and closes the Legend disclosure via its button', async () => {

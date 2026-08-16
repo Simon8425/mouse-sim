@@ -63,6 +63,7 @@ _ALLOWED_REQUEST_SCHEMA_IDS = (None, "", "gms.project/1")
 # Analysis is also memory heavy; bounded concurrency prevents several large
 # pipelines from running at once.
 _ANALYZE_SEMAPHORE = threading.BoundedSemaphore(2)
+_NORMALIZE_SEMAPHORE = threading.BoundedSemaphore(4)
 _STEP_ASSET_REGISTRY = {}
 _STEP_ASSET_PARTS_REGISTRY = {}
 _STEP_ASSET_REGISTRY_LOCK = threading.Lock()
@@ -678,77 +679,84 @@ def handle_normalize(config, query, body):
         return make_web_error(
             422, "E_INVALID_FORMAT", "unsupported geometry format {!r}".format(raw_format)
         )
-    units = (query.get("units") or [None])[0]
-    name = sanitize_display_name((query.get("name") or [None])[0])
-    asset_dir = Path(config.cache_dir) / "step-assets" if config.cache_dir is not None else None
-    # The serialize lock only guards the heavy STEP kernel path; lightweight
-    try:
-        from .importers import load_geometry
-        from .step_kernel import StepKernelFailure, StepKernelUnavailable
-    except Exception as exc:
-        return make_web_error(500, "E_INTERNAL", "geometry importer is unavailable: {}".format(exc))
-    try:
-        result = load_geometry(
-            body,
-            fmt=fmt,
-            units=units,
-            step_backend="auto",
-            step_asset_dir=asset_dir,
+    acquired = _NORMALIZE_SEMAPHORE.acquire(timeout=60.0)
+    if not acquired:
+        return make_web_error(
+            503, "E_BUSY", "server is busy processing geometry normalization; try again"
         )
-    except UnitError as exc:
-        diagnostic = {
-            "code": "invalid_units",
-            "severity": "blocker",
-            "message": str(exc),
-            "details": {},
+    try:
+        units = (query.get("units") or [None])[0]
+        name = sanitize_display_name((query.get("name") or [None])[0])
+        asset_dir = Path(config.cache_dir) / "step-assets" if config.cache_dir is not None else None
+        try:
+            from .importers import load_geometry
+            from .step_kernel import StepKernelFailure, StepKernelUnavailable
+        except Exception as exc:
+            return make_web_error(500, "E_INTERNAL", "geometry importer is unavailable: {}".format(exc))
+        try:
+            result = load_geometry(
+                body,
+                fmt=fmt,
+                units=units,
+                step_backend="auto",
+                step_asset_dir=asset_dir,
+            )
+        except UnitError as exc:
+            diagnostic = {
+                "code": "invalid_units",
+                "severity": "blocker",
+                "message": str(exc),
+                "details": {},
+            }
+            return _preview_failure(fmt, units, [diagnostic], name)
+        except StepKernelUnavailable as exc:
+            diagnostic = {
+                "code": "step_kernel_unavailable",
+                "severity": "blocker",
+                "message": str(exc),
+                "details": {},
+            }
+            return _preview_failure(fmt, units, [diagnostic], name)
+        except StepKernelFailure as exc:
+            diagnostic = {
+                "code": "step_kernel_failed",
+                "severity": "blocker",
+                "message": str(exc),
+                "details": {},
+            }
+            return _preview_failure(fmt, units, [diagnostic], name)
+        except ValueError as exc:
+            diagnostic = {
+                "code": "parse_failed",
+                "severity": "error",
+                "message": str(exc),
+                "details": {},
+            }
+            return _preview_failure(fmt, units, [diagnostic], name)
+        if result is None or not result.is_supported:
+            diagnostics = [
+                item.to_dict() for item in (result.diagnostics if result is not None else ())
+            ]
+            return _preview_failure(fmt, units, diagnostics, name)
+        raw_display_asset = getattr(result, "display_asset", None)
+        display_asset = register_step_asset(raw_display_asset) if raw_display_asset is not None else None
+        response = {
+            "schema_id": GEOMETRY_PREVIEW_SCHEMA_ID,
+            "supported": True,
+            "format": result.format,
+            "source_units": result.source_units,
+            "geometry": result.geometry.to_dict(),
+            "diagnostics": [item.to_dict() for item in result.diagnostics],
+            "source_name": result.source_name or name,
         }
-        return _preview_failure(fmt, units, [diagnostic], name)
-    except StepKernelUnavailable as exc:
-        diagnostic = {
-            "code": "step_kernel_unavailable",
-            "severity": "blocker",
-            "message": str(exc),
-            "details": {},
-        }
-        return _preview_failure(fmt, units, [diagnostic], name)
-    except StepKernelFailure as exc:
-        diagnostic = {
-            "code": "step_kernel_failed",
-            "severity": "blocker",
-            "message": str(exc),
-            "details": {},
-        }
-        return _preview_failure(fmt, units, [diagnostic], name)
-    except ValueError as exc:
-        diagnostic = {
-            "code": "parse_failed",
-            "severity": "error",
-            "message": str(exc),
-            "details": {},
-        }
-        return _preview_failure(fmt, units, [diagnostic], name)
-    if result is None or not result.is_supported:
-        diagnostics = [
-            item.to_dict() for item in (result.diagnostics if result is not None else ())
-        ]
-        return _preview_failure(fmt, units, diagnostics, name)
-    raw_display_asset = getattr(result, "display_asset", None)
-    display_asset = register_step_asset(raw_display_asset) if raw_display_asset is not None else None
-    response = {
-        "schema_id": GEOMETRY_PREVIEW_SCHEMA_ID,
-        "supported": True,
-        "format": result.format,
-        "source_units": result.source_units,
-        "geometry": result.geometry.to_dict(),
-        "diagnostics": [item.to_dict() for item in result.diagnostics],
-        "source_name": result.source_name or name,
-    }
-    if display_asset is not None:
-        response["display_asset"] = display_asset
-    return (
-        200,
-        response,
-    )
+        if display_asset is not None:
+            response["display_asset"] = display_asset
+        return (
+            200,
+            response,
+        )
+    finally:
+        _NORMALIZE_SEMAPHORE.release()
 
 
 def _validate_analysis_envelope(payload):
@@ -1212,7 +1220,11 @@ class WebApiHandler(BaseHTTPRequestHandler):
                 status, payload = make_web_error(
                     404, "E_NOT_FOUND", "unknown API path {!r}".format(path)
                 )
-            self._send_api(status, payload)
+            if status in (400, 404, 413, 415):
+                self.close_connection = True
+                self._send_api(status, payload, extra_headers={"Connection": "close"})
+            else:
+                self._send_api(status, payload)
         except WebRequestError as exc:
             # 400/413 may leave the request body unread on the socket; keeping
             # the connection open would let leftover bytes be parsed as the

@@ -430,7 +430,8 @@ def _export_glb(input_path, output_path, source_units, scale_to_m, glb_deflectio
     BRepMesh_IncrementalMesh(root_shape, glb_deflection_source, False, 0.35, False)
     writer = RWGltf_CafWriter(output_path, True)
     converter = writer.ChangeCoordinateSystemConverter()
-    converter.SetInputLengthUnit(scale_to_m)
+    # OCCT standard internal unit for STEP shapes is always millimeters (0.001 m).
+    converter.SetInputLengthUnit(0.001)
     converter.SetOutputLengthUnit(1.0)
     writer.SetParallel(False)
     writer.SetMergeFaces(False)

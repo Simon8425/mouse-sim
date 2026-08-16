@@ -2,6 +2,8 @@ import { describe, it, expect, vi } from 'vitest';
 import * as THREE from 'three';
 import {
   entriesSignature,
+  computeExplodeOffsets,
+  type ExplodePart,
 } from '../scene/sceneRuntime';
 import {
   pythonTransformToMatrix4,
@@ -573,10 +575,14 @@ describe('InstancedMesh batching (draw-call reduction)', () => {
     ]);
     syncInstancedPose(batchGroup, explode, { 'screw-2': false });
     const probe = new THREE.Matrix4();
+    // Explode offsets ADD to the baked placement (screw-0 baked at origin).
     inst.getMatrixAt(0, probe);
     expect(new THREE.Vector3().setFromMatrixPosition(probe).x).toBeCloseTo(0.1, 6);
+    // screw-1 baked at x=0.03, explode offset y=0.2 → position (0.03, 0.2, 0).
     inst.getMatrixAt(1, probe);
-    expect(new THREE.Vector3().setFromMatrixPosition(probe).y).toBeCloseTo(0.2, 6);
+    const pos1 = new THREE.Vector3().setFromMatrixPosition(probe);
+    expect(pos1.x).toBeCloseTo(0.03, 6);
+    expect(pos1.y).toBeCloseTo(0.2, 6);
     inst.getMatrixAt(2, probe);
     const scale = new THREE.Vector3().setFromMatrixScale(probe);
     expect(scale.lengthSq()).toBe(0);
@@ -593,5 +599,84 @@ describe('InstancedMesh batching (draw-call reduction)', () => {
       disposeObjectGroup(child);
     }
     expect(spyGeomDispose).toHaveBeenCalled();
+  });
+});
+
+describe('computeExplodeOffsets', () => {
+  const assembly: [number, number, number] = [0, 0, 0];
+
+  function part(id: string, cx: number, cy: number, cz: number, size = 0.01): ExplodePart {
+    return { id, center: [cx, cy, cz], size: [size, size, size] };
+  }
+
+  it('is deterministic for the same inputs', () => {
+    const parts = [part('a', 0.1, 0, 0.2), part('b', -0.1, 0.05, -0.1)];
+    const a = computeExplodeOffsets(parts, assembly, 1);
+    const b = computeExplodeOffsets(parts, assembly, 1);
+    for (const p of parts) {
+      expect(a.get(p.id)).toEqual(b.get(p.id));
+    }
+  });
+
+  it('keeps every part at or above the assembly — nothing goes under the floor', () => {
+    const parts = [
+      part('top', 0, 0, 0.3),      // above
+      part('bottom', 0, 0, -0.3),  // below the assembly center
+      part('skate', 0, 0, -0.5),   // lowest
+    ];
+    const offsets = computeExplodeOffsets(parts, assembly, 1);
+    for (const p of parts) {
+      const off = offsets.get(p.id)!;
+      // No part moves below its assembled position (never under the floor).
+      expect(off[2]).toBeGreaterThanOrEqual(0);
+    }
+    // The lowest part stays planted (zero lift) so the model stays low.
+    const skate = offsets.get('skate')!;
+    expect(skate[2]).toBeCloseTo(0, 6);
+    // The part that was higher ends up higher in the exploded pose.
+    const top = offsets.get('top')!;
+    const bottom = offsets.get('bottom')!;
+    expect(top[2]).toBeGreaterThan(bottom[2]);
+    expect(bottom[2]).toBeGreaterThan(skate[2]);
+  });
+
+  it('spreads parts laterally away from the assembly center', () => {
+    const parts = [
+      part('left', -0.3, 0, 0),
+      part('right', 0.3, 0, 0),
+    ];
+    const offsets = computeExplodeOffsets(parts, assembly, 1);
+    const left = offsets.get('left')!;
+    const right = offsets.get('right')!;
+    expect(left[0]).toBeLessThan(0);
+    expect(right[0]).toBeGreaterThan(0);
+  });
+
+  it('does not depend on part id naming', () => {
+    // Same height, different lateral position — the de-overlap pass has
+    // nothing to resolve, so any divergence would have to come from naming.
+    const parts = [part('generic_part_A', -0.02, 0, 0.3), part('top_shell', 0.02, 0, 0.3)];
+    const offsets = computeExplodeOffsets(parts, assembly, 1);
+    const a = offsets.get('generic_part_A')!;
+    const b = offsets.get('top_shell')!;
+    // Identical lift, mirrored lateral spread.
+    expect(a[2]).toBeCloseTo(b[2], 6);
+    expect(a[0]).toBeCloseTo(-b[0], 6);
+    expect(a[1]).toBeCloseTo(b[1], 6);
+  });
+
+  it('keeps exploded boxes from overlapping at full factor', () => {
+    // Two large slabs stacked on top of each other — the naive vertical lift
+    // would leave them colliding; separation must push the upper one up.
+    const parts = [
+      part('lower', 0, 0, -0.05, 0.2),
+      part('upper', 0, 0, 0.05, 0.2),
+    ];
+    const offsets = computeExplodeOffsets(parts, assembly, 1);
+    const lo = offsets.get('lower')!;
+    const hi = offsets.get('upper')!;
+    // After separation the centers must be farther apart than the slab size.
+    const gap = Math.abs(hi[2] - lo[2]);
+    expect(gap).toBeGreaterThan(0.2);
   });
 });

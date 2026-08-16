@@ -1053,6 +1053,9 @@ function resetGeometryView(state: ProjectState): ProjectState {
     classifyJob: null,
     classifyModalOpen: false,
     partGeometry: null,
+    // A fresh model starts assembled; the old explode factor targets stale
+    // geometry and must not carry over.
+    explode: 0,
   };
 }
 
