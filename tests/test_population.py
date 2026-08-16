@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import subprocess
 import sys
@@ -58,7 +59,18 @@ def make_config(**overrides):
 
 def battery_only_config(**overrides):
     config = make_config(**overrides)
-    config["components"] = [{"component_id": "battery_pack", "type": "battery"}]
+    # A cradle rated for the drop (latch retention 25 N: clears the whole
+    # 0.008-0.02 kg cell class across the 50-500 g shock band at the 0.5
+    # transmission factor).  The bare default 8 N hook is a weak-cradle
+    # scenario that dislodges even at low drops — not the reference design.
+    config["components"] = [
+        {
+            "component_id": "battery_pack",
+            "type": "battery",
+            "mass_kg": 0.008,
+            "latch_retention_n": 25.0,
+        }
+    ]
     return config
 
 
@@ -391,7 +403,15 @@ class PopulationRunTests(unittest.TestCase):
     def test_unevaluated_units_reported_and_excluded_from_failure_rate(self):
         config = make_config(
             components=[
-                {"component_id": "battery_pack", "type": "battery"},
+                # A rated cradle (25 N) on the reference 0.008 kg cell keeps
+                # the battery healthy at the default 0.75 m profile; the
+                # mystery part is unevaluated.
+                {
+                    "component_id": "battery_pack",
+                    "type": "battery",
+                    "mass_kg": 0.008,
+                    "latch_retention_n": 25.0,
+                },
                 {"component_id": "mystery_part", "type": "quantum_flux_capacitor"},
             ]
         )
@@ -563,6 +583,108 @@ class HertzContactDefaultTests(unittest.TestCase):
                 run_population(
                     make_config(contact_radius_m=bad), self.context
                 )
+
+
+class SurvivalAndWeibullTests(unittest.TestCase):
+    """Regression tests for the survival-curve boundary semantics and the
+    Weibull/B10 estimator (audit: multi-drop degradation & fleet reliability)."""
+
+    def _bins(self, *counts):
+        # counts[0] is bin 1 (0 < u_f <= 0.1); bin 0 is always empty.
+        bins = [0] * 11
+        for index, count in enumerate(counts, start=1):
+            bins[index] = count
+        return bins
+
+    def test_survival_excludes_exact_horizon_failures(self):
+        # 90 survivors + 10 units failing exactly AT u_f = 1.0 (ratio 1.0):
+        # S(1.0) must be 0.9 (the exact-horizon failures are DEAD at 1.0),
+        # and S(0.9) must be 1.0 (they are alive just before the horizon).
+        from mouse_sim.population import _survival
+
+        bins = self._bins()
+        bins[10] = 10
+        curve = _survival(bins, 90, 100)
+        self.assertEqual(curve[-1]["survival_rate"], 0.9)
+        self.assertEqual(curve[-2]["survival_rate"], 1.0)
+        # Monotonic non-increasing.
+        rates = [entry["survival_rate"] for entry in curve]
+        for lower, higher in zip(rates, rates[1:]):
+            self.assertLessEqual(higher, lower + 1e-9)
+
+    def test_survival_bin_boundary(self):
+        # 90 survivors + 10 units failing in (0.2, 0.3] (bin 3): alive at
+        # u=0.2 (u_f > 0.2), dead at u=0.3 and beyond.
+        from mouse_sim.population import _survival
+
+        bins = self._bins()
+        bins[3] = 10
+        curve = _survival(bins, 90, 100)
+        by_u = {entry["usage_fraction"]: entry["survival_rate"] for entry in curve}
+        self.assertEqual(by_u[0.1], 1.0)
+        self.assertEqual(by_u[0.2], 1.0)
+        self.assertEqual(by_u[0.3], 0.9)
+        self.assertEqual(by_u[1.0], 0.9)
+
+    def test_weibull_fit_median_rank_and_b10(self):
+        from mouse_sim.population import _weibull_fit
+
+        # 50 survivors, 50 failures uniformly spread over bins 4..10
+        # (u_f in (0.3, 1.0]); a Weibull fit must exist, be finite, and
+        # the B10 usage fraction must be strictly inside (0, 1).
+        bins = self._bins()
+        for k in range(4, 11):
+            bins[k] = 7
+        bins[10] += 1  # 50 total
+        fit = _weibull_fit(bins, 50, 100)
+        self.assertIsNotNone(fit)
+        self.assertGreater(fit["beta"], 0.0)
+        self.assertGreater(fit["eta"], 0.0)
+        self.assertGreater(fit["b10_usage_fraction"], 0.0)
+        self.assertLess(fit["b10_usage_fraction"], 1.0)
+        self.assertEqual(fit["failures_fit"], 50)
+        # B10 formula: t_10 = eta * (-ln(0.9))^(1/beta).
+        expected_b10 = fit["eta"] * ((-math.log(0.9)) ** (1.0 / fit["beta"]))
+        self.assertAlmostEqual(fit["b10_usage_fraction"], expected_b10, places=3)
+
+    def test_weibull_zero_failures_is_none(self):
+        from mouse_sim.population import _weibull_fit
+
+        # 0 failures -> infinite life -> no finite eta/beta (no NaN/Inf).
+        self.assertIsNone(_weibull_fit([0] * 11, 100, 100))
+        self.assertIsNone(_weibull_fit([0] * 11, 0, 100))
+
+    def test_weibull_all_fail_at_horizon_is_none_or_finite(self):
+        from mouse_sim.population import _weibull_fit
+
+        # All 100 units fail exactly at u_f = 1.0: the fit is degenerate
+        # (zero variance in x) and must NOT emit NaN/Inf — None is the
+        # safe answer.
+        bins = self._bins()
+        bins[10] = 100
+        fit = _weibull_fit(bins, 0, 100)
+        self.assertIsNone(fit)
+
+    def test_weibull_few_failures_is_none(self):
+        from mouse_sim.population import _weibull_fit
+
+        bins = self._bins()
+        bins[5] = 2  # only 2 failures
+        self.assertIsNone(_weibull_fit(bins, 98, 100))
+
+    def test_population_result_carries_weibull_key(self):
+        # The assembled population result must carry the weibull block
+        # (None when nothing failed, a dict when failures exist) and the
+        # survival endpoint must stay consistent with the failure rate.
+        result = run_population(
+            battery_only_config(sample_count=200, drop_height_m=2.0), make_context()
+        )
+        self.assertIn("weibull", result)
+        if result["units_failed"] > 0:
+            self.assertIsNotNone(result["weibull"])
+            self.assertIn("b10_usage_fraction", result["weibull"])
+        survival_end = result["survival"][-1]["survival_rate"]
+        self.assertAlmostEqual(survival_end, 1.0 - result["failure_rate"], places=4)
 
 
 if __name__ == "__main__":

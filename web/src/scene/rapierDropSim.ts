@@ -15,7 +15,7 @@
  * Determinism: Rapier is deterministic for a fixed timestep and fixed inputs.
  */
 import type { DropSimulationResult, DropSimulationDrop } from '../api/contracts';
-import { worldVerticesForGeometry, type ObjectSceneEntry } from './geometryFactory';
+import { worldVerticesForGeometryFull, type ObjectSceneEntry } from './geometryFactory';
 import type { TelemetryFrame } from '../api/telemetryDebuggerContracts';
 
 /** Backend model fields the Rapier sim consumes (subset of DropSimulationResult.model). */
@@ -148,8 +148,8 @@ export async function buildRapierDropSim(
     .setRotation(startQuat)
     .setLinvel(0, 0, 0)
     .setAngvel({ x: worldSpin[0], y: worldSpin[1], z: worldSpin[2] })
-    .setLinearDamping(0.04)
-    .setAngularDamping(0.25)
+    .setLinearDamping(0.0)
+    .setAngularDamping(0.0)
     .setCcdEnabled(true)
     .setCanSleep(true);
   const body = world.createRigidBody(bodyDesc);
@@ -188,6 +188,8 @@ type Vec3 = [number, number, number];
   let prevQuat: [number, number, number, number] = [startQuat.x, startQuat.y, startQuat.z, startQuat.w];
   let currPos: Vec3 = [startPose[0], startPose[1], startPose[2]];
   let currQuat: [number, number, number, number] = [startQuat.x, startQuat.y, startQuat.z, startQuat.w];
+  const prevLinvel: Vec3 = [0, 0, 0];
+  let hasImpacted = false;
 
   const reusableLiveState: LiveBodyState = {
     position: [startPose[0], startPose[1], startPose[2]],
@@ -197,6 +199,7 @@ type Vec3 = [number, number, number];
   };
 
   let accumulator = 0;
+  let elapsedSimTime = 0;
   const telemetryListeners = new Set<(frame: TelemetryFrame) => void>();
 
   const sim: RapierDropSim = {
@@ -218,6 +221,9 @@ type Vec3 = [number, number, number];
         prevQuat[1] = currQuat[1];
         prevQuat[2] = currQuat[2];
         prevQuat[3] = currQuat[3];
+        prevLinvel[0] = body.linvel().x;
+        prevLinvel[1] = body.linvel().y;
+        prevLinvel[2] = body.linvel().z;
         world.step();
         const p = body.translation();
         const r = body.rotation();
@@ -228,7 +234,11 @@ type Vec3 = [number, number, number];
         currQuat[1] = r.y;
         currQuat[2] = r.z;
         currQuat[3] = r.w;
+        if (currPos[2] < 0.04) {
+          hasImpacted = true;
+        }
         accumulator -= timestep;
+        elapsedSimTime += timestep;
         steps += 1;
       }
       const alpha = Math.min(1, Math.max(0, accumulator / timestep));
@@ -244,11 +254,35 @@ type Vec3 = [number, number, number];
       reusableLiveState.angvel[0] = Math.abs(w.x) < 1e-5 ? 0 : w.x;
       reusableLiveState.angvel[1] = Math.abs(w.y) < 1e-5 ? 0 : w.y;
       reusableLiveState.angvel[2] = Math.abs(w.z) < 1e-5 ? 0 : w.z;
+
       if (telemetryListeners.size > 0) {
+        const vx = reusableLiveState.linvel[0];
+        const vy = reusableLiveState.linvel[1];
+        const vz = reusableLiveState.linvel[2];
+        const wx = reusableLiveState.angvel[0];
+        const wy = reusableLiveState.angvel[1];
+        const wz = reusableLiveState.angvel[2];
+        const vSq = vx * vx + vy * vy + vz * vz;
+        const kTrans = 0.5 * mass * vSq;
+        const kRot = 0.5 * (principal.x * wx * wx + principal.y * wy * wy + principal.z * wz * wz);
+        const pot = mass * 9.81 * Math.max(0, reusableLiveState.position[2]);
+        const totEnergy = kTrans + kRot + pot;
+
+        // Numerical acceleration in G
+        const dvx = (v.x - prevLinvel[0]) / timestep;
+        const dvy = (v.y - prevLinvel[1]) / timestep;
+        const dvz = (v.z - prevLinvel[2]) / timestep;
+        const accelG = Math.sqrt(dvx * dvx + dvy * dvy + (dvz + 9.81) * (dvz + 9.81)) / 9.81;
+
+        const isContact = hasImpacted && reusableLiveState.position[2] < 0.035;
+        const status: TelemetryFrame['status'] = isContact
+          ? (vSq > 0.05 ? 'impact' : 'settled')
+          : (hasImpacted ? 'rebound' : 'free_fall');
+
         const frame: TelemetryFrame = {
-          index: 0,
-          t_s: 0,
-          status: 'free_fall',
+          index: Math.round(elapsedSimTime / timestep),
+          t_s: elapsedSimTime,
+          status,
           position_m: [reusableLiveState.position[0], reusableLiveState.position[1], reusableLiveState.position[2]],
           quaternion_wxyz: [
             reusableLiveState.quaternion[3],
@@ -256,11 +290,17 @@ type Vec3 = [number, number, number];
             reusableLiveState.quaternion[1],
             reusableLiveState.quaternion[2],
           ],
-          velocity_m_s: [reusableLiveState.linvel[0], reusableLiveState.linvel[1], reusableLiveState.linvel[2]],
-          angular_velocity_rad_s: [reusableLiveState.angvel[0], reusableLiveState.angvel[1], reusableLiveState.angvel[2]],
-          acceleration_g: 0,
-          energy_j: { kinetic_trans: 0, kinetic_rot: 0, potential: 0, total: 0, dissipated: 0 },
-          contact: { active: false },
+          velocity_m_s: [vx, vy, vz],
+          angular_velocity_rad_s: [wx, wy, wz],
+          acceleration_g: accelG,
+          energy_j: {
+            kinetic_trans: kTrans,
+            kinetic_rot: kRot,
+            potential: pot,
+            total: totEnergy,
+            dissipated: Math.max(0, mass * 9.81 * (firstDrop?.starting_pose_m?.[2] ?? 0.75) - totEnergy),
+          },
+          contact: { active: isContact },
         };
         for (const listener of telemetryListeners) listener(frame);
       }
@@ -273,8 +313,10 @@ type Vec3 = [number, number, number];
 
     reset(drop: DropSimulationDrop, m: DropSimulationModel): void {
       accumulator = 0;
-      body.setLinearDamping(0.04);
-      body.setAngularDamping(0.25);
+      elapsedSimTime = 0;
+      hasImpacted = false;
+      body.setLinearDamping(0.0);
+      body.setAngularDamping(0.0);
 
       const pose = drop.starting_pose_m ?? [0, 0, 0.75];
       body.setTranslation({ x: pose[0], y: pose[1], z: pose[2] }, true);
@@ -300,7 +342,7 @@ type Vec3 = [number, number, number];
       const speedSq = v.x * v.x + v.y * v.y + v.z * v.z;
       const spinSq = w.x * w.x + w.y * w.y + w.z * w.z;
       const pos = body.translation();
-      return pos.z < 0.25 && speedSq < 0.0005 && spinSq < 0.003;
+      return hasImpacted && pos.z < 0.08 && speedSq < 0.0005 && spinSq < 0.003;
     },
 
     onTelemetry(cb: (frame: TelemetryFrame) => void): () => void {
@@ -330,7 +372,7 @@ function buildCollider(
   const invGridSize = 500; // 2mm grid cell size (1 / 0.002)
 
   for (const entry of entries) {
-    const verts = worldVerticesForGeometry(entry.geometry);
+    const verts = worldVerticesForGeometryFull(entry.geometry);
     for (const v of verts) {
       const gx = Math.round(v[0] * invGridSize);
       const gy = Math.round(v[1] * invGridSize);

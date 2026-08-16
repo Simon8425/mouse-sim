@@ -145,9 +145,11 @@ class ShellSafetyIsolationTests(unittest.TestCase):
         # additionally fails the crush channel, the light one does not.
         self.assertEqual(heavy_verdict, "fail")
         self.assertEqual(light_verdict, "fail")
+        # The heavy cell also fails the snap-fit latch channel (its inertia
+        # overwhelms the 8 N retention hook) and the crush channel.
         self.assertEqual(
             [f["code"] for f in component_entries(heavy)[0].get("findings", [])],
-            ["BATTERY_CRUSH_RISK", "BATTERY_SHOCK_EXCEEDED"],
+            ["BATTERY_LATCH_DISLODGED", "BATTERY_CRUSH_RISK", "BATTERY_SHOCK_EXCEEDED"],
         )
         self.assertEqual(
             [f["code"] for f in component_entries(light)[0].get("findings", [])],

@@ -164,12 +164,13 @@ export function createPopulationFleet(
       unitGroup.userData.fleetUnitIndex = index;
       unitGroup.userData.fleetUnitId = unitData.id;
 
-      // Ensure all children are visible and unexploded
+      // Ensure all children are visible and unexploded.
+      // NOTE: child transforms are preserved (clone(true) copies them);
+      // only visibility is forced on — zeroing positions here would
+      // collapse any deliberately offset part hierarchy (e.g. a bottom
+      // case below the shell) into the origin.
       unitGroup.traverse((child) => {
         child.visible = true;
-        if (child.parent === unitGroup) {
-          child.position.set(0, 0, 0);
-        }
         if (child instanceof THREE.Mesh && child.material) {
           const originalMat = child.material as THREE.MeshStandardMaterial;
           let clonedMat = materialsMap.get(originalMat) as THREE.MeshStandardMaterial;
@@ -177,7 +178,11 @@ export function createPopulationFleet(
             clonedMat = originalMat.clone();
             materialsMap.set(originalMat, clonedMat);
           }
-          child.material = clonedMat.clone();
+          // SHARE one clone per base material across all units: the old
+          // code cloned AGAIN per unit (36N materials, cache dead code).
+          // Per-unit verdict tinting is done on the status rings only, so
+          // sharing the part materials is safe.
+          child.material = clonedMat;
           child.userData.fleetUnitIndex = index;
         }
       });
@@ -245,6 +250,8 @@ export function createPopulationFleet(
         const T2 = 2 * e * e * t1;
         const t3 = t2 + T2;
 
+        const verdictColor = u.verdict === 'fail' ? FAIL_COLOR : u.verdict === 'warn' ? WARN_COLOR : PASS_COLOR;
+
         if (timeS < t1) {
           // 1. Initial free fall under gravity with exact geodesic SLERP rotation
           const progress = Math.max(0, timeS / t1);
@@ -254,8 +261,12 @@ export function createPopulationFleet(
 
           if (statusRing) {
             const mat = statusRing.material as THREE.MeshBasicMaterial;
-            mat.color.setHex(0x475569);
-            mat.opacity = 0.3;
+            // Only write when the phase color differs (avoid per-frame
+            // uniform dirtying for every unit during free fall).
+            if (mat.color.getHex() !== 0x475569 || mat.opacity !== 0.3) {
+              mat.color.setHex(0x475569);
+              mat.opacity = 0.3;
+            }
           }
 
           if (ripple) {
@@ -270,8 +281,10 @@ export function createPopulationFleet(
 
           if (statusRing) {
             const mat = statusRing.material as THREE.MeshBasicMaterial;
-            mat.color.setHex(u.verdict === 'fail' ? FAIL_COLOR : u.verdict === 'warn' ? WARN_COLOR : PASS_COLOR);
-            mat.opacity = 0.85;
+            if (mat.color.getHex() !== verdictColor || mat.opacity !== 0.85) {
+              mat.color.setHex(verdictColor);
+              mat.opacity = 0.85;
+            }
           }
 
           if (ripple && dt1 < 0.4) {
@@ -291,22 +304,27 @@ export function createPopulationFleet(
 
           if (statusRing) {
             const mat = statusRing.material as THREE.MeshBasicMaterial;
-            mat.color.setHex(u.verdict === 'fail' ? FAIL_COLOR : u.verdict === 'warn' ? WARN_COLOR : PASS_COLOR);
-            mat.opacity = 0.85;
+            if (mat.color.getHex() !== verdictColor || mat.opacity !== 0.85) {
+              mat.color.setHex(verdictColor);
+              mat.opacity = 0.85;
+            }
           }
 
           if (ripple) {
             (ripple.mesh.material as THREE.MeshBasicMaterial).opacity = 0;
           }
         } else {
-          // 4. Settled at rest on ground
+          // 4. Settled at rest on ground — skip pose writes (already at
+          // target) and only dirty the ring material once at the transition.
           mesh.position.set(u.targetPos.x, u.targetPos.y, u.targetPos.z);
           mesh.quaternion.copy(u.targetQuat);
 
           if (statusRing) {
             const mat = statusRing.material as THREE.MeshBasicMaterial;
-            mat.color.setHex(u.verdict === 'fail' ? FAIL_COLOR : u.verdict === 'warn' ? WARN_COLOR : PASS_COLOR);
-            mat.opacity = 0.85;
+            if (mat.color.getHex() !== verdictColor || mat.opacity !== 0.85) {
+              mat.color.setHex(verdictColor);
+              mat.opacity = 0.85;
+            }
           }
 
           if (ripple) {
@@ -345,16 +363,36 @@ export function createPopulationFleet(
       return box;
     },
     dispose() {
-      fleetGroup.traverse((child) => {
-        if (child instanceof THREE.Mesh) {
-          child.geometry?.dispose();
-          if (Array.isArray(child.material)) {
-            child.material.forEach((m) => m.dispose());
-          } else {
-            child.material?.dispose();
-          }
+      // Audit fix (use-after-dispose hazard): the unit meshes are
+      // clone(true) of the BASE model, so their geometries are the SAME
+      // BufferGeometry objects the base model still renders.  Disposing
+      // them here left the base model pointing at disposed buffers after
+      // LEAVE_TEST (blank model or crash on re-render).  Dispose ONLY the
+      // fleet-owned ring geometries and the per-base-material clones; the
+      // shared unit geometries belong to the base model and stay alive.
+      statusRingGeom.dispose();
+      rippleGeom.dispose();
+      highlightRingGeom.dispose();
+      for (const mat of materialsMap.values()) {
+        mat.dispose();
+      }
+      highlightRingMat.dispose();
+      // The per-unit status/ripple materials are unique per ring mesh;
+      // dispose them too (they are not in materialsMap).
+      for (const ring of statusRings) {
+        if (Array.isArray(ring.material)) {
+          for (const m of ring.material) m.dispose();
+        } else {
+          ring.material?.dispose();
         }
-      });
+      }
+      for (const ripple of ripples) {
+        if (Array.isArray(ripple.mesh.material)) {
+          for (const m of ripple.mesh.material) m.dispose();
+        } else {
+          ripple.mesh.material?.dispose();
+        }
+      }
       scene.remove(fleetGroup);
     },
   };

@@ -62,7 +62,7 @@ describe('AiClassifyModal component', () => {
     expect(screen.getByText('part-0')).toBeDefined();
   });
 
-  it('allows individual accept and accept all', () => {
+  it('allows accepting recognized suggestions', () => {
     render(
       <ModalFixture
         actions={[
@@ -86,11 +86,11 @@ describe('AiClassifyModal component', () => {
       />
     );
 
-    const acceptBtn = screen.getByRole('button', { name: 'Accept' });
+    const acceptBtn = screen.getByRole('button', { name: 'Accept recognized (1)' });
     expect(acceptBtn).toBeDefined();
     fireEvent.click(acceptBtn);
 
-    // After accepting the only suggestion, the modal closes
+    // After accepting suggestions, the modal closes
     expect(screen.queryByText('AI Component Classification')).toBeNull();
   });
 

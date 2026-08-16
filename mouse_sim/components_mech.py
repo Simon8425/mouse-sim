@@ -49,6 +49,21 @@ _ABS_YIELD_PA = 40e6
 _ABS_COMPRESSIVE_PA = 60e6
 _ABS_MODULUS_PA = 2.0e9
 
+# Boss thread-stripping shear allowable: molded-plastic boss pull-out data
+# lands at ~0.75-1.0x the tensile yield of the boss material; the screening
+# constant is 1.0 * S_y (the classic F = pi * d_major * h_engagement * S_y
+# boss formula).  This is a shear-out capacity, NOT the 0.2*S_y cantilever
+# bending convention used elsewhere in this file.
+_BOSS_SHEAR_FRACTION = 1.0
+
+# Boss sizing recommendations (self-tapping screws in molded bosses):
+# boss OD ~= 2.0 x screw diameter and engaged thread length >= 2.5 x screw
+# diameter; minimum boss wall thickness ~0.5 mm (or 0.4 x thread pitch).
+_BOSS_OD_RATIO = 2.0
+_BOSS_ENGAGEMENT_RATIO = 2.5
+_BOSS_MIN_WALL_M = 0.5e-3
+_BOSS_WALL_PITCH_RATIO = 0.4
+
 # Unified knife-edge policy (see the module docstring): pass below 1.0, warn
 # (marginal) in [1.0, 1.2), fail at >= 1.2.  The float-noise guard absorbs
 # closed-form round-off so a ratio constructed to land exactly on a boundary
@@ -88,7 +103,9 @@ def defaults(component_type):
     if component_type == "screw":
         return {
             "thread_diameter_m": 0.002,
-            "engagement_length_m": 0.003,
+            "engagement_length_m": 0.005,
+            "boss_inner_diameter_m": 0.002,
+            "boss_outer_diameter_m": 0.004,
             "boss_material": "ABS",
             "preload_n": 15.0,
             "screw_count": 4,
@@ -197,7 +214,7 @@ def _not_evaluated(component_id, reason):
 
 def _analyze_screw(spec, context):
     d = _finite(spec.get("thread_diameter_m"), 0.002)
-    engagement = _finite(spec.get("engagement_length_m"), 0.003)
+    engagement = _finite(spec.get("engagement_length_m"), 0.005)
     preload = max(0.0, _finite(spec.get("preload_n"), 15.0))
     raw_count = spec.get("screw_count")
     count = max(1, int(raw_count) if raw_count else 4)
@@ -206,11 +223,25 @@ def _analyze_screw(spec, context):
     accel_g = _accel_g(context)
     if d <= 0.0 or engagement <= 0.0:
         return _not_evaluated("screw", "screw geometry must be positive")
-    # Plastic boss shear-out screening: tau = 0.2 * S_y (ABS S_y = 40 MPa,
-    # hardcoded ABS-class value; the boss material field is not read).
-    tau = 0.2 * _ABS_YIELD_PA
+    # Plastic boss thread-stripping screening: tau = S_y of the boss material
+    # (molded-plastic shear-out at ~1x tensile yield; ABS-class S_y = 40 MPa
+    # hardcoded — the boss material field is not read).  The standard
+    # stripping formula is F = pi * d_major * h_engagement * tau, where
+    # h_engagement is the ENGAGED thread length, not the full screw length.
+    tau = _BOSS_SHEAR_FRACTION * _ABS_YIELD_PA
     pullout = math.pi * d * engagement * tau
-    added = supported * max(accel_g, vibration_g) * 9.80665 / count
+    # Drop-shock load path: prefer the impact module's peak_force_n (split
+    # across the fastener count) when the pipeline supplies it; fall back to
+    # F = m * g * G / count.  Drop shock and transport vibration are
+    # superimposed as the max, not the sum (screening simplification, see
+    # assumptions).
+    drop = context.get("drop")
+    peak_force = 0.0
+    if isinstance(drop, dict):
+        peak_force = max(0.0, _finite(drop.get("peak_force_n"), 0.0))
+    drop_share = peak_force / count if peak_force > 0.0 else supported * accel_g * 9.80665 / count
+    vibration_share = supported * vibration_g * 9.80665 / count
+    added = max(drop_share, vibration_share)
     total_load = preload + added
     findings = []
     status = "pass"
@@ -225,21 +256,66 @@ def _analyze_screw(spec, context):
         if margin <= _MARGIN_FAIL:
             status = "fail"
             findings.append(
-                {"code": "SCREW_PULLOUT_RISK", "severity": "error", "message": "applied load exceeds the boss pull-out force (margin {:.2f}); beyond the class-constant screening uncertainty band".format(margin)}
+                {"code": "SCREW_PULLOUT_RISK", "severity": "error", "message": "applied load exceeds the boss thread-stripping force (margin {:.2f}); beyond the class-constant screening uncertainty band".format(margin)}
             )
         elif margin <= _MARGIN_WARN:
             status = "warn"
             findings.append(
-                {"code": "SCREW_PULLOUT_MARGINAL", "severity": "warning", "message": "pull-out margin {:.2f} at the screening boundary; within the class-constant screening uncertainty band".format(margin)}
+                {"code": "SCREW_PULLOUT_MARGINAL", "severity": "warning", "message": "thread-stripping margin {:.2f} at the screening boundary; within the class-constant screening uncertainty band".format(margin)}
             )
     preload_fraction = preload / pullout if pullout > 0.0 else 1.0
     # Junker-class self-loosening screening: transverse vibration load above
     # the friction capacity (mu_s * preload) of the joint risks self-loosening.
-    transverse = supported * vibration_g * 9.80665 / count
+    transverse = vibration_share
     loosening_preload = transverse / 0.15
     if preload < loosening_preload:
         findings.append(
             {"code": "SCREW_LOOSENING_RISK", "severity": "warning", "message": "preload {:.1f} N below the {:.1f} N friction capacity threshold; vibration self-loosening risk (Junker class)".format(preload, loosening_preload)}
+        )
+        if status == "pass":
+            status = "warn"
+    # Boss hoop stress from the radial thread-expansion pressure: the axial
+    # thread load spread over the engaged cylindrical bore area acts
+    # radially at the boss ID (thin-cylinder hoop law sigma = p * d_inner /
+    # (2 * t_wall)).  The screening allowable is the tensile yield of the
+    # boss material; a thin-walled boss splits before it pulls out.
+    d_inner = max(0.0, _finite(spec.get("boss_inner_diameter_m"), d))
+    d_outer = max(0.0, _finite(spec.get("boss_outer_diameter_m"), 2.0 * d))
+    t_wall = (d_outer - d_inner) / 2.0
+    hoop = None
+    hoop_ratio = 0.0
+    if t_wall > 0.0 and engagement > 0.0 and total_load > 0.0:
+        pressure = total_load / (math.pi * d_inner * engagement)
+        hoop = pressure * d_inner / (2.0 * t_wall)
+        hoop_ratio = hoop / _ABS_YIELD_PA
+        if hoop_ratio >= _FAIL_RATIO:
+            status = "fail"
+            findings.append(
+                {"code": "SCREW_BOSS_HOOP_FAIL", "severity": "error", "message": "boss hoop stress {:.1f} MPa exceeds the yield strength beyond the class-constant screening uncertainty band; boss radial crack risk".format(hoop / 1e6)}
+            )
+        elif hoop_ratio >= _WARN_RATIO:
+            status = "warn"
+            findings.append(
+                {"code": "SCREW_BOSS_HOOP_MARGINAL", "severity": "warning", "message": "boss hoop utilization {:.0%} at the screening boundary; within the class-constant screening uncertainty band".format(hoop_ratio)}
+            )
+        elif hoop_ratio > 0.7:
+            status = "warn"
+            findings.append(
+                {"code": "SCREW_BOSS_HOOP_MARGINAL", "severity": "warning", "message": "boss hoop utilization {:.0%} above 0.7".format(hoop_ratio)}
+            )
+    # Boss sizing recommendations (self-tapping screws): engaged thread
+    # length >= 2.5 x screw diameter and boss wall thickness >= 0.5 mm (or
+    # 0.4 x thread pitch).  Violations are advisory warnings, not fails.
+    if engagement < _BOSS_ENGAGEMENT_RATIO * d:
+        findings.append(
+            {"code": "SCREW_ENGAGEMENT_SHORT", "severity": "warning", "message": "engaged thread length {:.2f} mm is below the {:.1f}x screw-diameter recommendation ({:.2f} mm)".format(engagement * 1e3, _BOSS_ENGAGEMENT_RATIO, _BOSS_ENGAGEMENT_RATIO * d * 1e3)}
+        )
+        if status == "pass":
+            status = "warn"
+    pitch = d / 8.0
+    if t_wall < _BOSS_MIN_WALL_M or t_wall < _BOSS_WALL_PITCH_RATIO * pitch:
+        findings.append(
+            {"code": "SCREW_BOSS_WALL_THIN", "severity": "warning", "message": "boss wall thickness {:.2f} mm is below the minimum recommendation ({:.2f} mm / 0.4x pitch {:.2f} mm); add boss gussets or increase the boss OD".format(t_wall * 1e3, _BOSS_MIN_WALL_M * 1e3, _BOSS_WALL_PITCH_RATIO * pitch * 1e3)}
         )
         if status == "pass":
             status = "warn"
@@ -248,13 +324,18 @@ def _analyze_screw(spec, context):
         "added_load_n": round(added, 4),
         "margin": round(margin, 4) if margin is not None else None,
         "preload_fraction": round(preload_fraction, 4),
+        "hoop_stress_pa": round(hoop, 3) if hoop is not None else None,
+        "boss_wall_thickness_m": round(t_wall, 6) if t_wall > 0.0 else None,
     }
     assumptions = [
-        "boss pull-out tau = 0.2 * S_y with ABS-class S_y = 40 MPa hardcoded (plastic thread shear-out screening; the boss material field is not read)",
+        "boss thread-stripping tau = S_y of the boss material with ABS-class S_y = 40 MPa hardcoded (molded-plastic shear-out ~0.75-1.0x tensile yield; the boss material field is not read)",
         "bolt load = preload + applied load (screening superposition; for a stiff screw in a soft plastic boss the load-sharing factor is ~0.9, so the error is <= 25% and conservative)",
+        "drop-shock load uses the impact peak_force_n split across the screw count when supplied, else F = m * g * G / count; drop shock and transport vibration are combined as the max, not the sum (screening simplification)",
+        "boss hoop stress = radial thread-expansion pressure * d_inner / (2 * t_wall) against the tensile yield (thin-cylinder hoop law; p = axial load over the engaged bore area)",
         "preload relaxation from boss creep over life is NOT modeled (unconservative direction; 15 N default is 6x the loosening threshold)",
         "vibration loosening screening: preload below the friction capacity (mu_s = 0.15) of the transverse load risks Junker-class self-loosening",
         "3 g rms transport vibration is a severe screening value (rough-transport class), not a named ISTA class",
+        "boss sizing recommendations: engagement >= 2.5 x screw diameter, boss OD ~= 2.0 x screw diameter, wall >= 0.5 mm (or 0.4 x pitch)",
     ]
     return _result("screw", "screw", status, metrics, findings, assumptions, 1.0 / margin if margin and margin > 0.0 else 0.0)
 

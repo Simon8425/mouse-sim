@@ -611,7 +611,13 @@ _BUILTIN_BASELINE_PROJECT = {
 
 def handle_baseline(config):
     """Return the baseline project document from the configured project root."""
-    path = config.project_root / "examples" / "mouse_baseline.json"
+    root = getattr(config, "project_root", None)
+    if root is not None:
+        path = Path(root) / "examples" / "mouse_baseline.json"
+    else:
+        path = Path.cwd() / "examples" / "mouse_baseline.json"
+        if not path.exists():
+            path = Path(__file__).resolve().parent.parent / "examples" / "mouse_baseline.json"
     try:
         with path.open("r", encoding="utf-8") as stream:
             project = json.load(stream)

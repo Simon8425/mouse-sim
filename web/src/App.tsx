@@ -256,6 +256,13 @@ export function App(): React.ReactElement {
       selectionAnchor: null,
     };
 
+    // No test is active (LEAVE_TEST) and no FEA/stress visualization is
+    // requested: nothing but plain geometry markers may remain on screen.
+    const testActive =
+      state.draft?.drop_simulation != null ||
+      (!state.playbackDismissed && state.lastResult?.drop_simulation != null);
+    if (!testActive) return spec;
+
     const result = lastResult;
     if (result) {
       const response = result.structural?.response;
@@ -288,9 +295,9 @@ export function App(): React.ReactElement {
       }
     }
 
-    // For drop simulations, suppress static structural overlays so stress/load vectors
-    // don't float under the floor during dynamic drop playback.
-    if (result?.drop_simulation && !state.stale) {
+    // For drop simulations or when a drop test is active/stale/loading, suppress static
+    // structural overlays so stress/load vectors never float under/over the floor.
+    if (result?.drop_simulation || state.draft?.drop_simulation || state.stale || state.playbackDismissed) {
       spec.stressBadge = null;
       spec.loadVector = null;
       spec.fixtures = null;
@@ -338,9 +345,9 @@ export function App(): React.ReactElement {
     }
     spec.severityMarkers = markers.length > 0 ? markers : null;
     return spec;
-  }, [lastResult, analysisRequest, shownEntries, state.preview?.display_asset, state.renderMode, state.stale]);
+  }, [lastResult, analysisRequest, shownEntries, state.preview?.display_asset, state.renderMode, state.stale, state.draft?.drop_simulation, state.playbackDismissed]);
 
-  const leftInset = state.navOpen ? 294 : 0;
+  const leftInset = showGuideCard ? 0 : (state.navOpen ? 294 : 0);
   const rightDrawerOpen =
     state.classifyModalOpen ||
     (state.inspectorOpen && state.selectedId !== null);
@@ -364,12 +371,14 @@ export function App(): React.ReactElement {
   return (
     <div className="app" data-theme={state.theme}>
       <div className="workspace">
-        <aside
-          className={`drawer drawer--nav${state.navOpen ? ' is-open' : ''}`}
-          aria-label="Model navigator"
-        >
-          <ModelTree />
-        </aside>
+        {!showGuideCard ? (
+          <aside
+            className={`drawer drawer--nav${state.navOpen ? ' is-open' : ''}`}
+            aria-label="Model navigator"
+          >
+            <ModelTree />
+          </aside>
+        ) : null}
         <main
           className="viewport-column"
           onDragOver={(e) => {
@@ -383,7 +392,7 @@ export function App(): React.ReactElement {
         >
           {!showGuideCard && !state.webglError ? (
             <div className="viewport-column__top-bar" style={{ right: `${topBarRightOffset}px` }}>
-              <ViewportToolbar viewport={viewportRef} stats={stats} />
+              <ViewportToolbar viewportRef={viewportRef} stats={stats} />
               <div className="viewport-column__header">
                 <RunControls
                   onReplaceModel={() => setUploadOpen(!uploadOpen)}
@@ -467,6 +476,7 @@ export function App(): React.ReactElement {
             <InspectorPanel />
           </aside>
         )}
+
         {!showGuideCard ? (
           <div className={`results-rail-dock${resultsOpen ? ' is-open' : ''}`}>
             <ResultsRail

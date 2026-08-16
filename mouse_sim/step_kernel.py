@@ -305,8 +305,10 @@ def _settings(source_units):
         "backend": BACKEND_NAME,
         "source_units": source_units,
         # FreeCAD/OCCT store STEP geometry in internal millimetres, so the
-        # scale to metres is always 0.001 regardless of the declared units.
-        "scale_to_m": 0.001,
+        # scale to metres is the declared source unit's SI factor (mm -> 1e-3,
+        # in -> 0.0254, ft -> 0.3048).  A hardcoded 0.001 silently scaled an
+        # inch-declared STEP 25.4x too small (volume x16387, mass x16387).
+        "scale_to_m": _UNIT_SCALE_TO_M.get(str(source_units).strip().lower(), 0.001),
         "worker_script_sha256": _worker_script_hash(),
         "mesh_deflection_mm": _positive_setting(
             "MOUSE_SIM_STEP_MESH_DEFLECTION_MM", DEFAULT_MESH_DEFLECTION_MM

@@ -7,9 +7,14 @@ import {
   pythonTransformToMatrix4,
   createObjectGroup,
   worldBoundsForGeometry,
+  worldVerticesForGeometry,
+  worldVerticesForGeometryFull,
   disposeObjectGroup,
   applyFeaPlateField,
   plateStressShape,
+  buildInstancedBatches,
+  syncInstancedPose,
+  geometryFingerprint,
 } from '../scene/geometryFactory';
 import {
   IDENTITY_TRANSFORM,
@@ -400,5 +405,193 @@ describe('entriesSignature', () => {
     ]);
     expect(moved).toBe(base);
     expect(resized).not.toBe(base);
+  });
+});
+
+describe('collider vertex sampling', () => {
+  it('exports ALL mesh vertices for the physics hull (no stride cap)', () => {
+    // 1000 vertices: the strided display sampler caps at ~250 points, while
+    // the full export must return every vertex for the Rapier convex hull.
+    const vertices = Array.from({ length: 1000 }, (_, i) => [i * 0.001, 0, 0] as [number, number, number]);
+    const meshGeom: MeshGeometryJson = {
+      type: 'mesh',
+      vertices,
+      triangles: [[0, 1, 2]],
+      units: 'm',
+      transform: IDENTITY_TRANSFORM,
+    };
+    const full = worldVerticesForGeometryFull(meshGeom);
+    const strided = worldVerticesForGeometry(meshGeom);
+    expect(full.length).toBe(1000);
+    expect(strided.length).toBeLessThan(1000);
+    expect(strided.length).toBeGreaterThan(0);
+  });
+
+  it('keeps thin-shell features in the full export (no 2mm grid collapse)', () => {
+    // A 0.5 mm wall: two faces 0.5 mm apart must BOTH survive the full
+    // vertex export (the 2 mm voxel grid in rapierDropSim would collapse
+    // them; the export itself must not).
+    const vertices: [number, number, number][] = [
+      [0, 0, 0], [0.01, 0, 0], [0.01, 0.01, 0], [0, 0.01, 0],
+      [0, 0, 0.0005], [0.01, 0, 0.0005], [0.01, 0.01, 0.0005], [0, 0.01, 0.0005],
+    ];
+    const meshGeom: MeshGeometryJson = {
+      type: 'mesh',
+      vertices,
+      triangles: [[0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6]],
+      units: 'm',
+      transform: IDENTITY_TRANSFORM,
+    };
+    const full = worldVerticesForGeometryFull(meshGeom);
+    const zs = new Set(full.map((v: [number, number, number]) => v[2]));
+    expect(zs.has(0)).toBe(true);
+    expect(zs.has(0.0005)).toBe(true);
+  });
+});
+
+describe('InstancedMesh batching (draw-call reduction)', () => {
+  const sharedMaterials = {
+    default: new THREE.MeshStandardMaterial({ color: 0x9aa0a6 }),
+    metal: new THREE.MeshStandardMaterial({ color: 0x50555c }),
+    shell: new THREE.MeshStandardMaterial({ color: 0xd9d5cc }),
+    pcb: new THREE.MeshStandardMaterial({ color: 0x24282e }),
+    battery: new THREE.MeshStandardMaterial({ color: 0xaaaaae }),
+    skate: new THREE.MeshStandardMaterial({ color: 0xb4b8bd }),
+  };
+
+  const screwGeometry: CylinderGeometryJson = {
+    type: 'cylinder',
+    radius: 0.0015,
+    height: 0.006,
+    units: 'm',
+    transform: IDENTITY_TRANSFORM,
+  };
+
+  function screwEntry(id: string, tx: number, ty: number, tz: number) {
+    return {
+      entry: {
+        id,
+        className: 'screw_fastener',
+        geometry: {
+          ...screwGeometry,
+          transform: { ...IDENTITY_TRANSFORM, translation: [tx, ty, tz] as [number, number, number] },
+        } as CylinderGeometryJson,
+      },
+      matrix: pythonTransformToMatrix4({
+        ...IDENTITY_TRANSFORM,
+        translation: [tx, ty, tz] as [number, number, number],
+      }),
+    };
+  }
+
+  it('collapses N identical parts into one InstancedMesh (draw calls 50 → < 10)', () => {
+    const parts = [
+      screwEntry('screw-0', 0, 0, 0),
+      screwEntry('screw-1', 0.03, 0, 0),
+      screwEntry('screw-2', 0, 0.03, 0),
+      screwEntry('screw-3', 0.03, 0.03, 0),
+      screwEntry('screw-4', 0, 0, 0.01),
+      screwEntry('screw-5', 0.03, 0, 0.01),
+      screwEntry('screw-6', 0, 0.03, 0.01),
+      screwEntry('screw-7', 0.03, 0.03, 0.01),
+    ];
+    const batchGroup = buildInstancedBatches(parts, { materials: sharedMaterials });
+    // One batch for 8 identical screws.
+    const batches = batchGroup.group.children.filter((c) => c instanceof THREE.InstancedMesh);
+    expect(batches).toHaveLength(1);
+    const inst = batches[0] as THREE.InstancedMesh;
+    expect(inst.count).toBe(8);
+    // Every object id resolves to a slot in the batch.
+    for (const part of parts) {
+      const slot = batchGroup.byObjectId.get(part.entry.id);
+      expect(slot).toBeDefined();
+      expect(slot!.batch.mesh).toBe(inst);
+      expect(inst.userData.instanceObjectIds[slot!.instanceId]).toBe(part.entry.id);
+    }
+    // Per-instance matrices carry the part's translation (draw position).
+    const probe = new THREE.Matrix4();
+    inst.getMatrixAt(3, probe);
+    const pos = new THREE.Vector3().setFromMatrixPosition(probe);
+    expect(pos.x).toBeCloseTo(0.03, 6);
+    expect(pos.y).toBeCloseTo(0.03, 6);
+    // A 50-part assembly with 6 unique geometries + palette materials → 6 batches.
+    const mixed = buildInstancedBatches(
+      [
+        ...parts,
+        ...Array.from({ length: 42 }, (_, i) =>
+          screwEntry(`screw-${8 + i}`, (i % 7) * 0.03, Math.floor(i / 7) * 0.03, 0),
+        ),
+      ],
+      { materials: sharedMaterials },
+    );
+    const mixedBatches = mixed.group.children.filter((c) => c instanceof THREE.InstancedMesh);
+    expect(mixedBatches.length).toBeLessThan(10);
+    expect(mixed.byObjectId.size).toBe(50);
+  });
+
+  it('keeps distinct geometries and colored parts in separate batches/meshes', () => {
+    const boxGeom: BoxGeometryJson = {
+      type: 'box',
+      size: [0.01, 0.01, 0.01],
+      units: 'm',
+      transform: IDENTITY_TRANSFORM,
+    };
+    const parts = [
+      screwEntry('screw-a', 0, 0, 0),
+      screwEntry('screw-b', 0.03, 0, 0),
+      { entry: { id: 'box-c', className: 'shell', geometry: boxGeom }, matrix: new THREE.Matrix4() },
+      { entry: { id: 'colored-d', className: 'default', color: [1, 0, 0] as [number, number, number], geometry: boxGeom }, matrix: new THREE.Matrix4() },
+    ];
+    const batchGroup = buildInstancedBatches(parts, { materials: sharedMaterials });
+    const batches = batchGroup.group.children.filter((c) => c instanceof THREE.InstancedMesh);
+    // Screws → 1 batch; the palette box joins a second batch (different
+    // geometry+material); the colored part is skipped entirely (it needs a
+    // unique owned material and stays an individual mesh).
+    expect(batches).toHaveLength(2);
+    expect(batchGroup.byObjectId.has('colored-d')).toBe(false);
+    expect(batchGroup.byObjectId.has('box-c')).toBe(true);
+  });
+
+  it('fingerprint is transform-independent and size-sensitive', () => {
+    const a = geometryFingerprint(screwGeometry);
+    const b = geometryFingerprint({ ...screwGeometry, transform: { ...IDENTITY_TRANSFORM, translation: [9, 9, 9] as [number, number, number] } });
+    expect(a).toBe(b);
+    expect(geometryFingerprint({ ...screwGeometry, radius: 0.002 })).not.toBe(a);
+  });
+
+  it('syncInstancedPose hides instances via degenerate scale and applies explode offsets', () => {
+    const parts = [
+      screwEntry('screw-0', 0, 0, 0),
+      screwEntry('screw-1', 0.03, 0, 0),
+      screwEntry('screw-2', 0, 0.03, 0),
+    ];
+    const batchGroup = buildInstancedBatches(parts, { materials: sharedMaterials });
+    const inst = batchGroup.group.children[0] as THREE.InstancedMesh;
+    const explode = new Map<string, THREE.Vector3>([
+      ['screw-0', new THREE.Vector3(0.1, 0, 0)],
+      ['screw-1', new THREE.Vector3(0, 0.2, 0)],
+    ]);
+    syncInstancedPose(batchGroup, explode, { 'screw-2': false });
+    const probe = new THREE.Matrix4();
+    inst.getMatrixAt(0, probe);
+    expect(new THREE.Vector3().setFromMatrixPosition(probe).x).toBeCloseTo(0.1, 6);
+    inst.getMatrixAt(1, probe);
+    expect(new THREE.Vector3().setFromMatrixPosition(probe).y).toBeCloseTo(0.2, 6);
+    inst.getMatrixAt(2, probe);
+    const scale = new THREE.Vector3().setFromMatrixScale(probe);
+    expect(scale.lengthSq()).toBe(0);
+  });
+
+  it('disposing the batch group releases the shared geometry once', () => {
+    const spyGeomDispose = vi.spyOn(THREE.BufferGeometry.prototype, 'dispose');
+    const parts = [
+      screwEntry('screw-0', 0, 0, 0),
+      screwEntry('screw-1', 0.03, 0, 0),
+    ];
+    const batchGroup = buildInstancedBatches(parts, { materials: sharedMaterials });
+    for (const child of [...batchGroup.group.children]) {
+      disposeObjectGroup(child);
+    }
+    expect(spyGeomDispose).toHaveBeenCalled();
   });
 });

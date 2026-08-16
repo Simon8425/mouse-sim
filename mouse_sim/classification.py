@@ -22,36 +22,45 @@ from .geometry import Box, Compound, Cone, Cylinder, Frustum, Geometry, Sphere, 
 NAME_SYNONYMS = {
     "wheel": (
         "wheel", "scroll", "scrollwheel", "scroll_wheel", "scrollring", "scroll_ring",
-        "scroller", "wheel_assembly", "encoder",
+        "scroller", "wheel_assembly", "c_wheel", "cw_xwd", "xwd",
+    ),
+    "encoder": (
+        "encoder", "rotary_encoder", "wheel_encoder",
     ),
     "pcb": (
-        "pcb", "board", "mainboard", "main_board", "circuit_board", "logic_board",
-        "electronics", "pwa",
+        "pcb", "pcba", "board", "mainboard", "main_board", "circuit_board", "logic_board",
+        "electronics", "pwa", "fpc",
     ),
     "battery": (
         "battery", "battery_pack", "batterypack", "lipo", "li_po", "lipoly",
-        "cell", "power_cell", "accumulator",
+        "cell", "power_cell", "accumulator", "300ah", "400ah", "500ah", "602024",
     ),
     "shell_top": (
         "shell_top", "topshell", "top_shell", "top_cover", "topcover",
-        "upper_shell", "shell_upper", "cover_top", "upper_cover",
+        "upper_shell", "shell_upper", "cover_top", "upper_cover", "top_c",
     ),
     "shell_bottom": (
         "shell_bottom", "bottomshell", "bottom_shell", "bottom_cover", "bottomcover",
         "lower_shell", "shell_lower", "base", "base_plate", "baseplate",
-        "chassis", "cover_bottom", "lower_cover",
+        "chassis", "cover_bottom", "lower_cover", "bot1",
     ),
     "skate": (
         "skate", "skates", "skatefoot", "skate_foot", "glide", "glide_pad",
         "glidepad", "mouse_foot", "mousefeet", "foot", "feet", "pad", "pads",
+        "eva", "eva_tp", "tp", "ptfe", "teflon", "foot_pad",
     ),
     "screw": (
         "screw", "screws", "fastener", "fasteners", "bolt", "bolts",
-        "screw_insert", "screwinsert", "insert",
+        "screw_insert", "screwinsert", "insert", "2x4", "2x5", "2x3",
+        "m2x4", "m2x5", "m1_6x3", "pm2_4", "kb2_5", "type_c_l_1",
     ),
     "button": (
         "button", "buttons", "switch", "switches", "click", "clicker",
         "key", "keys", "microswitch", "micro_switch", "mouse_button",
+    ),
+    "sensor": (
+        "sensor", "sensor_package", "sensor_package_sanitized", "lens", "prism",
+        "optical_sensor", "paw", "pmw", "pixart",
     ),
 }
 

@@ -21,8 +21,31 @@ export function pickObjectId(
   const raycaster = new THREE.Raycaster();
   raycaster.setFromCamera(new THREE.Vector2(x, y), camera);
 
-  const intersects = raycaster.intersectObjects(root.children, true);
+  // Three.js's Raycaster does NOT test `object.visible` (only `layers`), so
+  // eye-toggled-off (hidden) parts must be excluded explicitly: clicking
+  // through a hidden part must not select it.
+  const intersects = raycaster.intersectObjects(root.children, true).filter((hit) => {
+    let curr: THREE.Object3D | null = hit.object;
+    while (curr) {
+      if (!curr.visible) return false;
+      curr = curr.parent;
+    }
+    return true;
+  });
   for (const hit of intersects) {
+    // THREE r168's Raycaster intersects InstancedMesh and returns the
+    // per-instance slot on the hit; resolve it through the mapping the batch
+    // builder stores (objectId per instance slot). Instances hidden via a
+    // degenerate scale are skipped by InstancedMesh.raycast automatically.
+    const instanced = hit.object as THREE.InstancedMesh & {
+      isInstancedMesh?: boolean;
+      userData?: { instanceObjectIds?: string[] };
+    };
+    if (instanced.isInstancedMesh && hit.instanceId != null) {
+      const ids = instanced.userData?.instanceObjectIds;
+      const objectId = ids?.[hit.instanceId];
+      if (typeof objectId === 'string') return objectId;
+    }
     let curr: THREE.Object3D | null = hit.object;
     while (curr) {
       if (typeof curr.userData?.objectId === 'string') {

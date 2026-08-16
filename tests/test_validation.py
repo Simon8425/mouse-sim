@@ -2,11 +2,13 @@ import unittest
 
 from mouse_sim import Box, TriangleMesh, run_validation
 from mouse_sim.validation import (
+    LENS_DEFOCUS_BUDGET_M,
     ValidationFinding,
     ValidationReport,
     check_classification,
     check_geometry_health,
     check_material,
+    check_optical_defocus,
     check_pcb_clearance,
     check_wall_thickness,
 )
@@ -253,6 +255,81 @@ class NonFiniteInputTests(unittest.TestCase):
         open_mesh = next(item for item in findings if item.code == "GEOMETRY_OPEN_MESH")
         self.assertEqual(open_mesh.severity, "warning")
         self.assertFalse(open_mesh.evidence_blocking)
+
+
+class OpticalDefocusTests(unittest.TestCase):
+    """The optical sensor lens z-defocus model: a 40x60x1.6 mm FR-4 PCB
+    (clamped-plate bending under shock) carrying a sensor; lens z-shift
+    beyond the 0.15 mm budget emits OPTICAL_TRACKING_LOD_SHIFT."""
+
+    def _pcb(self, thickness=0.0016, length=0.06, width=0.04):
+        return Box((width, length, thickness))
+
+    def _sensor(self, center=True):
+        # 4x4x1 mm sensor package, centered or near an edge of the PCB.
+        if center:
+            return Box((0.004, 0.004, 0.001), transform={"translation": (0.02, 0.03, 0.0008)})
+        return Box((0.004, 0.004, 0.001), transform={"translation": (0.036, 0.05, 0.0008)})
+
+    def test_no_defocus_at_mild_shock(self):
+        findings = check_optical_defocus(
+            self._pcb(), self._sensor(), "sensor-01", 20.0, lens_height_m=1.5e-3
+        )
+        self.assertEqual(findings, ())
+
+    def test_high_shock_triggers_lod_shift_warning(self):
+        findings = check_optical_defocus(
+            self._pcb(), self._sensor(), "sensor-01", 300.0, lens_height_m=1.2e-3
+        )
+        self.assertEqual(len(findings), 1)
+        finding = findings[0]
+        self.assertEqual(finding.code, "OPTICAL_TRACKING_LOD_SHIFT")
+        self.assertEqual(finding.severity, "warning")
+        self.assertFalse(finding.evidence_blocking)
+        self.assertIn("0.15", finding.message)
+        self.assertEqual(finding.affected_ids, ("sensor-01",))
+
+    def test_threshold_boundary(self):
+        # Just under the budget: no finding; just over: warning.
+        under = check_optical_defocus(
+            self._pcb(), self._sensor(), "sensor-01", 50.0,
+            lens_height_m=1.2e-3, lens_defocus_budget_m=1e6,
+        )
+        self.assertEqual(under, ())
+        over = check_optical_defocus(
+            self._pcb(), self._sensor(), "sensor-01", 50.0,
+            lens_height_m=1.2e-3, lens_defocus_budget_m=1e-9,
+        )
+        self.assertEqual(over[0].code, "OPTICAL_TRACKING_LOD_SHIFT")
+
+    def test_missing_shock_data_warns_unknown(self):
+        findings = check_optical_defocus(self._pcb(), self._sensor(), "sensor-01", 0.0)
+        self.assertEqual(findings[0].code, "OPTICAL_TRACKING_LOD_UNKNOWN")
+        self.assertEqual(findings[0].severity, "warning")
+
+    def test_missing_geometry_warns_unknown(self):
+        findings = check_optical_defocus(None, self._sensor(), "sensor-01", 100.0)
+        self.assertEqual(findings[0].code, "OPTICAL_TRACKING_LOD_UNKNOWN")
+
+    def test_lens_height_band_constants(self):
+        # The gaming-mouse lens stack is a design band 1.2-1.5 mm; the
+        # defocus budget is 0.15 mm.
+        self.assertAlmostEqual(LENS_DEFOCUS_BUDGET_M, 0.15e-3)
+
+    def test_run_validation_wires_optical_check(self):
+        report = run_validation(
+            {"pcb": self._pcb(), "sensor": self._sensor()},
+            {},
+            {},
+            {
+                "pcb_object_id": "pcb",
+                "sensor_object_id": "sensor",
+                "drop_peak_accel_g": 300.0,
+            },
+        )
+        codes = {item.code for item in report.findings}
+        self.assertIn("OPTICAL_TRACKING_LOD_SHIFT", codes)
+        self.assertEqual(report.status, "warn")  # warning-only -> warn, not fail
 
 
 if __name__ == "__main__":

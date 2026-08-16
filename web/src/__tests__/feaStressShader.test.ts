@@ -4,10 +4,15 @@ import {
   feaGradientColor,
   damageForDistance,
   dentFactorFor,
+  dentDepthFactorFor,
   createFeaUniforms,
   updateFeaUniforms,
   decorateForFea,
   feaFieldMaxDamage,
+  impactPulseFor,
+  yieldNormFor,
+  yieldMaskFor,
+  crackIntensityFor,
 } from '../scene/feaStressShader';
 import { applyFeaObjectField } from '../scene/geometryFactory';
 import type { FeaObjectField, FeaResult } from '../api/contracts';
@@ -113,9 +118,10 @@ describe('dentFactorFor (plastic dent boost)', () => {
     expect(dentFactorFor(0.7)).toBe(1);
   });
 
-  it('caps the plastic boost at 1.5', () => {
-    expect(dentFactorFor(0.9)).toBe(1.5);
-    expect(dentFactorFor(1)).toBe(1.5);
+  it('caps the plastic boost at 3.0 (backend PLASTIC_AMPLIFICATION_MAX)', () => {
+    expect(dentFactorFor(0.85)).toBeCloseTo(2.0, 6);
+    expect(dentFactorFor(0.9)).toBeCloseTo(2.333333, 6);
+    expect(dentFactorFor(1)).toBe(3.0);
   });
 
   it('is monotone non-decreasing', () => {
@@ -125,6 +131,89 @@ describe('dentFactorFor (plastic dent boost)', () => {
       expect(cur).toBeGreaterThanOrEqual(prev);
       prev = cur;
     }
+  });
+});
+
+describe('dentDepthFactorFor (backend depth cap parity)', () => {
+  it('applies the 1.5 cap to the COMBINED gauss*amp product', () => {
+    // amp = 3.0 at damage 1.0; gauss = 0.8 -> depth factor min(1.5, 2.4) = 1.5.
+    expect(dentDepthFactorFor(0.8, 1.0)).toBe(1.5);
+    // gauss = 0.5, amp = 2.0 -> min(1.5, 1.0) = 1.0 (under the cap).
+    expect(dentDepthFactorFor(0.5, 0.85)).toBeCloseTo(1.0, 6);
+  });
+
+  it('matches the backend depth = delta * min(1.5, gauss*amp) exactly', () => {
+    // Backend: depth = delta_max * gaussian * amp, capped at 1.5*delta_max.
+    const gauss = Math.exp(-1); // d = lambda
+    const amp = 1 + 2 * ((0.8 - 0.7) / 0.3);
+    expect(dentDepthFactorFor(gauss, 0.8)).toBeCloseTo(Math.min(1.5, gauss * amp), 10);
+  });
+
+  it('is zero below the dent threshold and guards degenerate gaussians', () => {
+    expect(dentDepthFactorFor(0.9, 0.5)).toBe(0);
+    expect(dentDepthFactorFor(0, 1)).toBe(0);
+    expect(dentDepthFactorFor(Number.NaN, 1)).toBe(0);
+    expect(dentDepthFactorFor(-1, 1)).toBe(0);
+  });
+});
+
+describe('impactPulseFor (dynamic heatmap surge)', () => {
+  it('is 0 before the impact and 1 at the moment of impact', () => {
+    expect(impactPulseFor(0.2, 0.3, 0.3)).toBe(0);
+    expect(impactPulseFor(0.3, 0.3, 0.3)).toBeCloseTo(1, 6);
+  });
+
+  it('decays exponentially after the impact', () => {
+    const pulse = impactPulseFor(0.45, 0.3, 0.3);
+    expect(pulse).toBeGreaterThan(0);
+    expect(pulse).toBeLessThan(1);
+    expect(impactPulseFor(0.6, 0.3, 0.3)).toBeLessThan(pulse);
+    expect(impactPulseFor(5, 0.3, 0.3)).toBeLessThan(1e-6);
+  });
+
+  it('guards missing/non-finite inputs', () => {
+    expect(impactPulseFor(Number.NaN, 0.3, 0.3)).toBe(0);
+    expect(impactPulseFor(0.5, Number.NaN, 0.3)).toBe(0);
+  });
+});
+
+describe('yieldNormFor / yieldMaskFor (yield threshold masking)', () => {
+  it('maps the dent threshold onto the auto-normalized ramp', () => {
+    // Field max 1.0: the yield level sits exactly at the dent threshold.
+    expect(yieldNormFor(1, 0.7)).toBeCloseTo(0.7, 6);
+    // A field peaking below the dent threshold clamps the mask off.
+    expect(yieldNormFor(0.5, 0.7)).toBe(1);
+    // Degenerate inputs fall back to "mask off".
+    expect(yieldNormFor(0, 0.7)).toBe(0);
+    expect(yieldNormFor(Number.NaN, 0.7)).toBe(0);
+    expect(yieldNormFor(1, 0)).toBe(1);
+  });
+
+  it('masks damage above the yield level and leaves safe zones dark', () => {
+    const yn = yieldNormFor(1, 0.7);
+    expect(yieldMaskFor(0.5, yn)).toBe(0);
+    expect(yieldMaskFor(0.7, yn)).toBe(0);
+    expect(yieldMaskFor(0.85, yn)).toBeGreaterThan(0);
+    expect(yieldMaskFor(0.85, yn)).toBeLessThan(1);
+    expect(yieldMaskFor(1, yn)).toBeCloseTo(1, 6);
+    // yn >= 1 disables the mask entirely.
+    expect(yieldMaskFor(1, 1)).toBe(0);
+  });
+});
+
+describe('crackIntensityFor (plastic-damage striations)', () => {
+  it('ramps from 0 at the dent threshold to 1 at/above the tear threshold', () => {
+    expect(crackIntensityFor(0.5, 0.7, 0.92)).toBe(0);
+    expect(crackIntensityFor(0.7, 0.7, 0.92)).toBe(0);
+    expect(crackIntensityFor(0.81, 0.7, 0.92)).toBeCloseTo(0.5, 6);
+    expect(crackIntensityFor(0.92, 0.7, 0.92)).toBe(1);
+    expect(crackIntensityFor(1, 0.7, 0.92)).toBe(1);
+  });
+
+  it('guards degenerate thresholds', () => {
+    expect(crackIntensityFor(0.95, 0.95, 0.95)).toBe(1);
+    expect(crackIntensityFor(0.5, 0.7, 0.7)).toBe(0);
+    expect(crackIntensityFor(Number.NaN, 0.7, 0.92)).toBe(0);
   });
 });
 
@@ -340,6 +429,54 @@ describe('createFeaUniforms / updateFeaUniforms (no per-frame allocation)', () =
     expect(uniforms.uFeaMode.value).toBe(-1);
   });
 
+  it('carries the dynamic impact pulse / drop time / yield norm uniforms', () => {
+    const fea: FeaResult = {
+      computed: true,
+      peak: null,
+      yield_stress_pa: 4e7,
+      safety_factor: 2,
+      impact_window_s: 0.3,
+      dent_threshold: 0.7,
+      tear_threshold: 0.92,
+      objects: [
+        {
+          object_id: 'shell',
+          vertex_count: 1,
+          damage: [0.8],
+          displacement: [],
+          stress_pa: [],
+        },
+      ],
+      procedural: [],
+      assumptions: [],
+      flags: [],
+    };
+    const uniforms = createFeaUniforms(fea);
+    // Field max 0.8 > dent threshold 0.7: the yield level sits at 0.875 on
+    // the auto-normalized ramp.
+    expect(uniforms.uYieldNorm.value).toBeCloseTo(0.875, 6);
+    expect(uniforms.uImpactPulse.value).toBe(0);
+    expect(uniforms.uDropTime.value).toBe(0);
+    expect(uniforms.uImpactTime.value).toBe(0);
+
+    updateFeaUniforms(uniforms, {
+      mode: 'yield',
+      impactWindow01: 1,
+      impactWindowActive: true,
+      time: 1,
+      impactPulse: 0.42,
+      dropTime: 0.6,
+      impactTime: 0.3,
+    });
+    expect(uniforms.uImpactPulse.value).toBeCloseTo(0.42, 6);
+    expect(uniforms.uDropTime.value).toBeCloseTo(0.6, 6);
+    expect(uniforms.uImpactTime.value).toBeCloseTo(0.3, 6);
+
+    // A field whose peak never reaches the dent threshold disables the mask.
+    const safe = createFeaUniforms({ ...fea, objects: [{ ...fea.objects[0], damage: [0.3] }] });
+    expect(safe.uYieldNorm.value).toBe(1);
+  });
+
   it('decorates a material with injectable shader hooks (compile-safe guards)', () => {
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
@@ -408,18 +545,37 @@ describe('createFeaUniforms / updateFeaUniforms (no per-frame allocation)', () =
     expect(shader.fragmentShader).toContain('f = ( t - 0.0 ) / 0.28;');
     expect(shader.fragmentShader).not.toContain('( t - 0 ) /');
     expect(shader.fragmentShader).toContain('if ( feaDamageVis > 0.0005 ) {');
-    // The vertex shader complements the attribute dent procedurally.
+    // The vertex shader complements the attribute dent procedurally, with
+    // the backend-parity depth factor: amp capped at 3.0, the 1.5 cap on
+    // the COMBINED gauss*amp product.  GLSL ES 1.00 float literals only.
     expect(shader.vertexShader).toContain('feaGaussProc');
+    expect(shader.vertexShader).toContain('min( 3.0, 1.0 + 2.0 * max( 0.0, ( uPeakDamage * feaGaussProc - 0.7 ) / 0.3 ) )');
+    expect(shader.vertexShader).toContain('min( 1.5, feaGaussProc * feaPlasticProc )');
+    expect(shader.vertexShader).toContain('min( 1.5, feaGauss * feaPlastic )');
+    expect(shader.vertexShader).not.toContain('min( 3,');
+    // Dynamic impact pulse + radial ripple: the heatmap animates across
+    // playback frames instead of being a static contour.
+    expect(shader.fragmentShader).toContain('uniform float uImpactPulse;');
+    expect(shader.fragmentShader).toContain('uniform float uDropTime;');
+    expect(shader.fragmentShader).toContain('uniform float uImpactTime;');
+    expect(shader.fragmentShader).toContain('uniform float uYieldNorm;');
+    expect(shader.fragmentShader).toContain('feaPulse = clamp( exp( -feaSince * 6.0 ), 0.0, 1.0 );');
+    expect(shader.fragmentShader).toContain('float feaRipple = 0.0;');
+    expect(shader.fragmentShader).toContain('feaDamageVis = clamp( feaDamageVis + feaRipple * 0.25, 0.0, 1.0 );');
     // YIELD SHADER is visually distinct: steel-gray base, hot-tinted
     // plastic zone, tear cutout — NOT the same gradient as the heatmap.
     // The whitening and the tear cutout use TRUE damage, never the
     // auto-normalized contour, so a tiny field cannot white-out or tear
-    // the whole model.
+    // the whole model. The yield mask ramps from uYieldNorm to the peak.
     expect(shader.fragmentShader).toContain('diffuseColor.rgb = vec3( 0.60, 0.62, 0.66 );');
-    expect(shader.fragmentShader).toContain('vec3( 1.0, 0.2, 0.05 )');
+    expect(shader.fragmentShader).toContain('float feaYieldMask = smoothstep( uYieldNorm, 1.0, feaDamageVis );');
+    expect(shader.fragmentShader).toContain('vec3( 1.0, 0.36, 0.05 )');
     expect(shader.fragmentShader).toContain('if ( feaDamage > 0.92 ) {');
     expect(shader.fragmentShader).toContain('discard;');
     expect(shader.fragmentShader).toContain('float feaW = clamp( ( feaDamage - 0.7 )');
+    // Micro-crack striations inside the plastic zone, flickered by the pulse.
+    expect(shader.fragmentShader).toContain('float feaStripe = smoothstep( 0.45, 0.75, fract( vFeaPosition.y * 140.0 + feaNoise * 2.0 ) );');
+    expect(shader.fragmentShader).toContain('float feaFlicker = 0.35 + 0.65 * feaPulse;');
     // The heatmap gradient is exclusive to the fea branch.
     expect(shader.fragmentShader).toContain('} else if ( uFeaMode > -0.5 ) {');
   });

@@ -39,7 +39,28 @@ interface Metric {
 interface IssueRow {
   severity: string;
   message: string;
+  code?: string;
 }
+
+/** Recommendation text attached to a finding (e.g. OPTICAL_TRACKING_LOD_SHIFT). */
+const RECOMMENDATIONS: Record<string, string> = {
+  OPTICAL_TRACKING_LOD_SHIFT:
+    'Add EVA foam dampening under the PCB near the sensor, shorten the PCB standoff span, or thicken the board to keep lens z-shift under 0.15 mm.',
+  SCREW_BOSS_WALL_THIN:
+    'Add 45° gussets at the boss root or increase the boss outer diameter to reach the 0.5 mm minimum wall thickness.',
+  SCREW_ENGAGEMENT_SHORT:
+    'Increase the engaged thread length to at least 2.5x the screw diameter.',
+  BATTERY_LATCH_DISLODGED:
+    'Add EVA foam dampening around the cell cradle or increase the latch hook height/retention force.',
+  BATTERY_CRUSH_RISK:
+    'Add EVA foam dampening between the cell and the chassis to cut the transmitted shock load.',
+  BATTERY_SHOCK_EXCEEDED:
+    'Add EVA foam dampening around the cell cradle to attenuate the peak acceleration.',
+  SCREW_PULLOUT_RISK:
+    'Increase the boss engagement length or switch to a larger-diameter screw to raise the thread-stripping capacity.',
+  SCREW_BOSS_HOOP_FAIL:
+    'Add 45° gussets at the boss root or increase the boss wall thickness to resist radial cracking.',
+};
 
 const SURFACE_LABELS: Record<string, string> = {
   concrete: 'Concrete',
@@ -110,7 +131,7 @@ function computeVerdict(result: PipelineResult): Verdict {
 /** Collect warnings and worse from validation findings, issues, and errors. */
 function buildIssueRows(result: PipelineResult): IssueRow[] {
   const rows: IssueRow[] = [];
-  const push = (severity: string, message: string) => {
+  const push = (severity: string, message: string, code?: string) => {
     const normalized = severity.toLowerCase();
     if (
       normalized === 'blocker' ||
@@ -118,7 +139,14 @@ function buildIssueRows(result: PipelineResult): IssueRow[] {
       normalized === 'warning' ||
       normalized === 'warn'
     ) {
-      rows.push({ severity: normalized, message });
+      rows.push({ severity: normalized, message, code });
+    } else {
+      // Unknown severity: never silently drop a finding — disclose it.
+      rows.push({
+        severity: 'warning',
+        message: code ? `${code}: ${message}` : message,
+        code,
+      });
     }
   };
 
@@ -127,13 +155,13 @@ function buildIssueRows(result: PipelineResult): IssueRow[] {
   let selfIntersectionCount = 0;
   let draftMaterialCount = 0;
 
-  const rawIssues: { severity: string; message: string }[] = [];
+  const rawIssues: { severity: string; message: string; code?: string }[] = [];
 
   for (const finding of (result.validation?.findings ?? []) as ValidationFinding[]) {
-    rawIssues.push({ severity: finding.severity, message: finding.message });
+    rawIssues.push({ severity: finding.severity, message: finding.message, code: finding.code });
   }
   for (const issue of (result.issues ?? []) as Issue[]) {
-    rawIssues.push({ severity: issue.severity, message: issue.message });
+    rawIssues.push({ severity: issue.severity, message: issue.message, code: issue.code });
   }
 
   for (const item of rawIssues) {
@@ -147,7 +175,7 @@ function buildIssueRows(result: PipelineResult): IssueRow[] {
     } else if (msg.includes("approval_state is 'draft'") || msg.includes('properties are not approved')) {
       draftMaterialCount++;
     } else {
-      push(item.severity, msg);
+      push(item.severity, msg, item.code);
     }
   }
 
@@ -165,24 +193,26 @@ function buildIssueRows(result: PipelineResult): IssueRow[] {
   }
 
   for (const error of (result.errors ?? []) as ErrorEntry[]) {
-    push('error', `${error.code}: ${error.message}`);
+    push('error', error.message, error.code);
   }
 
-  // Deduplicate any remaining exact duplicates
-  const seen = new Map<string, number>();
-  const deduplicated: IssueRow[] = [];
+  // Deduplicate exact duplicates, keeping the code with the row.
+  const seen = new Map<string, IssueRow>();
+  const counts = new Map<string, number>();
   for (const row of rows) {
-    const key = `${row.severity}:${row.message}`;
-    seen.set(key, (seen.get(key) ?? 0) + 1);
+    const key = `${row.severity}:${row.message}:${row.code ?? ''}`;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+    seen.set(key, row);
   }
 
-  for (const [key, count] of seen.entries()) {
-    const colonIdx = key.indexOf(':');
-    const severity = key.slice(0, colonIdx);
-    const message = key.slice(colonIdx + 1);
+  const deduplicated: IssueRow[] = [];
+  for (const [key, count] of counts.entries()) {
+    const row = seen.get(key);
+    if (row === undefined) continue;
     deduplicated.push({
-      severity,
-      message: count > 1 ? `${message} (${count}x)` : message,
+      severity: row.severity,
+      message: count > 1 ? `${row.message} (${count}x)` : row.message,
+      code: row.code,
     });
   }
 
@@ -265,7 +295,7 @@ function buildMetrics(result: PipelineResult, liveDropData?: LiveDropData | null
         raw: null,
       },
       {
-        label: 'Yield reliability',
+        label: 'Expected pass rate',
         value: `${((1 - failureRate) * 100).toFixed(1)}%`,
         raw: 1 - failureRate,
       },
@@ -580,14 +610,25 @@ function ResultPanel({
         <section className="results-rail__issues" aria-label="Issues">
           <h4>Issues</h4>
           <ul>
-            {issues.map((issue, index) => (
-              <li key={`${issue.severity}-${index}`}>
-                <StatusBadge tone={severityTone(issue.severity)}>
-                  {severityLabel(issue.severity)}
-                </StatusBadge>
-                <span>{issue.message}</span>
-              </li>
-            ))}
+            {issues.map((issue, index) => {
+              const recommendation = issue.code ? RECOMMENDATIONS[issue.code] : undefined;
+              return (
+                <li key={`${issue.severity}-${issue.code ?? ''}-${index}`}>
+                  <div className="results-rail__issue-line">
+                    <StatusBadge tone={severityTone(issue.severity)}>
+                      {severityLabel(issue.severity)}
+                    </StatusBadge>
+                    {issue.code ? (
+                      <code className="results-rail__issue-code">{issue.code}</code>
+                    ) : null}
+                    <span>{issue.message}</span>
+                  </div>
+                  {recommendation ? (
+                    <p className="results-rail__recommendation">{recommendation}</p>
+                  ) : null}
+                </li>
+              );
+            })}
           </ul>
         </section>
       ) : null}

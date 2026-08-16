@@ -87,14 +87,9 @@ export function AiClassifyModal(): React.ReactElement | null {
       tabIndex={-1}
     >
       <header className="ai-classify-header">
-        <div className="ai-classify-header__title-group">
-          <div className="ai-classify-header__title-row">
-            <h2 className="ai-classify-title">AI Component Classification</h2>
-            <span className="ai-classify-badge">{recognizedEntries.length} recognized</span>
-          </div>
-          <p className="ai-classify-subtitle">
-            Review predicted functional roles for assembly components
-          </p>
+        <div className="ai-classify-header__title-row">
+          <h2 className="ai-classify-title">AI Component Classification</h2>
+          <span className="ai-classify-badge">{recognizedEntries.length} recognized</span>
         </div>
         <button
           type="button"
@@ -168,30 +163,6 @@ export function AiClassifyModal(): React.ReactElement | null {
                       </option>
                     ))}
                   </select>
-                  <button
-                    type="button"
-                    className="ai-classify-row__accept-btn"
-                    title="Accept classification"
-                    aria-label="Accept"
-                    onClick={() =>
-                      dispatch({
-                        type: 'CLASSIFY_APPLY_ONE',
-                        objectId,
-                        role: currentRole,
-                      })
-                    }
-                  >
-                    ✓
-                  </button>
-                  <button
-                    type="button"
-                    className="ai-classify-row__dismiss-btn"
-                    title="Dismiss classification"
-                    aria-label="Dismiss"
-                    onClick={() => dispatch({ type: 'CLASSIFY_CLEAR', objectId })}
-                  >
-                    ✕
-                  </button>
                 </div>
               </div>
             );
@@ -210,14 +181,14 @@ export function AiClassifyModal(): React.ReactElement | null {
         <div className="ai-classify-footer__right">
           <button
             type="button"
-            className="btn btn--small"
+            className="ai-classify-footer__btn-close"
             onClick={handleClose}
           >
             Close
           </button>
           <button
             type="button"
-            className="btn btn--small btn--primary ai-classify-btn-accept-all"
+            className="ai-classify-footer__btn-accept"
             onClick={handleAcceptAll}
           >
             Accept recognized ({recognizedEntries.length})

@@ -18,6 +18,183 @@ export interface ObjectSceneEntry {
   color?: [number, number, number] | null;
 }
 
+/**
+ * One instanced batch: a single draw call rendering N geometrically
+ * identical parts (same geometry fingerprint + same material object) at
+ * per-instance transforms. `instanceObjectIds[i]` maps instance slot i to
+ * the owning entry id so picking/selection/visibility stay object-accurate.
+ */
+export interface InstancedBatch {
+  mesh: THREE.InstancedMesh;
+  objectIds: string[];
+  baseMatrix: THREE.Matrix4;
+}
+
+export interface InstancedBatchGroup {
+  group: THREE.Group;
+  /** objectId → instances (a part can appear once per batch at most). */
+  byObjectId: Map<string, { batch: InstancedBatch; instanceId: number }>;
+}
+
+/** Non-finite or NaN geometry must never join a batch. */
+function geometryIsBatchable(geometry: GeometryJson): boolean {
+  if (geometry.type === 'compound') return false;
+  if (geometry.type !== 'mesh') return true;
+  return (
+    Array.isArray(geometry.vertices) &&
+    geometry.vertices.length > 0 &&
+    Array.isArray(geometry.triangles) &&
+    geometry.triangles.length > 0
+  );
+}
+
+/**
+ * Compact geometry fingerprint for dedup: primitives key on their defining
+ * parameters; meshes key on vertices+triangles (the transform is excluded —
+ * it becomes the per-instance matrix). The fingerprint intentionally does
+ * not include the id, so identical parts across the assembly collapse.
+ */
+export function geometryFingerprint(geometry: GeometryJson): string {
+  switch (geometry.type) {
+    case 'box':
+      return `box:${(geometry.size as Vec3).join(',')}`;
+    case 'sphere':
+      return `sphere:${geometry.radius}`;
+    case 'cylinder':
+      return `cylinder:${geometry.radius},${geometry.height}`;
+    case 'cone':
+      return `cone:${geometry.base_radius},${geometry.height}`;
+    case 'frustum':
+      return `frustum:${geometry.top_radius},${geometry.bottom_radius},${geometry.height}`;
+    case 'mesh':
+      return `mesh:v${geometry.vertices.length}:t${geometry.triangles.length}`;
+    default:
+      return `${geometry.type}`;
+  }
+}
+
+/**
+ * Build InstancedMesh batches from eligible entries. Each batch reuses ONE
+ * geometry (built from the first member) and ONE shared material; instance
+ * matrices bake the part's local transform (the same matrix the non-batched
+ * path applies to the outer group) so the instance renders in the exact
+ * place the mesh would have.
+ *
+ * Eligibility: no display asset (GLB path owns its own meshes), no per-part
+ * CAD color (colored parts need unique materials), not a compound, and the
+ * geometry must be renderable. Batches are only built when the caller opts
+ * in — FEA mode is excluded because per-vertex attributes are per-geometry,
+ * not per-instance.
+ */
+export function buildInstancedBatches(
+  parts: { entry: ObjectSceneEntry; matrix: THREE.Matrix4 }[],
+  opts?: FactoryOptions,
+): InstancedBatchGroup {
+  const group = new THREE.Group();
+  group.name = 'instanced-batches';
+  const byObjectId = new Map<string, { batch: InstancedBatch; instanceId: number }>();
+  const scratch = new THREE.Matrix4();
+
+  // Pass 1: group eligible parts by (geometry fingerprint, palette key) and
+  // count members. The InstancedMesh matrix buffer is sized at construction
+  // and `count` is a plain property — growing it later silently drops the
+  // writes, so the final count must be known BEFORE the mesh is created.
+  const members = new Map<string, { entry: ObjectSceneEntry; matrix: THREE.Matrix4 }[]>();
+  for (const part of parts) {
+    const { entry, matrix } = part;
+    if (entry.displayAssetUrl) continue;
+    if (entry.color) continue;
+    if (!isSafeGeometry(entry.geometry) || !geometryIsBatchable(entry.geometry)) continue;
+    const key = paletteKeyForComponent(entry.className ?? null);
+    const material = opts?.materials?.[key] as THREE.MeshStandardMaterial | undefined;
+    if (!material) continue;
+    const batchKey = `${geometryFingerprint(entry.geometry)}|${key}`;
+    let list = members.get(batchKey);
+    if (!list) {
+      list = [];
+      members.set(batchKey, list);
+    }
+    list.push({ entry, matrix });
+  }
+
+  // Pass 2: build one InstancedMesh per group with the exact capacity.
+  for (const list of members.values()) {
+    const first = list[0];
+    const mesh = buildMeshCore(first.entry.geometry, first.entry.className ?? null, null, opts, 16, 8, 16);
+    if (!mesh) continue;
+    const geometry = mesh.geometry;
+    const instanced = new THREE.InstancedMesh(geometry, mesh.material as THREE.Material, list.length);
+    instanced.name = `instanced:${first.entry.id}`;
+    // The batch spans many positions; the geometry bounding sphere is
+    // meaningless across instances, so disable frustum culling (the
+    // outer shell of the assembly is always on screen).
+    instanced.frustumCulled = false;
+    instanced.userData.owned = true;
+    const objectIds: string[] = [];
+    instanced.userData.instanceObjectIds = objectIds;
+    const batch: InstancedBatch = {
+      mesh: instanced,
+      objectIds,
+      baseMatrix: new THREE.Matrix4(),
+    };
+    for (let i = 0; i < list.length; i += 1) {
+      scratch.copy(list[i].matrix);
+      instanced.setMatrixAt(i, scratch);
+      objectIds.push(list[i].entry.id);
+      byObjectId.set(list[i].entry.id, { batch, instanceId: i });
+    }
+    instanced.instanceMatrix.needsUpdate = true;
+    instanced.computeBoundingSphere();
+    group.add(instanced);
+  }
+
+  return { group, byObjectId };
+}
+
+/**
+ * Rewrite the per-instance matrices after explode/visibility changes. Each
+ * instance matrix = base (baked local transform) × explode translation, with
+ * hidden instances collapsed to a degenerate scale so they cost nothing to
+ * render and are skipped by raycasts (THREE skips instances with a zero
+ * scale in InstancedMesh.raycast).
+ */
+export function syncInstancedPose(
+  batchGroup: InstancedBatchGroup | null,
+  explodeByObjectId: Map<string, THREE.Vector3>,
+  visibility: Record<string, boolean>,
+): void {
+  if (!batchGroup) return;
+  const scratch = new THREE.Matrix4();
+  const scale = new THREE.Vector3();
+  const pos = new THREE.Vector3();
+  const quat = new THREE.Quaternion();
+  for (const batch of batchGroup.group.children) {
+    const inst = batch as THREE.InstancedMesh;
+    const ids = inst.userData.instanceObjectIds as string[] | undefined;
+    if (!ids) continue;
+    for (let i = 0; i < inst.count; i += 1) {
+      const id = ids[i];
+      const visible = id === undefined || visibility[id] !== false;
+      inst.getMatrixAt(i, scratch);
+      if (!visible) {
+        scratch.makeScale(0, 0, 0);
+      } else {
+        scratch.decompose(pos, quat, scale);
+        const explode = explodeByObjectId.get(id);
+        if (explode) {
+          pos.x = explode.x;
+          pos.y = explode.y;
+          pos.z = explode.z;
+        }
+        scratch.compose(pos, quat, scale);
+      }
+      inst.setMatrixAt(i, scratch);
+    }
+    inst.instanceMatrix.needsUpdate = true;
+  }
+}
+
+
 export interface FactoryOptions {
   quality?: QualityTier;
   materials?: Partial<Record<PaletteKey, THREE.Material>>;
@@ -166,6 +343,183 @@ export function pythonTransformToMatrix4(transform?: RigidTransformJson | null):
 }
 
 /**
+ * Shared mesh-building core: resolves the material (palette-shared or
+ * CAD-colored), creates the geometry for every primitive/mesh case, attaches
+ * the zero-filled FEA attributes, computes normals, and returns the mesh.
+ * Extracted from createObjectGroup so the instancing path reuses the exact
+ * same geometry/material construction.
+ */
+function buildMeshCore(
+  geometry: GeometryJson,
+  className: string | null,
+  color: [number, number, number] | null,
+  opts: FactoryOptions | undefined,
+  sphereSegments: number,
+  sphereRings: number,
+  radialSegments: number,
+): THREE.Mesh | null {
+  if (!isSafeGeometry(geometry) || geometry.type === 'compound') return null;
+  if (geometry.type === 'mesh' && (geometry.vertices.length === 0 || geometry.triangles.length === 0)) {
+    return null;
+  }
+
+  function resolveMaterial(key: PaletteKey): THREE.Material {
+    const shared = opts?.materials?.[key];
+    if (shared) return shared;
+    const mat = new THREE.MeshStandardMaterial({ color: 0x9aa0a6 });
+    mat.userData.owned = true;
+    return mat;
+  }
+
+  function attachFeaAttributes(geometry: THREE.BufferGeometry): void {
+    const vertexCount = geometry.attributes.position.count;
+    geometry.setAttribute('aDamage', new THREE.BufferAttribute(new Float32Array(vertexCount), 1));
+    geometry.setAttribute(
+      'aDisplacement',
+      new THREE.BufferAttribute(new Float32Array(vertexCount * 3), 3),
+    );
+  }
+
+  const key = paletteKeyForComponent(className);
+  const material = color
+    ? (() => {
+        // Kernel-tessellated STEP parts carry their CAD presentation color;
+        // own the material so disposal never touches the shared palette.
+        // CAD colors are sRGB; the renderer outputs sRGB with ACES tone
+        // mapping, so convert once to linear.
+        const colored = new THREE.MeshStandardMaterial({
+          color: new THREE.Color().setRGB(color[0], color[1], color[2], THREE.SRGBColorSpace),
+          roughness: 0.6,
+          metalness: 0.1,
+        });
+        colored.userData.owned = true;
+        return colored;
+      })()
+    : resolveMaterial(key);
+  let mesh: THREE.Mesh | null = null;
+  let createdGeometry: THREE.BufferGeometry | null = null;
+  let wireframeMaterial: THREE.LineBasicMaterial | null = null;
+
+  try {
+    switch (geometry.type) {
+      case 'box': {
+        const size = geometry.size as Vec3;
+        createdGeometry = new THREE.BoxGeometry(size[0], size[1], size[2]);
+        attachFeaAttributes(createdGeometry);
+        mesh = new THREE.Mesh(createdGeometry, material);
+        break;
+      }
+      case 'sphere': {
+        createdGeometry = new THREE.SphereGeometry(geometry.radius, sphereSegments, sphereRings);
+        attachFeaAttributes(createdGeometry);
+        mesh = new THREE.Mesh(createdGeometry, material);
+        break;
+      }
+      case 'cylinder': {
+        const geometryCyl = new THREE.CylinderGeometry(
+          geometry.radius,
+          geometry.radius,
+          geometry.height,
+          radialSegments,
+        );
+        geometryCyl.rotateX(Math.PI / 2);
+        geometryCyl.translate(0, 0, geometry.height / 2);
+        createdGeometry = geometryCyl;
+        attachFeaAttributes(createdGeometry);
+        mesh = new THREE.Mesh(createdGeometry, material);
+        break;
+      }
+      case 'cone': {
+        const geometryCone = new THREE.ConeGeometry(
+          geometry.base_radius,
+          geometry.height,
+          radialSegments,
+        );
+        geometryCone.rotateX(Math.PI / 2);
+        geometryCone.translate(0, 0, geometry.height / 2);
+        createdGeometry = geometryCone;
+        attachFeaAttributes(createdGeometry);
+        mesh = new THREE.Mesh(createdGeometry, material);
+        break;
+      }
+      case 'frustum': {
+        const geometryFrustum = new THREE.CylinderGeometry(
+          geometry.top_radius,
+          geometry.bottom_radius,
+          geometry.height,
+          radialSegments,
+        );
+        geometryFrustum.rotateX(Math.PI / 2);
+        geometryFrustum.translate(0, 0, geometry.height / 2);
+        createdGeometry = geometryFrustum;
+        attachFeaAttributes(createdGeometry);
+        mesh = new THREE.Mesh(createdGeometry, material);
+        break;
+      }
+      case 'mesh': {
+        const vertices = geometry.vertices as Vec3[];
+        const positions = new Float32Array(vertices.length * 3);
+        for (let i = 0; i < vertices.length; i += 1) {
+          positions[i * 3] = vertices[i][0];
+          positions[i * 3 + 1] = vertices[i][1];
+          positions[i * 3 + 2] = vertices[i][2];
+        }
+        const bufferGeometry = new THREE.BufferGeometry();
+        createdGeometry = bufferGeometry;
+        bufferGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        const triangleCount = geometry.triangles.length;
+        const vertexCount = vertices.length;
+        const indices =
+          vertexCount <= 65535
+            ? new Uint16Array(triangleCount * 3)
+            : new Uint32Array(triangleCount * 3);
+        for (let i = 0; i < triangleCount; i += 1) {
+          const tri = geometry.triangles[i];
+          indices[i * 3] = tri[0];
+          indices[i * 3 + 1] = tri[1];
+          indices[i * 3 + 2] = tri[2];
+        }
+        bufferGeometry.setIndex(new THREE.BufferAttribute(indices, 1));
+        bufferGeometry.computeVertexNormals();
+        // FEA per-vertex attributes (~16 bytes/vertex): zero-filled damage
+        // (itemSize 1) and displacement (itemSize 3). They exist on ALL
+        // meshes so the decorated FEA shader always compiles and renders
+        // identically until applyFeaObjectField() writes real values.
+        bufferGeometry.setAttribute('aDamage', new THREE.BufferAttribute(new Float32Array(vertexCount), 1));
+        bufferGeometry.setAttribute(
+          'aDisplacement',
+          new THREE.BufferAttribute(new Float32Array(vertexCount * 3), 3),
+        );
+        bufferGeometry.computeBoundingSphere();
+        mesh = new THREE.Mesh(bufferGeometry, material);
+        if (opts?.wireframe) {
+          wireframeMaterial = new THREE.LineBasicMaterial({
+            color: 0x000000,
+            transparent: true,
+            opacity: 0.35,
+          });
+          wireframeMaterial.userData.owned = true;
+          const edges = new THREE.LineSegments(
+            new THREE.EdgesGeometry(bufferGeometry, 20),
+            wireframeMaterial,
+          );
+          edges.userData.owned = true;
+          mesh.add(edges);
+        }
+        break;
+      }
+    }
+  } catch {
+    createdGeometry?.dispose();
+    wireframeMaterial?.dispose();
+    if (material.userData.owned) material.dispose();
+    return null;
+  }
+
+  return mesh;
+}
+
+/**
  * Build a THREE.Group for a scene entry. Primitive transforms are applied to
  * the group itself; compound transforms are applied once to an inner container.
  */
@@ -184,179 +538,6 @@ export function createObjectGroup(entry: ObjectSceneEntry, opts?: FactoryOptions
   const sphereSegments = quality === 'high' ? 32 : quality === 'medium' ? 24 : 16;
   const sphereRings = quality === 'high' ? 16 : quality === 'medium' ? 12 : 8;
   const radialSegments = quality === 'high' ? 32 : quality === 'medium' ? 24 : 16;
-
-  function resolveMaterial(key: PaletteKey): THREE.Material {
-    const shared = opts?.materials?.[key];
-    if (shared) return shared;
-    const mat = new THREE.MeshStandardMaterial({ color: 0x9aa0a6 });
-    mat.userData.owned = true;
-    return mat;
-  }
-
-  /**
-   * Attach the zero-filled FEA vertex attributes (aDamage/aDisplacement) to a
-   * primitive geometry so the decorated shader compiles with the attribute
-   * path and applyFeaPlateField() can fill real values — mirrors the 'mesh'
-   * case which attaches them at build time.
-   */
-  function attachFeaAttributes(geometry: THREE.BufferGeometry): void {
-    const vertexCount = geometry.attributes.position.count;
-    geometry.setAttribute('aDamage', new THREE.BufferAttribute(new Float32Array(vertexCount), 1));
-    geometry.setAttribute(
-      'aDisplacement',
-      new THREE.BufferAttribute(new Float32Array(vertexCount * 3), 3),
-    );
-  }
-
-  function buildMesh(geometry: GeometryJson): THREE.Mesh | null {
-    if (!isSafeGeometry(geometry) || geometry.type === 'compound') return null;
-    if (geometry.type === 'mesh' && (geometry.vertices.length === 0 || geometry.triangles.length === 0)) {
-      return null;
-    }
-
-    const key = paletteKeyForComponent(entry.className ?? null);
-    const material = entry.color
-      ? (() => {
-          // Kernel-tessellated STEP parts carry their CAD presentation color;
-          // own the material so disposal never touches the shared palette.
-          // CAD colors are sRGB; the renderer outputs sRGB with ACES tone
-          // mapping, so convert once to linear.
-          const colored = new THREE.MeshStandardMaterial({
-            color: new THREE.Color().setRGB(
-              entry.color[0],
-              entry.color[1],
-              entry.color[2],
-              THREE.SRGBColorSpace,
-            ),
-            roughness: 0.6,
-            metalness: 0.1,
-          });
-          colored.userData.owned = true;
-          return colored;
-        })()
-      : resolveMaterial(key);
-    let mesh: THREE.Mesh | null = null;
-    let createdGeometry: THREE.BufferGeometry | null = null;
-    let wireframeMaterial: THREE.LineBasicMaterial | null = null;
-
-    try {
-      switch (geometry.type) {
-        case 'box': {
-          const size = geometry.size as Vec3;
-          createdGeometry = new THREE.BoxGeometry(size[0], size[1], size[2]);
-          attachFeaAttributes(createdGeometry);
-          mesh = new THREE.Mesh(createdGeometry, material);
-          break;
-        }
-        case 'sphere': {
-          createdGeometry = new THREE.SphereGeometry(geometry.radius, sphereSegments, sphereRings);
-          attachFeaAttributes(createdGeometry);
-          mesh = new THREE.Mesh(createdGeometry, material);
-          break;
-        }
-        case 'cylinder': {
-          const geometryCyl = new THREE.CylinderGeometry(
-            geometry.radius,
-            geometry.radius,
-            geometry.height,
-            radialSegments,
-          );
-          geometryCyl.rotateX(Math.PI / 2);
-          geometryCyl.translate(0, 0, geometry.height / 2);
-          createdGeometry = geometryCyl;
-          attachFeaAttributes(createdGeometry);
-          mesh = new THREE.Mesh(createdGeometry, material);
-          break;
-        }
-        case 'cone': {
-          const geometryCone = new THREE.ConeGeometry(
-            geometry.base_radius,
-            geometry.height,
-            radialSegments,
-          );
-          geometryCone.rotateX(Math.PI / 2);
-          geometryCone.translate(0, 0, geometry.height / 2);
-          createdGeometry = geometryCone;
-          attachFeaAttributes(createdGeometry);
-          mesh = new THREE.Mesh(createdGeometry, material);
-          break;
-        }
-        case 'frustum': {
-          const geometryFrustum = new THREE.CylinderGeometry(
-            geometry.top_radius,
-            geometry.bottom_radius,
-            geometry.height,
-            radialSegments,
-          );
-          geometryFrustum.rotateX(Math.PI / 2);
-          geometryFrustum.translate(0, 0, geometry.height / 2);
-          createdGeometry = geometryFrustum;
-          attachFeaAttributes(createdGeometry);
-          mesh = new THREE.Mesh(createdGeometry, material);
-          break;
-        }
-        case 'mesh': {
-          const vertices = geometry.vertices as Vec3[];
-          const positions = new Float32Array(vertices.length * 3);
-          for (let i = 0; i < vertices.length; i += 1) {
-            positions[i * 3] = vertices[i][0];
-            positions[i * 3 + 1] = vertices[i][1];
-            positions[i * 3 + 2] = vertices[i][2];
-          }
-          const bufferGeometry = new THREE.BufferGeometry();
-          createdGeometry = bufferGeometry;
-          bufferGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-          const triangleCount = geometry.triangles.length;
-          const vertexCount = vertices.length;
-          const indices =
-            vertexCount <= 65535
-              ? new Uint16Array(triangleCount * 3)
-              : new Uint32Array(triangleCount * 3);
-          for (let i = 0; i < triangleCount; i += 1) {
-            const tri = geometry.triangles[i];
-            indices[i * 3] = tri[0];
-            indices[i * 3 + 1] = tri[1];
-            indices[i * 3 + 2] = tri[2];
-          }
-          bufferGeometry.setIndex(new THREE.BufferAttribute(indices, 1));
-          bufferGeometry.computeVertexNormals();
-          // FEA per-vertex attributes (~16 bytes/vertex): zero-filled damage
-          // (itemSize 1) and displacement (itemSize 3). They exist on ALL
-          // meshes so the decorated FEA shader always compiles and renders
-          // identically until applyFeaObjectField() writes real values.
-          bufferGeometry.setAttribute('aDamage', new THREE.BufferAttribute(new Float32Array(vertexCount), 1));
-          bufferGeometry.setAttribute(
-            'aDisplacement',
-            new THREE.BufferAttribute(new Float32Array(vertexCount * 3), 3),
-          );
-          bufferGeometry.computeBoundingSphere();
-          mesh = new THREE.Mesh(bufferGeometry, material);
-          if (opts?.wireframe) {
-            wireframeMaterial = new THREE.LineBasicMaterial({
-              color: 0x000000,
-              transparent: true,
-              opacity: 0.35,
-            });
-            wireframeMaterial.userData.owned = true;
-            const edges = new THREE.LineSegments(
-              new THREE.EdgesGeometry(bufferGeometry, 20),
-              wireframeMaterial,
-            );
-            edges.userData.owned = true;
-            mesh.add(edges);
-          }
-          break;
-        }
-      }
-    } catch {
-      createdGeometry?.dispose();
-      wireframeMaterial?.dispose();
-      if (material.userData.owned) material.dispose();
-      return null;
-    }
-
-    return mesh;
-  }
 
   if (!isSafeGeometry(entry.geometry)) return group;
 
@@ -385,7 +566,15 @@ export function createObjectGroup(entry: ObjectSceneEntry, opts?: FactoryOptions
     });
     group.userData.meshObjects = collected;
   } else {
-    const mesh = buildMesh(entry.geometry);
+    const mesh = buildMeshCore(
+      entry.geometry,
+      entry.className ?? null,
+      entry.color ?? null,
+      opts,
+      sphereSegments,
+      sphereRings,
+      radialSegments,
+    );
     if (!mesh) return group;
     group.applyMatrix4(pythonTransformToMatrix4(entry.geometry.transform));
     group.matrixAutoUpdate = false;

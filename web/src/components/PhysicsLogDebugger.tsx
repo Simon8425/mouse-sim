@@ -216,7 +216,6 @@ export function PhysicsLogDebugger({ viewportRef }: PhysicsLogDebuggerProps) {
 
   // Poll the runtime telemetry while the drawer is open (20 Hz, cheap).
   React.useEffect(() => {
-    if (!state.debuggerOpen) return;
     const tick = () => {
       const rt = viewportRef.current as {
         getTelemetryFrames?: () => TelemetryFrame[];
@@ -233,7 +232,7 @@ export function PhysicsLogDebugger({ viewportRef }: PhysicsLogDebuggerProps) {
         pollRef.current = null;
       }
     };
-  }, [state.debuggerOpen, viewportRef]);
+  }, [viewportRef]);
 
   // Rebuild the session snapshot when frames change (export tab uses it).
   React.useEffect(() => {
@@ -254,16 +253,11 @@ export function PhysicsLogDebugger({ viewportRef }: PhysicsLogDebuggerProps) {
     window.setTimeout(() => setCopied(false), 1500);
   };
 
-  // Close when clicking outside the log card
-  const cardRef = React.useRef<HTMLDivElement | null>(null);
+  // Close when clicking outside the log popover.
   React.useEffect(() => {
     const handlePointerDownOutside = (e: PointerEvent) => {
       const target = e.target as HTMLElement | null;
-      if (
-        target &&
-        !target.closest('.viewport-toolbar__log') &&
-        !target.closest('.telemetry-debugger')
-      ) {
+      if (target && !target.closest('.viewport-toolbar__log') && !target.closest('.telemetry-debugger')) {
         dispatch({ type: 'SET_DEBUGGER_OPEN', open: false });
       }
     };
@@ -340,7 +334,7 @@ export function PhysicsLogDebugger({ viewportRef }: PhysicsLogDebuggerProps) {
   const summary = derivedSession?.summary;
 
   return (
-    <div ref={cardRef} className="telemetry-debugger">
+    <div className="telemetry-debugger">
       <div className="telemetry-debugger__header">
         <h2 className="telemetry-debugger__title">Log</h2>
         <button

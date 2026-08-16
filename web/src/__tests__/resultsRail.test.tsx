@@ -280,7 +280,8 @@ describe('ResultsRail', () => {
     renderRail({ ...baseResult(), errors: [{ code: 'EXPLOSION', message: 'kaboom' }] });
 
     expect(screen.getByText('FAIL')).toBeInTheDocument();
-    expect(screen.getByText(/EXPLOSION: kaboom/)).toBeInTheDocument();
+    expect(screen.getByText('kaboom')).toBeInTheDocument();
+    expect(screen.getByText('EXPLOSION')).toBeInTheDocument();
   });
 
   it('renders the drop-test configuration line and material', () => {
@@ -310,6 +311,49 @@ describe('ResultsRail', () => {
     expect(screen.getByText('Wall thickness below recommended minimum.')).toBeInTheDocument();
     expect(screen.queryByText('Units normalized to mm.')).not.toBeInTheDocument();
     expect(screen.queryByText('Info')).not.toBeInTheDocument();
+  });
+
+  it('renders the finding code and an engineering recommendation for optical defocus', () => {
+    renderRail({
+      ...baseResult(),
+      validation: {
+        status: 'warn',
+        validity_state: 'approximate',
+        findings: [
+          {
+            code: 'OPTICAL_TRACKING_LOD_SHIFT',
+            severity: 'warning',
+            state: 'open',
+            category: 'optics',
+            message:
+              'optical sensor lens z-displacement 0.18 mm exceeds the 0.150 mm defocus budget under 300 g shock',
+            affected_ids: ['sensor-package-01'],
+            phase: 'validation',
+            evidence_blocking: false,
+          },
+        ],
+      },
+    });
+
+    expect(screen.getByText('OPTICAL_TRACKING_LOD_SHIFT')).toBeInTheDocument();
+    expect(
+      screen.getByText(/lens z-displacement 0.18 mm exceeds/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/EVA foam dampening under the PCB near the sensor/)).toBeInTheDocument();
+  });
+
+  it('surfaces findings with unknown severities instead of dropping them', () => {
+    renderRail({
+      ...baseResult(),
+      issues: [
+        { code: 'MYSTERY', severity: 'esoteric', category: 'x', message: 'odd finding', evidence_blocking: false },
+      ],
+    });
+
+    // Unknown severities are disclosed: the code prefixes the message
+    // ("MYSTERY: odd finding") and renders in the summary strip too.
+    expect(screen.getAllByText(/MYSTERY/).length).toBeGreaterThan(0);
+    expect(screen.getByText('MYSTERY: odd finding')).toBeInTheDocument();
   });
 
   it('shows no issues section when there is nothing actionable', () => {
@@ -344,5 +388,40 @@ describe('ResultsRail', () => {
     expect(screen.getByRole('button', { name: 'Show results rail' })).toBeInTheDocument();
     const rail = screen.getByRole('button', { name: 'Show results rail' }).closest('aside');
     expect(rail?.className).toContain('results-rail--collapsed');
+  });
+
+  it('labels the population pass fraction correctly (not "Yield reliability")', () => {
+    const result: PipelineResult = {
+      ...baseResult(),
+      population: {
+        mode: 'exploration',
+        verdict: 'fail',
+        drop: null,
+        sample_count: 10000,
+        profile: 'esports_fps',
+        lifespan_days: 730,
+        units_failed: 120,
+        failure_rate: 0.012,
+        wilson_ci: { low: 0.010, high: 0.014 },
+        component_failure_rates: [],
+        weakest_components: [],
+        sensitivity: [],
+        survival: [],
+        components: null,
+        assumptions: [],
+        shell: null,
+        diagnostics: [],
+        model: null,
+      },
+    };
+    renderRail(result);
+
+    // 1 - 0.012 = 0.988 -> "98.8%".
+    expect(screen.getByText('Expected pass rate')).toBeInTheDocument();
+    expect(screen.getByText('98.8%')).toBeInTheDocument();
+    // The misleading "Yield reliability" label must be gone — a point
+    // estimate of the pass fraction is not a Weibull R(t) reliability.
+    expect(screen.queryByText('Yield reliability')).not.toBeInTheDocument();
+    expect(screen.getByText('95% Wilson CI')).toBeInTheDocument();
   });
 });

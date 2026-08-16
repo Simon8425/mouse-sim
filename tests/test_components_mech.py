@@ -58,17 +58,108 @@ class ComponentMechBasicsTests(unittest.TestCase):
 
 class ScrewComponentTests(unittest.TestCase):
     def test_margin_math(self):
-        # F_pullout = pi * 0.002 * 0.003 * 0.2 * 40e6 = 150.8 N.
+        # F_pullout = pi * 0.002 * 0.005 * 1.0 * 40e6 = 1256.6 N.
         # Added load at 100 g on 0.05 kg / 4 screws = 1.23 N.
         result = analyze(
             {"type": "screw", "preload_n": 15.0},
             {"drop": {"peak_accel_g": 100.0}},
         )
         pullout = result["metrics"]["pull_out_force_n"]
-        self.assertAlmostEqual(pullout, 150.8, delta=0.5)
+        self.assertAlmostEqual(pullout, 1256.6, delta=0.5)
         margin = pullout / (15.0 + 0.05 * 100.0 * 9.80665 / 4.0)
         self.assertAlmostEqual(result["metrics"]["margin"], margin, places=3)
         self.assertEqual(result["status"], "pass")
+
+    def test_pullout_uses_tensile_yield_shear_allowable(self):
+        # The thread-stripping screening must use the boss shear-out
+        # allowable tau = S_y (molded-plastic pull-out data 0.75-1.0x S_y),
+        # NOT the 0.2 * S_y cantilever-bending convention: an M2 x 5 mm
+        # engagement boss in ABS (S_y = 40 MPa) strips at ~754 N (0.75x) to
+        # ~1257 N (1.0x), not at the old 150.8 N.
+        result = analyze(
+            {"type": "screw", "preload_n": 15.0, "transport_vibration_g_rms": 0.0},
+            {"drop": {"peak_accel_g": 10.0}},
+        )
+        pullout = result["metrics"]["pull_out_force_n"]
+        self.assertAlmostEqual(pullout, math.pi * 0.002 * 0.005 * 40e6, delta=0.5)
+        self.assertGreater(pullout, 3.0 * math.pi * 0.002 * 0.005 * 8e6)
+
+    def test_engagement_length_scales_pullout(self):
+        # Doubling the engaged thread length doubles the stripping capacity.
+        short = analyze(
+            {"type": "screw", "engagement_length_m": 0.0025},
+            {"drop": {"peak_accel_g": 100.0}},
+        )
+        long = analyze(
+            {"type": "screw", "engagement_length_m": 0.005},
+            {"drop": {"peak_accel_g": 100.0}},
+        )
+        self.assertAlmostEqual(
+            long["metrics"]["pull_out_force_n"],
+            2.0 * short["metrics"]["pull_out_force_n"],
+            places=2,
+        )
+
+    def test_short_engagement_warns(self):
+        # 1.0x screw diameter engagement is below the 2.5x recommendation.
+        result = analyze(
+            {"type": "screw", "engagement_length_m": 0.002},
+            {"drop": {"peak_accel_g": 10.0}},
+        )
+        self.assertEqual(result["status"], "warn")
+        self.assertTrue(any(f["code"] == "SCREW_ENGAGEMENT_SHORT" for f in result["findings"]))
+
+    def test_thin_boss_wall_warns(self):
+        # OD 2.4 mm / ID 2.0 mm -> 0.2 mm wall, below the 0.5 mm minimum.
+        result = analyze(
+            {
+                "type": "screw",
+                "boss_inner_diameter_m": 0.002,
+                "boss_outer_diameter_m": 0.0024,
+            },
+            {"drop": {"peak_accel_g": 10.0}},
+        )
+        self.assertEqual(result["status"], "warn")
+        self.assertTrue(any(f["code"] == "SCREW_BOSS_WALL_THIN" for f in result["findings"]))
+
+    def test_hoop_stress_reported(self):
+        # Default boss (ID 2.0 mm, OD 4.0 mm, wall 1.0 mm) reports a finite
+        # hoop stress and passes at 100 g.
+        result = analyze(
+            {"type": "screw"},
+            {"drop": {"peak_accel_g": 100.0}},
+        )
+        self.assertIsNotNone(result["metrics"]["hoop_stress_pa"])
+        self.assertEqual(result["status"], "pass")
+
+    def test_extreme_preload_hoop_fails(self):
+        # A huge preload inflates the radial pressure until the boss hoop
+        # stress exceeds yield: boss radial-crack risk.
+        result = analyze(
+            {"type": "screw", "preload_n": 5000.0},
+            {"drop": {"peak_accel_g": 10.0}},
+        )
+        self.assertEqual(result["status"], "fail")
+        self.assertTrue(any(f["code"] == "SCREW_BOSS_HOOP_FAIL" for f in result["findings"]))
+
+    def test_peak_force_path_preferred_over_accel(self):
+        # When the impact module supplies peak_force_n, the screw load uses
+        # F/count instead of m*g*G/count: 100 N / 4 screws = 25 N added.
+        result = analyze(
+            {"type": "screw", "preload_n": 0.0},
+            {"drop": {"peak_force_n": 100.0, "peak_accel_g": 2000.0}},
+        )
+        self.assertAlmostEqual(result["metrics"]["added_load_n"], 25.0, places=3)
+        # The same joint fed only the acceleration falls back to m*g*G/count.
+        fallback = analyze(
+            {"type": "screw", "preload_n": 0.0},
+            {"drop": {"peak_accel_g": 2000.0}},
+        )
+        self.assertAlmostEqual(
+            fallback["metrics"]["added_load_n"],
+            0.05 * 2000.0 * 9.80665 / 4.0,
+            places=3,
+        )
 
     def test_low_preload_loosening_warn(self):
         result = analyze(
@@ -208,7 +299,7 @@ class KnifeEdgeBoundaryTests(unittest.TestCase):
         # 1.0/1.19/1.2/1.21 map to margins 1/1.0, 1/1.19, 1/1.2, 1/1.21.
         # Vibration loosening is disabled (0 g rms) so the pull-out band
         # alone drives the status.
-        pullout = math.pi * 0.002 * 0.003 * 0.2 * 40e6
+        pullout = math.pi * 0.002 * 0.005 * 1.0 * 40e6
         for ratio, expected in ((1.0, "warn"), (1.19, "warn"), (1.2, "fail"), (1.21, "fail")):
             accel = (pullout / (1.0 / ratio)) * 4.0 / (0.05 * 9.80665)
             result = analyze(

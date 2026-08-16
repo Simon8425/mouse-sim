@@ -269,9 +269,15 @@ export function createOverlayLayer(
     apply,
     setPlaneRadius,
     setContactPlaneRadius,
+    clear() {
+      if (disposed) return;
+      disposeOverlayResources(container);
+      container.clear();
+      currentSpec = null;
+      appliedKey = '';
+    },
     dispose() {
       if (disposed) return;
-      disposed = true;
       disposeOverlayResources(container);
       container.clear();
       container.removeFromParent();
@@ -279,6 +285,7 @@ export function createOverlayLayer(
         texture.dispose();
       }
       textureCache.clear();
+      disposed = true;
       currentSpec = null;
       appliedKey = '';
     },

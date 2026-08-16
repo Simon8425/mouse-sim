@@ -576,5 +576,29 @@ class MeshRepairTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 load_geometry(path)
 
+    def test_step_unit_scale_honors_declared_inches(self):
+        """An inch-declared STEP must scale by 0.0254, not the mm 0.001.
+
+        The kernel's metre scale comes from the declared STEP length unit; a
+        hardcoded 0.001 would shrink an inch model 25.4x (volume x16387,
+        mass x16387).
+        """
+        from mouse_sim.step_kernel import _settings, step_unit_hint
+
+        inch_step = (
+            b"ISO-10303-21;\nHEADER;\n"
+            b"FILE_DESCRIPTION((''),'2;1');\n"
+            b"FILE_NAME('x.stp','',(''),(''),'','','');\n"
+            b"FILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }'));\n"
+            b"ENDSEC;\nDATA;\n"
+            b"#1 = CONVERSION_BASED_UNIT('INCH', #2);\n"
+            b"#2 = LENGTH_UNIT() GLOBAL_UNIT_ASSIGNED_CONTEXT(#1);\n"
+            b"ENDSEC;\nEND-ISO-10303-21;\n"
+        )
+        self.assertEqual(step_unit_hint(inch_step), "in")
+        self.assertEqual(_settings("in")["scale_to_m"], 0.0254)
+        self.assertEqual(_settings("mm")["scale_to_m"], 0.001)
+        self.assertEqual(_settings("ft")["scale_to_m"], 0.3048)
+
 if __name__ == "__main__":
     unittest.main()

@@ -437,6 +437,7 @@ class WebApiTests(unittest.TestCase):
                 "CORRELATION_MEASURED",
                 "REQUIREMENT_EVALUATION",
                 "CONVERGENCE_EVIDENCE",
+                "COMPONENT_CHECKS_CLEAN",
             },
         )
 

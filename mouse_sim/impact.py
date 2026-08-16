@@ -760,8 +760,13 @@ def estimate_impact(
     partition = None
     partition_notes = []
     if inertia is not None:
+        # Audit fix (impulse-momentum consistency): the partition used the
+        # PLASTIC impulse (m*v_n) while the reported impulse includes
+        # restitution (m*(1+e)*v_n).  With e > 0 the old code understated
+        # the rotational share before the energy scaling.  Use the same
+        # impulse the result reports so the bookkeeping is consistent.
         partition, partition_notes = _energy_partition(
-            partition_mass, inertia, normal, effective_mass * normal_velocity, offset,
+            partition_mass, inertia, normal, impulse, offset,
             energy=energy,
         )
         if partition is not None:

@@ -66,6 +66,21 @@ function getSingletonWorker(): Worker {
   return workerInstance;
 }
 
+/**
+ * Cancels every in-flight parse job. The worker itself cannot be interrupted
+ * mid-parse (it is a single synchronous task per message), but dropping all
+ * pending promises here guarantees a superseded upload's result can never
+ * resolve into a stale preview: the FileDropzone already guards with a
+ * version check, and this makes the guard immediate instead of waiting for
+ * the old job to finish.
+ */
+export function cancelPendingParses(): void {
+  for (const pending of pendingMap.values()) {
+    pending.reject(new Error('Parse superseded by a newer upload'));
+  }
+  pendingMap.clear();
+}
+
 export function parseInWorker(
   format: PreviewFormat,
   units: string,

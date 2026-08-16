@@ -173,28 +173,41 @@ export function summarizeFrames(
   let lastStatus: string | undefined;
   let apexEnergy = 0;
   for (const f of frames) {
-    if (f.acceleration_g > peakG) peakG = f.acceleration_g;
+    if (typeof f.acceleration_g === 'number' && Number.isFinite(f.acceleration_g) && f.acceleration_g > peakG) {
+      peakG = f.acceleration_g;
+    }
     const fea = f.fea;
     if (fea) {
-      if (fea.peak_stress_pa / 1e6 > peakStressMpa) peakStressMpa = fea.peak_stress_pa / 1e6;
-      if (fea.safety_factor < minSf) minSf = fea.safety_factor;
+      if (Number.isFinite(fea.peak_stress_pa) && fea.peak_stress_pa / 1e6 > peakStressMpa) {
+        peakStressMpa = fea.peak_stress_pa / 1e6;
+      }
+      if (Number.isFinite(fea.safety_factor) && fea.safety_factor < minSf) {
+        minSf = fea.safety_factor;
+      }
     }
     // Drift is tracked by the auditor (max over the stream); the frame energy
     // block does not carry drift, so derive it from the dissipated/release
     // ratio for the export summary.
-    const drift = f.energy_j.dissipated > 0 && releaseEnergyJ > 0
-      ? (f.energy_j.dissipated / releaseEnergyJ) * 100
-      : 0;
+    const dissipated = f.energy_j?.dissipated ?? 0;
+    const drift =
+      Number.isFinite(dissipated) && dissipated > 0 && Number.isFinite(releaseEnergyJ) && releaseEnergyJ > 0
+        ? (dissipated / releaseEnergyJ) * 100
+        : 0;
     if (drift > maxDrift) maxDrift = drift;
     if (f.status === 'rebound' && lastStatus !== 'rebound') {
       reboundCount += 1;
-      apexEnergy = f.energy_j.total;
+      if (Number.isFinite(f.energy_j?.total)) apexEnergy = f.energy_j.total;
     }
     lastStatus = f.status;
   }
-  const restitution = releaseEnergyJ > 0 ? Math.sqrt(Math.max(0, apexEnergy / releaseEnergyJ)) : 0;
+  const restitution =
+    Number.isFinite(releaseEnergyJ) && releaseEnergyJ > 0
+      ? Math.sqrt(Math.max(0, Number.isFinite(apexEnergy) ? apexEnergy : 0) / releaseEnergyJ)
+      : 0;
+  const firstT = frames.length ? frames[0].t_s : 0;
+  const lastT = frames.length ? frames[frames.length - 1].t_s : 0;
   return {
-    duration_s: frames.length ? frames[frames.length - 1].t_s - frames[0].t_s : 0,
+    duration_s: Number.isFinite(firstT) && Number.isFinite(lastT) ? Math.max(0, lastT - firstT) : 0,
     total_frames: frames.length,
     peak_g_force: peakG,
     peak_stress_mpa: peakStressMpa,
@@ -235,33 +248,35 @@ export function buildTelemetrySession(
 
 /** Flatten one frame to CSV columns (matching the table). */
 export function frameToCsvRow(f: TelemetryFrame): (string | number)[] {
+  // Non-finite kinematics/energy must never leak into the exported CSV:
+  // NaN/Infinity serialize to corrupt tokens. Every numeric cell is
+  // sanitized to '' when not strictly finite (mirrors the row writer).
+  const num = (v: number | undefined, scale = 1): number | string => {
+    const n = typeof v === 'number' ? v * scale : Number.NaN;
+    return Number.isFinite(n) ? n : '';
+  };
+  const vec = (v: readonly number[] | undefined, scale = 1): (number | string)[] =>
+    (v ?? []).map((entry) => num(entry, scale));
   return [
-    f.index,
-    f.t_s.toFixed(6),
+    num(f.index),
+    num(f.t_s, 1e6) === '' ? '' : (f.t_s as number).toFixed(6),
     f.status,
-    f.position_m[2] * 1000,
-    f.velocity_m_s[0],
-    f.velocity_m_s[1],
-    f.velocity_m_s[2],
-    norm3(f.velocity_m_s),
-    f.acceleration_g,
-    f.angular_velocity_rad_s[0],
-    f.angular_velocity_rad_s[1],
-    f.angular_velocity_rad_s[2],
-    f.quaternion_wxyz[0],
-    f.quaternion_wxyz[1],
-    f.quaternion_wxyz[2],
-    f.quaternion_wxyz[3],
-    f.energy_j.kinetic_trans * 1000,
-    f.energy_j.kinetic_rot * 1000,
-    f.energy_j.potential * 1000,
-    f.energy_j.total * 1000,
-    f.energy_j.dissipated * 1000,
+    num(f.position_m[2], 1000),
+    ...vec(f.velocity_m_s),
+    ...(Number.isFinite(norm3(f.velocity_m_s)) ? [norm3(f.velocity_m_s)] : ['']),
+    num(f.acceleration_g),
+    ...vec(f.angular_velocity_rad_s),
+    ...vec(f.quaternion_wxyz),
+    num(f.energy_j.kinetic_trans, 1000),
+    num(f.energy_j.kinetic_rot, 1000),
+    num(f.energy_j.potential, 1000),
+    num(f.energy_j.total, 1000),
+    num(f.energy_j.dissipated, 1000),
     // Drift is tracked per-frame by the auditor; the frame block carries only
     // the partition, so export the dissipated/release ratio as the drift proxy.
-    f.energy_j.dissipated > 0 ? (f.energy_j.dissipated / Math.max(1e-9, f.energy_j.total + f.energy_j.dissipated)) * 100 : 0,
-    f.fea ? f.fea.peak_stress_pa / 1e6 : '',
-    f.fea ? f.fea.safety_factor : '',
+    f.energy_j.dissipated > 0 ? num((f.energy_j.dissipated / Math.max(1e-9, f.energy_j.total + f.energy_j.dissipated)) * 100) : 0,
+    f.fea ? num(f.fea.peak_stress_pa, 1 / 1e6) : '',
+    f.fea ? num(f.fea.safety_factor) : '',
   ];
 }
 

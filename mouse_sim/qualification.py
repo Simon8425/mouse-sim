@@ -41,6 +41,19 @@ GATE_SPECS = (
     ("CORRELATION_MEASURED", "Predicted vs measured drop response within acceptance"),
     ("REQUIREMENT_EVALUATION", "Structured requirement targets evaluate to pass"),
     ("CONVERGENCE_EVIDENCE", "Claimed convergence/force-balance evidence is substantiated"),
+    ("COMPONENT_CHECKS_CLEAN", "Component screening findings (battery latch, screw boss, ...) carry no blocker/error"),
+)
+
+# Consumer drop-test standards referenced by the component screening models:
+# IEC 60068-2-31 (free-fall drop, 4 faces / 2 edges / 1 corner at 1.0 m for
+# <= 20 kg products; repeated drops accumulate) and MIL-STD-810H Method
+# 516.8 Procedure IV (transit drop: 1.22 m on six faces, 12 drops).  The
+# screening models use class-level peak accelerations (20-150 g design band
+# for a gaming mouse; up to ~1000 g at the impact face) rather than a single
+# test height.
+DROP_STANDARDS_REFERENCE = (
+    "IEC 60068-2-31 (free-fall drop test, 1.0 m, 7 drops: 4 faces, 2 edges, 1 corner) "
+    "and MIL-STD-810H Method 516.8 Procedure IV (transit drop, 1.22 m, 12 drops: 6 faces)"
 )
 
 _GATE_LABELS = dict(GATE_SPECS)
@@ -837,6 +850,53 @@ def _convergence_evidence_gate(convergence_evidence, force_balance, structural_r
     )
 
 
+def _component_checks_gate(pipeline_result):
+    """COMPONENT_CHECKS_CLEAN: component screening must carry no blocker/error.
+
+    The pipeline stores the mechanical/electrical component screening under
+    ``result["components"]`` (a dict with a ``results``/``components`` list of
+    per-component findings).  A component finding with severity
+    ``blocker``/``error`` — e.g. ``BATTERY_LATCH_DISLODGED`` (snap-fit cell
+    cradle) or ``SCREW_PULLOUT_RISK`` (boss thread stripping) — hard-blocks
+    qualification, mirroring the ``NO_BLOCKING_ISSUES`` gate for validation
+    findings.  Missing component data is non-evaluable and non-blocking.
+    """
+    components = pipeline_result.get("components") if pipeline_result is not None else None
+    if components is None:
+        return _gate(
+            "COMPONENT_CHECKS_CLEAN", False, False, False,
+            "no component screening supplied",
+        )
+    entries = []
+    if isinstance(components, Mapping):
+        entries = components.get("components", ())
+        if not entries:
+            entries = components.get("findings", ())
+    findings = []
+    for entry in entries or ():
+        if isinstance(entry, Mapping) and entry.get("findings"):
+            # Per-component result dicts carry their own nested findings.
+            findings.extend(entry["findings"])
+        else:
+            findings.append(entry)
+    if not findings:
+        return _gate("COMPONENT_CHECKS_CLEAN", True, True, True, "no component findings")
+    blocking = []
+    for finding in findings:
+        severity = str(_get(finding, "severity", default="") or "").casefold()
+        if severity in ("blocker", "error"):
+            blocking.append(
+                str(_get(finding, "code", default="") or "component finding")
+            )
+    if blocking:
+        codes = ", ".join(sorted({item for item in blocking}))
+        return _gate(
+            "COMPONENT_CHECKS_CLEAN", False, True, True,
+            "component screening carries blocker/error findings: {}".format(codes),
+        )
+    return _gate("COMPONENT_CHECKS_CLEAN", True, True, True, "component screening is clean")
+
+
 def _correlation_measured_gate(pipeline_result):
     """CORRELATION_MEASURED: predicted vs measured drop response within
     acceptance.  FAIL-CLOSED.
@@ -1059,8 +1119,10 @@ def evaluate_qualification(
     validation report, a qualification-blocked or unsupported impact result,
     correlation error fractions beyond the policy maximum, a measured-drop
     correlation outside the acceptance band (when supplied), unmeasurable or
-    failing structured requirement targets, or claimed convergence/force
-    balance evidence that a valid structural response cannot substantiate.
+    failing structured requirement targets, claimed convergence/force
+    balance evidence that a valid structural response cannot substantiate,
+    or component screening findings with blocker/error severity
+    (``COMPONENT_CHECKS_CLEAN``, e.g. a dislodged battery latch).
     """
     mode_value = _mode(mode)
     if requirements is None:
@@ -1096,6 +1158,7 @@ def evaluate_qualification(
         _correlation_measured_gate(pipeline_result),
         _requirement_evaluation_gate(requirement_evaluations),
         _convergence_evidence_gate(convergence_evidence, force_balance, structural_response),
+        _component_checks_gate(pipeline_result),
     ]
     gates = tuple(sorted(gates, key=lambda gate: gate.key))
     integrity_gates = tuple(sorted(integrity_gates, key=lambda gate: gate.key))
@@ -1185,6 +1248,7 @@ def impact_qualification_status(method=None, validated=False):
 
 __all__ = [
     "GATE_SPECS",
+    "DROP_STANDARDS_REFERENCE",
     "QualificationGate",
     "QualificationResult",
     "evaluate_qualification",

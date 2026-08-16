@@ -1,20 +1,20 @@
 import * as React from 'react';
 import { useProjectStore } from '../state/projectStore';
 import type { RenderStats } from '../scene/sceneRuntime';
-import type { SceneViewportHandle } from '../scene/SceneViewport';
 import type { RenderMode } from '../api/contracts';
+import type { SceneViewportHandle } from '../scene/SceneViewport';
 import { PhysicsLogDebugger } from './PhysicsLogDebugger';
 
 export interface ViewportToolbarProps {
-  viewport: React.RefObject<SceneViewportHandle | null>;
   stats: RenderStats | null;
+  viewportRef?: React.RefObject<SceneViewportHandle | null>;
 }
 
 /**
  * Toolbar overlaying the 3D viewport: camera presets, exploded view toggle,
  * overlay legend, quality tier and renderer diagnostics.
  */
-export function ViewportToolbar({ viewport, stats }: ViewportToolbarProps) {
+export function ViewportToolbar({ stats, viewportRef }: ViewportToolbarProps) {
   const { state, dispatch } = useProjectStore();
   const [openDropdown, setOpenDropdown] = React.useState<'legend' | 'stats' | null>(null);
 
@@ -97,7 +97,7 @@ export function ViewportToolbar({ viewport, stats }: ViewportToolbarProps) {
           Log
         </button>
         {state.debuggerOpen ? (
-          <PhysicsLogDebugger viewportRef={viewport} />
+          <PhysicsLogDebugger viewportRef={viewportRef ?? { current: null }} />
         ) : null}
       </div>
 

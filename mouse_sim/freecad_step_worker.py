@@ -426,11 +426,11 @@ def _export_glb(input_path, output_path, source_units, scale_to_m, glb_deflectio
     if root_shape is None or root_shape.IsNull():
         raise RuntimeError("XCAF STEP transfer produced a null root shape")
 
-    glb_deflection_source = glb_deflection_mm / (_SCALE_TO_M * 1000.0)
+    glb_deflection_source = glb_deflection_mm / (scale_to_m * 1000.0)
     BRepMesh_IncrementalMesh(root_shape, glb_deflection_source, False, 0.35, False)
     writer = RWGltf_CafWriter(output_path, True)
     converter = writer.ChangeCoordinateSystemConverter()
-    converter.SetInputLengthUnit(_SCALE_TO_M)
+    converter.SetInputLengthUnit(scale_to_m)
     converter.SetOutputLengthUnit(1.0)
     writer.SetParallel(False)
     writer.SetMergeFaces(False)
@@ -464,8 +464,10 @@ def _run():
     glb_output = _required_environment("MOUSE_SIM_STEP_GLB_OUTPUT")
     parts_output = _required_environment("MOUSE_SIM_STEP_PARTS_OUTPUT")
     source_units = os.environ.get("MOUSE_SIM_STEP_SOURCE_UNITS", "mm").strip() or "mm"
-    scale_to_m = _SCALE_TO_M
-    _positive_float("MOUSE_SIM_STEP_SCALE", _SCALE_TO_M)
+    # The declared STEP unit drives the metre scale: FreeCAD/OCCT hold the
+    # model in millimetres, so an inch/feet-declared STEP must be scaled by
+    # the true inch/feet->m factor, not the mm factor (a 25.4x mass error).
+    scale_to_m = _positive_float("MOUSE_SIM_STEP_SCALE", _SCALE_TO_M)
     mesh_deflection_mm = _positive_float("MOUSE_SIM_STEP_MESH_DEFLECTION_MM", 0.5)
     glb_deflection_mm = _positive_float("MOUSE_SIM_STEP_GLB_DEFLECTION_MM", 0.10)
     os.makedirs(os.path.dirname(mesh_output) or ".", exist_ok=True)

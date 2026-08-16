@@ -66,6 +66,201 @@ const mockPipelineResult: PipelineResult = {
   errors: [],
 };
 
+describe('projectStore fast-dispatch stress (interleaved UI actions)', () => {
+  const dropConfig = {
+    height_m: 0.75,
+    surface: 'concrete',
+    drop_count: 3,
+    orientation: 'flat',
+  } as const;
+
+  function readyState() {
+    return reducer(initialState, {
+      type: 'LOAD_BASELINE_OK',
+      project: mockBaselineProject,
+      name: 'mouse_baseline',
+    });
+  }
+
+  it('rapid RUN_DROP_TEST / LEAVE_TEST / RUN_DROP_TEST interleaving settles consistently', () => {
+    let state = readyState();
+    for (let i = 0; i < 25; i += 1) {
+      state = reducer(state, { type: 'RUN_DROP_TEST', test: 'drop', config: dropConfig });
+      if (state.runStatus === 'loading' || state.runStatus === 'running') {
+        // A late ANALYZE_OK from the first launch must never resurrect a
+        // dismissed test: LEAVE_TEST bumps requestVersion, so the stale
+        // response is dropped by the version guard.
+        const staleVersion = state.requestVersion;
+        state = reducer(state, { type: 'LEAVE_TEST' });
+        const afterLeave = state.requestVersion;
+        state = reducer(state, {
+          type: 'ANALYZE_OK',
+          version: staleVersion,
+          requestKey: 'stale-k',
+          result: mockPipelineResult,
+        });
+        expect(state.requestVersion).toBe(afterLeave);
+        expect(state.lastResult).toBeNull();
+        expect(state.playbackDismissed).toBe(true);
+      } else {
+        state = reducer(state, { type: 'LEAVE_TEST' });
+      }
+    }
+    // The interleaving never wedges the machine in a running state.
+    expect(['idle', 'loading', 'success', 'error']).toContain(state.runStatus);
+    expect(state.playbackDismissed).toBe(true);
+    expect(state.dropPlaying).toBe(false);
+  });
+
+  it('LEAVE_TEST during an in-flight run prevents the late ANALYZE_OK from repainting results', () => {
+    let state = readyState();
+    state = reducer(state, { type: 'RUN_DROP_TEST', test: 'drop', config: dropConfig });
+    const key = createAnalysisRequestKey(createAnalysisRequest(state));
+    state = reducer(state, { type: 'ANALYZE_START', version: 1, requestKey: key });
+    expect(state.runStatus).toBe('running');
+    // User smashes Leave Test while the physics worker is stepping.
+    state = reducer(state, { type: 'LEAVE_TEST' });
+    expect(state.playbackDismissed).toBe(true);
+    // Late response from the cancelled run arrives with the OLD version.
+    const staleResult: PipelineResult = {
+      ...mockPipelineResult,
+      drop_simulation: {
+        config: { test: 'drop', height_m: 0.75, surface: 'concrete', drop_count: 3, orientation: 'flat' },
+        model: {
+          mass_kg: 0.06,
+          inertia_kg_m2: [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+          support_model: 'test',
+          support_point_count: 1,
+          integrator: 'test',
+          timestep_s: 0.001,
+          gravity_m_s2: 9.81,
+          surface: 'concrete',
+          restitution: 0.3,
+          friction: 0.6,
+          com_offset_m: [0, 0, 0],
+          orientation_quaternion_wxyz: [1, 0, 0, 0],
+          initial_velocity_m_s: [0, 0, 0],
+          initial_angular_velocity_rad_s: [0, 0, 0],
+          starting_pose_m: [0, 0, 0.75],
+        },
+        drops: [],
+        impacts: [],
+        trajectory: [],
+        peak: null,
+        peak_force_estimate_n: null,
+      },
+    };
+    state = reducer(state, {
+      type: 'ANALYZE_OK',
+      version: 1,
+      requestKey: key,
+      result: staleResult,
+    });
+    // Version guard drops it: results stay dismissed.
+    expect(state.lastResult).toBeNull();
+    expect(state.runStatus).toBe('idle');
+  });
+
+  it('rapid SET_FLOOR / SET_DROP_TEST_CONFIG during a run does not corrupt the draft', () => {
+    let state = readyState();
+    state = reducer(state, { type: 'RUN_DROP_TEST', test: 'drop', config: dropConfig });
+    const key = createAnalysisRequestKey(createAnalysisRequest(state));
+    state = reducer(state, { type: 'ANALYZE_START', version: 1, requestKey: key });
+    // Floor material swaps and config edits while the run is in flight.
+    for (const surface of ['wood', 'foam', 'steel', 'concrete'] as const) {
+      state = reducer(state, { type: 'SET_FLOOR', surface });
+      state = reducer(state, { type: 'SET_DROP_TEST_CONFIG', patch: { height_m: 0.8 } });
+    }
+    // The draft stays a well-formed drop test; the last surface wins.
+    expect(state.draft?.drop_simulation?.surface).toBe('concrete');
+    expect(state.draft?.drop_simulation?.height_m).toBe(0.8);
+    expect(state.draft?.drop_simulation?.drop_count).toBe(3);
+    expect(state.runStatus).toBe('running');
+    // The completed run that no longer matches the draft is honestly stale —
+    // but stale only ever applies to a PRIOR result, and this is the first
+    // run (lastResult was null), so the fresh result is current.
+    state = reducer(state, { type: 'ANALYZE_OK', version: 1, requestKey: key, result: mockPipelineResult });
+    expect(state.runStatus).toBe('success');
+    expect(state.stale).toBe(false);
+    expect(state.lastResult).toEqual(mockPipelineResult);
+    // A second run against the EDITED draft marks the first result stale.
+    const key2 = createAnalysisRequestKey(createAnalysisRequest(state));
+    state = reducer(state, { type: 'ANALYZE_START', version: 2, requestKey: key2 });
+    expect(state.stale).toBe(true);
+  });
+
+  it('rapid SET_DEBUGGER_OPEN toggling is idempotent and non-destructive', () => {
+    let state = readyState();
+    for (let i = 0; i < 20; i += 1) {
+      state = reducer(state, { type: 'SET_DEBUGGER_OPEN', open: i % 2 === 0 });
+    }
+    expect(state.debuggerOpen).toBe(false);
+    // The drawer toggle never disturbs run state or results.
+    expect(state.lastResult).toBeNull();
+    expect(state.runStatus).toBe('idle');
+  });
+
+  it('rapid AI classify open/close + dismiss interleaving never resurrects suggestions', () => {
+    let state = readyState();
+    state = reducer(state, { type: 'CLASSIFY_START', jobId: 'job-1' });
+    for (let i = 0; i < 10; i += 1) {
+      state = reducer(state, {
+        type: 'CLASSIFY_POLL',
+        status: 'running',
+        total: 1,
+        done: i,
+        error: null,
+        results: [{ object_id: 'shell_top', component_type: 'top_shell', confidence: 0.9, reasons: [] }],
+      });
+      if (i % 2 === 0) {
+        state = reducer(state, { type: 'SET_CLASSIFY_MODAL_OPEN', open: true });
+      } else {
+        state = reducer(state, { type: 'SET_CLASSIFY_MODAL_OPEN', open: false });
+      }
+    }
+    // Dismiss everything mid-stream.
+    state = reducer(state, { type: 'CLASSIFY_DISMISS_ALL' });
+    // A late poll tick must not resurrect the dismissed suggestion.
+    state = reducer(state, {
+      type: 'CLASSIFY_POLL',
+      status: 'done',
+      total: 1,
+      done: 1,
+      error: null,
+      results: [{ object_id: 'shell_top', component_type: 'top_shell', confidence: 0.9, reasons: [] }],
+    });
+    expect(state.aiClassifications).toEqual({});
+    expect(state.classifyModalOpen).toBe(false);
+  });
+
+  it('CANCEL_RUN during a population run strips the one-shot spec and never re-runs it', () => {
+    let state = readyState();
+    state = reducer(state, { type: 'RUN_POPULATION' });
+    const key = createAnalysisRequestKey(createAnalysisRequest(state));
+    state = reducer(state, { type: 'ANALYZE_START', version: 1, requestKey: key });
+    state = reducer(state, { type: 'CANCEL_RUN' });
+    expect(state.draft?.population).toBeUndefined();
+    expect(state.inflightRequestKey).toBeNull();
+    // A subsequent plain run is NOT a population campaign.
+    state = reducer(state, { type: 'RUN_STUDY' });
+    expect(state.draft?.population).toBeUndefined();
+  });
+
+  it('duplicate rapid launches of the SAME drop test do not double-run', () => {
+    let state = readyState();
+    for (let i = 0; i < 5; i += 1) {
+      state = reducer(state, { type: 'RUN_DROP_TEST', test: 'drop', config: dropConfig });
+    }
+    const key = createAnalysisRequestKey(createAnalysisRequest(state));
+    state = reducer(state, { type: 'ANALYZE_START', version: 1, requestKey: key });
+    const nonce = state.runNonce;
+    const before = state;
+    state = reducer(state, { type: 'RUN_DROP_TEST', test: 'drop', config: dropConfig });
+    expect(state).toBe(before);
+    expect(state.runNonce).toBe(nonce);
+  });
+});
+
 describe('projectStore state reducer and selectors', () => {
   it('enforces token stale guard on out-of-order analysis responses', () => {
     let state = reducer(initialState, {

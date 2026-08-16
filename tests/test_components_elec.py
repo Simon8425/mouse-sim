@@ -75,12 +75,42 @@ class BatteryComponentTests(unittest.TestCase):
 
     def test_crush_transmission_pass(self):
         # 0.02 kg * 400 g * 9.81 * 0.5 transmission = 39.2 N < 130 N crush.
+        # A cradle rated for the drop (latch retention >= transmitted cell
+        # inertia) keeps the cell seated.
         result = analyze(
-            {"component_id": "b", "type": "battery", "mass_kg": 0.02},
+            {
+                "component_id": "b",
+                "type": "battery",
+                "mass_kg": 0.02,
+                "latch_retention_n": 40.0,
+            },
             {"drop": {"peak_accel_g": 400.0}},
         )
         self.assertEqual(result["status"], "pass")
         self.assertAlmostEqual(result["metrics"]["transmitted_force_n"], 39.227, places=3)
+
+    def test_latch_dislodgement_fails(self):
+        # F_inertia = m * a_peak * 0.5 = 0.02 * 400 g * 9.81 * 0.5 = 39.2 N
+        # exceeds the 8 N retention hook: BLOCKER-class finding.
+        result = analyze(
+            {"component_id": "b", "type": "battery", "mass_kg": 0.02},
+            {"drop": {"peak_accel_g": 400.0}},
+        )
+        self.assertEqual(result["status"], "fail")
+        self.assertTrue(
+            any(f["code"] == "BATTERY_LATCH_DISLODGED" for f in result["findings"])
+        )
+        self.assertGreater(result["metrics"]["latch_inertia_n"], result["metrics"]["latch_retention_n"])
+
+    def test_latch_margin_at_150g(self):
+        # 150 g is the top of the gaming-mouse design band:
+        # 0.02 * 150 * 9.81 * 0.5 = 14.7 N vs the 8 N hook -> still dislodges.
+        result = analyze(
+            {"component_id": "b", "type": "battery", "mass_kg": 0.02},
+            {"drop": {"peak_accel_g": 150.0}},
+        )
+        self.assertEqual(result["status"], "fail")
+        self.assertTrue(any(f["code"] == "BATTERY_LATCH_DISLODGED" for f in result["findings"]))
 
     def test_crush_fail(self):
         result = analyze(

@@ -25,6 +25,7 @@ import {
   createFeaUniforms,
   updateFeaUniforms,
   feaFieldMaxDamage,
+  impactPulseFor,
   type FeaUniforms,
   type FeaPlateConfig,
 } from './feaStressShader';
@@ -33,11 +34,14 @@ import { createPicker } from './picking';
 import { createOverlayLayer, type OverlaySpec } from './overlays';
 import {
   applyFeaPlateField,
+  buildInstancedBatches,
   createObjectGroup,
   worldBoundsForGeometry,
   disposeObjectGroup,
   applyFeaObjectField,
   objectMeshesFor,
+  syncInstancedPose,
+  type InstancedBatchGroup,
   type ObjectSceneEntry,
 } from './geometryFactory';
 import { disposeObject3D, disposeSceneResources } from './disposal';
@@ -133,6 +137,8 @@ export interface SceneRuntime {
   setTheme: (theme: 'light' | 'dark') => void;
   setQuality: (quality: QualityTier) => void;
   setOverlays: (overlays: OverlaySpec | null) => void;
+  clearOverlays: () => void;
+  setFloorMaterial: (surfaceKey: string | null | undefined) => void;
   setDropSimulation: (simulation: DropSimulationResult | null) => void;
   setDropPlayback: (playing: boolean) => void;
   setPlaybackSpeed: (speed: number) => void;
@@ -419,7 +425,14 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   const updatePixelRatio = () => {
     const dpr = window.devicePixelRatio || 1;
     const maxRatio = quality === 'ultra' ? 2.5 : quality === 'high' ? 2 : 1.5;
-    renderer.setPixelRatio(Math.min(dpr, maxRatio));
+    const ratio = Math.min(dpr, maxRatio);
+    renderer.setPixelRatio(ratio);
+    // The composer must render at the SAME pixel ratio as the canvas or the
+    // post passes (RenderPass/OutlinePass/SMAAPass) render at 1x while the
+    // canvas draws at 2-3x on Retina — a massive fill-rate waste and a
+    // half-resolution image. EffectComposer.setPixelRatio re-sizes its
+    // render targets and calls setSize on every pass.
+    composer?.setPixelRatio(ratio);
   };
   updatePixelRatio();
 
@@ -488,7 +501,8 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   let boundsUnion = { min: [-0.05, -0.05, -0.05] as Vec3, max: [0.05, 0.05, 0.05] as Vec3 };
   let maxDimension = 0.1;
   let floorSize = 2.5;
-  const currentSurfaceMaterial = 'concrete';
+  let currentSurfaceMaterial = 'concrete';
+  let floorSurfaceKey: string | null | undefined = 'concrete';
 
   function getSurfaceMaterialProps(surfaceKey: string | null | undefined, currentTheme: 'light' | 'dark') {
     const key = (surfaceKey || 'concrete').toLowerCase();
@@ -637,6 +651,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
         outer.visible = currentVisibility[id] ?? true;
       }
     }
+    syncInstancedPose(instancedBatches, explodeByObjectId, currentVisibility);
   };
 
   // State variables
@@ -644,6 +659,10 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   let currentVisibility: Record<string, boolean> = {};
   let currentSelectionId: string | null = null;
   let currentDropSimulation: DropSimulationResult | null = null;
+  /** Instanced batches for geometrically identical parts (see buildInstancedBatches). */
+  let instancedBatches: InstancedBatchGroup | null = null;
+  /** Per-object explode translation (objectId → offset), consumed by syncInstancedPose. */
+  const explodeByObjectId = new Map<string, THREE.Vector3>();
   let dropTime = 0;
   let dropPlaying = false;
   let playbackSpeed = 1.0;
@@ -658,6 +677,10 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   let populationFleet: PopulationFleetManager | null = null;
   let isFleetMode = false;
   let fleetTime = 0;
+  // Single loop-duration constant: the render loop wraps fleetTime at this
+  // value AND setFleetPlayback resets at it, so pressing Play after a loop
+  // can never jump the timeline backward (the old 3.2 vs 3.0 mismatch).
+  const FLEET_LOOP_S = 3.2;
   let fleetPlaying = false;
 
   // Telemetry debugger: live collector fed by the Rapier tap.
@@ -676,6 +699,27 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     impactWindow01: 1,
     impactWindowActive: true,
     time: 0,
+    impactPulse: 0,
+    dropTime: 0,
+    impactTime: 0,
+  };
+
+  /**
+   * First impact time of the drop simulation (seconds), or 0 when the
+   * simulation carries no impact record. Mirrors the render-loop impact-time
+   * fallback used by the dent window.
+   */
+  const feaImpactTimeFor = (simulation: DropSimulationResult | null): number => {
+    if (!simulation) return 0;
+    const impacts = simulation.impacts;
+    if (impacts && impacts.length > 0 && typeof impacts[0]?.t_s === 'number') {
+      return impacts[0].t_s;
+    }
+    const first = simulation.drops[0];
+    if (first && typeof first.end_s === 'number' && first.end_s > 0) {
+      return first.end_s * 0.38;
+    }
+    return 0;
   };
 
   /**
@@ -1004,13 +1048,34 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   };
 
   const rebuildObjects = () => {
-    assetLoadGeneration += 1;
+    // Keep the ground slab material in sync with the configured test surface
+    // (floor look follows the drop-test surface selection).
+    currentSurfaceMaterial = floorSurfaceKey ?? 'concrete';
     const generation = assetLoadGeneration;
-    // Clear old objects
+    // Clear old objects.  FEA-decorated clones are cached per old geometry:
+    // drop the cache first so the stale clones are released with their
+    // geometries instead of accumulating GPU programs on every rebuild.
+    feaMaterialCache.clear();
     const oldChildren = [...objectsGroup.children];
     for (const child of oldChildren) {
       disposeObjectGroup(child);
     }
+    if (instancedBatches) {
+      for (const child of [...instancedBatches.group.children]) {
+        disposeObjectGroup(child);
+      }
+      instancedBatches = null;
+    }
+    explodeByObjectId.clear();
+
+    // Instancing is mutually exclusive with FEA decoration: per-vertex
+    // attributes (aDamage/aDisplacement) are per-geometry, not per-instance,
+    // so batching parts that receive per-object FEA fields would show the
+    // first object's field on every copy. Batches are rebuilt when the mode
+    // or result crosses the FEA boundary.
+    const allowInstancing = currentRenderMode === 'default' && !currentFeaResult?.computed;
+    const instancedParts: { entry: ObjectSceneEntry; matrix: THREE.Matrix4 }[] = [];
+    const batchMatrix = new THREE.Matrix4();
 
     let minX = Infinity, minY = Infinity, minZ = Infinity;
     let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
@@ -1039,8 +1104,43 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
         maxZ = Math.max(maxZ, bounds.max[2]);
       }
 
+      // Batch the part instead of rendering it as its own mesh when it is
+      // eligible: no GLB asset, no CAD color, no compound, geometry renders,
+      // and FEA is inactive. The inner group's baked transform becomes the
+      // per-instance matrix; the outer group stays as the identity transform
+      // shell so explode/selection bookkeeping is unchanged.
+      if (
+        allowInstancing &&
+        !entry.displayAssetUrl &&
+        !entry.color &&
+        entry.geometry.type !== 'compound'
+      ) {
+        batchMatrix.copy(innerGroup.matrix);
+        instancedParts.push({ entry, matrix: batchMatrix });
+        continue;
+      }
+
       objectsGroup.add(outerGroup);
       loadDisplayAsset(entry, innerGroup, outerGroup, generation);
+    }
+
+    if (instancedParts.length > 0) {
+      instancedBatches = buildInstancedBatches(instancedParts, {
+        quality: quality === 'ultra' ? 'high' : quality,
+        materials: palette.getAll(),
+      });
+      objectsGroup.add(instancedBatches.group);
+      // Instanced parts keep an invisible outer shell so applyExplode's
+      // setFromObject bounds and the picker's id walk keep working.
+      for (const { entry, matrix } of instancedParts) {
+        const shell = new THREE.Group();
+        shell.userData.objectId = entry.id;
+        shell.userData.instanced = true;
+        shell.matrixAutoUpdate = false;
+        shell.matrix.copy(matrix);
+        shell.visible = true;
+        objectsGroup.add(shell);
+      }
     }
 
     applyVisibility();
@@ -1076,6 +1176,8 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       for (const outer of objectsGroup.children) {
         outer.position.set(0, 0, 0);
       }
+      explodeByObjectId.clear();
+      syncInstancedPose(instancedBatches, explodeByObjectId, currentVisibility);
       return;
     }
 
@@ -1175,7 +1277,10 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       }
     }
 
-    // 3. Apply positions with smooth staggered easing
+    // 3. Apply positions with smooth staggered easing. Instanced parts get
+    // their explode translation recorded into explodeByObjectId (the outer
+    // shell position stays zero) and the batch matrices are rewritten once.
+    explodeByObjectId.clear();
     for (let i = 0; i < count; i++) {
       const { outer, targetPos, rankRatio } = targets[i];
       const staggerDelay = (1.0 - rankRatio) * 0.35;
@@ -1185,12 +1290,16 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       );
       const easedFactor = rawPartFactor * rawPartFactor * (3 - 2 * rawPartFactor);
 
-      outer.position.set(
-        targetPos[0] * easedFactor,
-        targetPos[1] * easedFactor,
-        targetPos[2] * easedFactor,
-      );
+      const tx = targetPos[0] * easedFactor;
+      const ty = targetPos[1] * easedFactor;
+      const tz = targetPos[2] * easedFactor;
+      if (outer.userData.instanced) {
+        explodeByObjectId.set(outer.userData.objectId as string, new THREE.Vector3(tx, ty, tz));
+      } else {
+        outer.position.set(tx, ty, tz);
+      }
     }
+    syncInstancedPose(instancedBatches, explodeByObjectId, currentVisibility);
   };
 
   const selectedMeshesCache: THREE.Mesh[] = [];
@@ -1222,6 +1331,9 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
           mat.emissive.setHex(originalEmissiveMap.get(mat)!);
         }
       }
+      // Instanced batches must never join the highlight/outline path: the
+      // whole batch would be outlined. Their per-part shells carry the id.
+      if (obj.userData?.instanced) return;
 
       let curr: THREE.Object3D | null = obj;
       let objId: string | null = null;
@@ -1356,7 +1468,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       lastFrameTime = now;
       if (fleetPlaying) {
         fleetTime += delta;
-        if (fleetTime >= 3.2) {
+        if (fleetTime >= FLEET_LOOP_S) {
           fleetTime = 0;
         }
       }
@@ -1401,21 +1513,27 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       const windowS = currentFeaResult?.impact_window_s ?? 0.3;
       let window01 = 1;
       let active = false;
+      let impactPulse = 0;
+      let impactTime = 0;
       if (currentDropSimulation) {
         const total = currentDropSimulation.trajectory[currentDropSimulation.trajectory.length - 1]?.[0] ?? 1.5;
         if (dropPlaying || dropTime < total) {
           active = true;
-          const impactTime =
-            currentDropSimulation.impacts?.[0]?.t_s ??
-            (currentDropSimulation.drops?.[0]?.end_s
-              ? currentDropSimulation.drops[0].end_s * 0.38
-              : 0.38);
+          const impactTimeCandidates = currentDropSimulation.impacts?.[0]?.t_s;
+          impactTime =
+            typeof impactTimeCandidates === 'number'
+              ? impactTimeCandidates
+              : feaImpactTimeFor(currentDropSimulation);
           window01 = impactWindowProgress(dropTime, impactTime, windowS > 0 ? windowS : 0.3);
+          impactPulse = impactPulseFor(dropTime, impactTime, windowS > 0 ? windowS : 0.3);
         }
       }
       feaFrameOpts.mode = currentRenderMode;
       feaFrameOpts.impactWindow01 = window01;
       feaFrameOpts.impactWindowActive = active;
+      feaFrameOpts.impactPulse = impactPulse;
+      feaFrameOpts.dropTime = dropTime;
+      feaFrameOpts.impactTime = impactTime;
       feaFrameOpts.time = currentDropSimulation && !dropPlaying ? 0 : performance.now() / 1000;
       for (const pair of feaDecorated) {
         updateFeaUniforms(pair.uniforms, feaFrameOpts);
@@ -1525,9 +1643,38 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       rebuildObjects();
     },
 
+    setFloorMaterial(surfaceKey: string | null | undefined) {
+      if (disposed) return;
+      const next = (surfaceKey || 'concrete').toLowerCase();
+      if (next === currentSurfaceMaterial) return;
+      floorSurfaceKey = next;
+      currentSurfaceMaterial = next;
+      if (groundMesh) {
+        // Dispose the previous slab material — setFloorMaterial is called on
+        // every surface change and used to leak one GPU program per swap.
+        const previous = groundMesh.material;
+        const props = getSurfaceMaterialProps(next, theme);
+        groundMesh.material = new THREE.MeshStandardMaterial({
+          color: new THREE.Color(props.color),
+          roughness: props.roughness,
+          metalness: props.metalness,
+        });
+        (groundMesh.material as THREE.MeshStandardMaterial).userData.owned = true;
+        const previousMat = Array.isArray(previous) ? previous[0] : previous;
+        if (previousMat && (previousMat as unknown as { userData?: { owned?: boolean } }).userData?.owned) {
+          previousMat.dispose();
+        }
+      }
+    },
+
     setOverlays(spec: OverlaySpec | null) {
       if (disposed) return;
       overlayLayer.apply(spec);
+    },
+
+    clearOverlays() {
+      if (disposed) return;
+      overlayLayer.clear();
     },
 
     setDropSimulation(simulation: DropSimulationResult | null) {
@@ -1772,6 +1919,11 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
           }
         }
         feaDecorated.length = 0;
+        // Leaving FEA mode re-enables instancing: rebuild so the batches
+        // replace the per-part meshes.
+        if (currentFeaResult?.computed) {
+          rebuildObjects();
+        }
       } else {
         if (feaDecorated.length > 0) {
           const targetVal = mode === 'yield' ? 1 : 0;
@@ -1779,6 +1931,12 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
             pair.uniforms.uFeaMode.value = targetVal;
           }
         } else {
+          // Entering FEA mode disables instancing: rebuild first so every
+          // part exists as an individual mesh to decorate.
+          if (instancedBatches) {
+            rebuildObjects();
+            return;
+          }
           applyModeDecoration();
         }
       }
@@ -1789,7 +1947,10 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       currentFeaResult = fea;
       feaMaterialCache.clear();
       if (currentRenderMode !== 'default') {
-        applyModeDecoration();
+        // A new FEA result may flip the batching boundary (a null result
+        // re-enables instancing; a computed result disables it). Rebuild so
+        // the mesh/batch layout matches the decoration pass.
+        rebuildObjects();
       }
     },
 
@@ -1827,7 +1988,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     setFleetPlayback(playing: boolean) {
       if (disposed) return;
       fleetPlaying = playing;
-      if (playing && fleetTime >= 3.0) {
+      if (playing && fleetTime >= FLEET_LOOP_S) {
         fleetTime = 0;
       }
     },
@@ -1927,6 +2088,13 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       for (const child of oldChildren) {
         disposeObjectGroup(child);
       }
+      if (instancedBatches) {
+        for (const child of [...instancedBatches.group.children]) {
+          disposeObjectGroup(child);
+        }
+        instancedBatches = null;
+      }
+      explodeByObjectId.clear();
       disposeSceneResources(scene);
       renderer.dispose();
       canvas.removeEventListener('webglcontextlost', handleContextLost);

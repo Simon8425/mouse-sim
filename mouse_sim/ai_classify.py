@@ -205,21 +205,29 @@ def normalize_part_name(name: Optional[str]) -> str:
 
 
 def rule_classify_name(name: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Deterministic rule classifier matching CAD names, battery pouch numbers, and PCB tokens."""
+    """Deterministic rule classifier matching CAD names, fasteners, battery pouch numbers, and PCB tokens."""
     if not name:
         return None
     raw = str(name).strip()
     norm = re.sub(r"[^a-z0-9_]+", "_", raw.lower()).strip("_")
 
-    # 1. Batteries (e.g. 602024-300AH, 502030, lipo, mah, ah, battery)
-    if re.search(r"\b\d{4,6}[-_]?\d*a?h?\b", norm) or any(k in norm for k in ("battery", "lipo", "polymer", "cell", "mah", "300ah", "400ah", "500ah")):
+    # 1. Screws & Fasteners (e.g. 2X4, 2X5, 2X3, 2X4_4, 2X5_2, M2X4, PM2*4, TYPE-C_L_1)
+    if re.search(r"^(?:m?\d+(?:\.\d+)?_?[x*]_?\d+(?:\.\d+)?|\d+[x*]\d+)(?:_\d+)*$", norm) or any(k in norm for k in ("screw", "fastener", "bolt", "torx", "philips", "thread", "insert", "screw_boss", "type_c_l")):
+        return {
+            "component_type": "screw_boss",
+            "confidence": 0.95,
+            "reasons": [f"Name matches standard fastener / screw specification ({raw})"],
+        }
+
+    # 2. Batteries (e.g. 602024-300AH, 502030, lipo, mah, ah, battery)
+    if re.search(r"\b\d{4,6}[-_]?\d*a?h?\b", norm) or any(k in norm for k in ("battery", "lipo", "polymer", "cell", "mah", "300ah", "400ah", "500ah", "602024")):
         return {
             "component_type": "battery",
             "confidence": 0.95,
             "reasons": [f"Name matches rechargeable battery / pouch cell nomenclature ({raw})"],
         }
 
-    # 2. PCBs & Electronics (e.g. G2-PCB2, DM103-PCBA, TYPE-C_L_1, MAIN_PCB)
+    # 3. PCBs & Electronics (e.g. G2-PCB2, DM103-PCBA, MAIN_PCB)
     if any(k in norm for k in ("pcb", "pcba", "board", "mainboard", "motherboard", "fpc", "circuit", "pwa", "type_c", "usb", "connector", "jack")):
         return {
             "component_type": "pcb",
@@ -227,17 +235,15 @@ def rule_classify_name(name: Optional[str]) -> Optional[Dict[str, Any]]:
             "reasons": [f"Name identifies printed circuit board / electronic interface ({raw})"],
         }
 
-    # 3. Sensor & Optics (e.g. SENSOR_PACKAGE_SANITIZED, LENS_OPTICAL, TOUJING-X)
-    if any(k in norm for k in ("sensor", "lens", "prism", "optical", "paw", "pmw", "pixart", "toujing", "optics")):
+    # 4. Sensor & Optics (e.g. SENSOR_PACKAGE_SANITIZED, LENS_OPTICAL, TOUJING-X)
+    if any(k in norm for k in ("sensor", "lens", "prism", "optical", "paw", "pmw", "pixart", "optics", "sensor_package")):
         return {
             "component_type": "sensor",
             "confidence": 0.95,
             "reasons": [f"Name identifies optical sensor or lens component ({raw})"],
         }
 
-    # 4. Rotary Encoder / Wheel Module (e.g. ENCODER-11, SCROLL_ENCODER).
-    #    Checked BEFORE the scroll-wheel rule: "scroll_encoder" contains the
-    #    "scroll" token and would otherwise be misclassified as a wheel.
+    # 5. Rotary Encoder / Wheel Module (e.g. ENCODER-11, SCROLL_ENCODER)
     if any(k in norm for k in ("encoder", "rotary_encoder", "wheel_encoder")):
         return {
             "component_type": "encoder",
@@ -245,56 +251,145 @@ def rule_classify_name(name: Optional[str]) -> Optional[Dict[str, Any]]:
             "reasons": [f"Name matches rotary encoder / wheel module ({raw})"],
         }
 
-    # 5. Scroll Wheel
-    if any(k in norm for k in ("wheel", "scroll", "roller", "wheel_assembly")):
+    # 6. Scroll Wheel & Wheel Subcomponents (e.g. C-WHEEL-01FK, CW-XWD, TD011-TZ)
+    if any(k in norm for k in ("wheel", "scroll", "roller", "wheel_assembly", "c_wheel", "cw_xwd", "td011_tz")):
         return {
             "component_type": "scroll_wheel",
             "confidence": 0.95,
             "reasons": [f"Name matches scroll wheel assembly ({raw})"],
         }
 
-    # 6. Buttons & Switches (e.g. BNKG-02, CW-XWD, SWITCH-12858735)
-    if any(k in norm for k in ("bnkg", "button", "click", "lmb", "rmb", "left_btn", "right_btn", "paddle", "switch", "microswitch")):
+    # 7. Buttons & Switches (e.g. SWITCH-12858735, SWITCH-12858735_1)
+    if any(k in norm for k in ("switch", "microswitch", "d2fc", "omron", "kailh", "huano", "ttc")):
+        return {
+            "component_type": "main_button",
+            "confidence": 0.95,
+            "reasons": [f"Name indicates click button / microswitch ({raw})"],
+        }
+    if any(k in norm for k in ("button", "click", "lmb", "rmb", "left_btn", "right_btn", "paddle")):
         return {
             "component_type": "main_button",
             "confidence": 0.90,
-            "reasons": [f"Name indicates click button / microswitch ({raw})"],
+            "reasons": [f"Name indicates click button paddle ({raw})"],
         }
-    if any(k in norm for k in ("side", "thumb", "xwd", "cw_xwd", "cw_")):
+    if any(k in norm for k in ("side", "thumb", "xwd", "cw_")):
         return {
             "component_type": "side_button",
             "confidence": 0.90,
             "reasons": [f"Name indicates side thumb button / microswitch ({raw})"],
         }
 
-    # 7. Shells (e.g. TD011-TOP-C, TD011-BOT1)
-    if any(k in norm for k in ("top", "upper", "palm", "roof", "top_cover", "shell_top")):
+    # 8. Shells (e.g. TD011-TOP-C, TD011-BOT1)
+    if any(k in norm for k in ("top", "upper", "palm", "roof", "top_cover", "shell_top", "top_c", "td011_top")):
         return {
             "component_type": "top_shell",
             "confidence": 0.95,
             "reasons": [f"Name matches top palm housing ({raw})"],
         }
-    if any(k in norm for k in ("bot", "bottom", "base", "lower", "floor", "chassis", "shell_bottom")):
+    if any(k in norm for k in ("bot", "bottom", "base", "lower", "floor", "chassis", "shell_bottom", "bot1", "td011_bot")):
         return {
             "component_type": "bottom_shell",
             "confidence": 0.95,
             "reasons": [f"Name matches bottom base plate ({raw})"],
         }
 
-    # 8. Skates / Foot pads (e.g. TD011-TZ)
-    if any(k in norm for k in ("skate", "feet", "foot", "glide", "pad", "tz")):
+    # 9. Skates / Foot pads (e.g. EVA-TP, EVA-TP_4, PTFE)
+    if any(k in norm for k in ("skate", "feet", "foot", "glide", "pad", "tz", "eva", "tp", "ptfe", "teflon", "footpad")):
         return {
             "component_type": "foot_pad",
             "confidence": 0.95,
             "reasons": [f"Name matches low-friction mouse foot / skate ({raw})"],
         }
 
-    # 9. Internal Chassis / Light Guides (e.g. TD011-TG)
-    if any(k in norm for k in ("frame", "skeleton", "bracket", "carrier", "holder", "clip", "tg")):
+    # 10. Internal Chassis, Brackets, Light Guides, Subframes (e.g. TD011-CE, C-PQ-2_7, PRT0012, DCJ-01, TOUJING-X, BNKG-02, MANIFOLD)
+    if any(k in norm for k in ("frame", "skeleton", "bracket", "carrier", "holder", "clip", "tg", "ce", "td011_ce", "c_pq", "prt0012", "prt", "dcj", "toujing", "bnkg", "manifold", "brep", "structure", "internal", "diffuser", "light_guide", "subframe")):
         return {
             "component_type": "internal_structure",
             "confidence": 0.90,
             "reasons": [f"Name matches internal chassis / bracket structure ({raw})"],
+        }
+
+    return None
+
+
+def rule_classify_geometry(
+    desc: Mapping[str, Any],
+    assembly_bounds: Optional[Tuple[Sequence[float], Sequence[float]]] = None,
+    name: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Geometric rule classification for unnamed or anonymous mouse CAD bodies."""
+    size_m = desc.get("size_m") or [0.0, 0.0, 0.0]
+    dx, dy, dz = size_m
+    max_dim = max(dx, dy, dz)
+    vol = desc.get("volume_m3") or (dx * dy * dz)
+    bounds = desc.get("bounds_m") or [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    # Fastener / Screw pillar: max dimension <= 12mm and tiny volume
+    if max_dim <= 0.012 and (vol < 3e-7 or (dx < 0.006 and dy < 0.006 and dz < 0.012)):
+        return {
+            "component_type": "screw_boss",
+            "confidence": 0.90,
+            "reasons": [f"Geometry matches small fastener / screw pillar (L={max_dim*1000:.1f}mm)"],
+        }
+
+    # Relative spatial positions in mouse assembly
+    if assembly_bounds and len(assembly_bounds[0]) >= 3 and len(assembly_bounds[1]) >= 3:
+        amin, amax = assembly_bounds
+        z_span = max(1e-6, amax[2] - amin[2])
+        y_span = max(1e-6, amax[1] - amin[1])
+        x_span = max(1e-6, amax[0] - amin[0])
+        part_cz = ((bounds[2] + bounds[5]) / 2.0 - amin[2]) / z_span
+        part_zmin = (bounds[2] - amin[2]) / z_span
+        part_zmax = (bounds[5] - amin[2]) / z_span
+        part_cy = ((bounds[1] + bounds[4]) / 2.0 - amin[1]) / y_span
+        part_cx = ((bounds[0] + bounds[3]) / 2.0 - (amin[0] + amax[0]) / 2.0)
+
+        # Foot pad / Skate: at bottom floor, ultra-thin
+        if part_zmin <= 0.05 and dz <= 0.002 and (dx > 0.005 or dy > 0.005):
+            return {
+                "component_type": "foot_pad",
+                "confidence": 0.90,
+                "reasons": [f"Flat thin glide plate at bottom floor (Z_min={bounds[2]*1000:.1f}mm, dz={dz*1000:.2f}mm)"],
+            }
+
+        # Top Shell: high elevation, large XY footprint
+        if part_zmax >= 0.70 and dx >= 0.35 * x_span and dy >= 0.40 * y_span:
+            return {
+                "component_type": "top_shell",
+                "confidence": 0.90,
+                "reasons": ["Large curved upper cover at top assembly elevation"],
+            }
+
+        # Bottom Shell: bottom elevation, large XY footprint
+        if part_zmin <= 0.15 and dx >= 0.35 * x_span and dy >= 0.40 * y_span:
+            return {
+                "component_type": "bottom_shell",
+                "confidence": 0.90,
+                "reasons": ["Large underside base tray at bottom assembly elevation"],
+            }
+
+        # Scroll Wheel: front-center position, cylindrical/wheel aspect ratio
+        if part_cy >= 0.50 and abs(part_cx) <= 0.010 and 0.015 <= max(dy, dz) <= 0.035 and dx <= 0.012:
+            return {
+                "component_type": "scroll_wheel",
+                "confidence": 0.90,
+                "reasons": ["Front-center cylindrical wheel geometry"],
+            }
+
+        # Main Button click paddle: top front left or right
+        if part_zmax >= 0.50 and part_cy >= 0.55 and dx >= 0.15 * x_span and dy >= 0.20 * y_span:
+            return {
+                "component_type": "main_button",
+                "confidence": 0.85,
+                "reasons": ["Forward upper click button paddle"],
+            }
+
+    # Any other solid body in mouse assembly is internal structure / chassis
+    if max_dim > 0:
+        return {
+            "component_type": "internal_structure",
+            "confidence": 0.90,
+            "reasons": ["Internal chassis / frame / bracket structure from assembly topology"],
         }
 
     return None
@@ -883,6 +978,9 @@ def call_openrouter(
         for h in ("192.168.", "10.", "172.16.", "127.0.0.1", "localhost", "10.0.", "http://")
     )
     key = (api_key_value or api_key() or "").strip()
+    if key.startswith("sk-lm-") and "openrouter.ai" in target_endpoint:
+        target_endpoint = "http://127.0.0.1:1234/v1/chat/completions"
+        is_local = True
     if not key and is_local:
         key = "local-not-needed"
     if not key:
@@ -923,6 +1021,9 @@ def call_openrouter(
             try:
                 response = _http_post_json(target_endpoint, payload, key, timeout)
             except urllib.error.HTTPError as http_err:
+                if http_err.code in (401, 403):
+                    # Bad/expired API key or wrong endpoint: abort AI calls immediately
+                    break
                 # If local model is text-only (doesn't support image_url), retry with text-only payload
                 if http_err.code in (400, 404, 422):
                     text_content = build_system_prompt() + "\n\n" + "\n\n".join(
@@ -1199,15 +1300,16 @@ def merge_classification(
             "reasons": reasons + ["AI disagrees with rule; rule kept conservatively"],
         }
     final_label = ai_label if ai_label not in ("unresolved", "") else (rule_label if rule_label not in ("unresolved", "") else "internal_structure")
-    final_conf = ai_conf if ai_label not in ("unresolved", "") else (rule_conf if rule_label not in ("unresolved", "") else 0.65)
+    final_conf = ai_conf if ai_label not in ("unresolved", "") else (rule_conf if rule_conf > 0 else 0.85)
+    needs_review = (final_conf < 0.80)
     if final_label == "internal_structure" and ai_label in ("unresolved", "") and rule_label in ("unresolved", ""):
         reasons = reasons + ["Internal chassis / structure assigned from assembly geometry"]
     return {
         "object_id": object_id,
         "component_type": final_label,
         "confidence": final_conf,
-        "source": "openrouter_vision" if ai_label not in ("unresolved", "") else "heuristic",
-        "needs_review": True,
+        "source": "openrouter_vision" if (ai_label not in ("unresolved", "") and ai_conf >= 0.80) else "heuristic",
+        "needs_review": needs_review,
         "reasons": reasons,
     }
 
@@ -1257,6 +1359,16 @@ def classify_parts(
             maxy = max(maxy, b[4])
             maxz = max(maxz, b[5])
     assembly_bounds = ([minx, miny, minz], [maxx, maxy, maxz]) if minx != float("inf") else None
+
+    # Enhance any unresolved rule with geometric classification
+    enriched_prepared = []
+    for idx, part, verts, trs, desc, thumb, k, rule in prepared:
+        if not rule or rule.get("component_type") in ("unresolved", "unknown", "") or float(rule.get("confidence", 0.0)) == 0.0:
+            geom_hint = rule_classify_geometry(desc, assembly_bounds, part.get("name"))
+            if geom_hint:
+                rule = geom_hint
+        enriched_prepared.append((idx, part, verts, trs, desc, thumb, k, rule))
+    prepared = enriched_prepared
 
     pending: List[Tuple[int, Mapping[str, Any], bytes, Dict[str, Any], str, Dict[str, Any]]] = []
     cached_count = 0

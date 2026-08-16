@@ -145,6 +145,15 @@ FEA_TRANSFORM_ASSUMED_IDENTITY = "FEA_TRANSFORM_ASSUMED_IDENTITY"
 FEA_NO_MESHED_OBJECTS = "FEA_NO_MESHED_OBJECTS"
 FEA_NON_FINITE_VERTEX = "FEA_NON_FINITE_VERTEX"
 FEA_STRUCTURAL_VALIDITY_INCONCLUSIVE = "FEA_STRUCTURAL_VALIDITY_INCONCLUSIVE"
+# The shell peak stress was derived from the drop/impact peak FORCE via the
+# documented screening heuristic sigma = F * 18000 Pa/N clamped to
+# [15 MPa, 85 MPa] (no structural shell solve ran): disclosed, never silent.
+FEA_STRESS_FROM_FORCE_HEURISTIC = "FEA_STRESS_FROM_FORCE_HEURISTIC"
+_STRESS_FROM_FORCE_HEURISTIC_TEXT = (
+    "peak stress derived from the impact peak force via the screening "
+    "heuristic sigma = F * 18000 Pa/N clamped to [15 MPa, 85 MPa] "
+    "(no structural shell solve; display-only approximation)"
+)
 # The plate display field could not be derived from the structural section
 # (no uniform-pressure shell panel: missing panel structure/load/material
 # data, a beam case, or a point load) — the impact Gaussian is used for the
@@ -212,7 +221,14 @@ def _failed_payload(flag, assumptions=()):
 
 
 def _shell_peak_stress_pa(result):
-    """Authoritative peak stress from the shell result or drop simulation (or None)."""
+    """Authoritative peak stress from the shell result or drop simulation.
+
+    Returns ``(value, from_force_heuristic)``: the second element is True
+    when the stress was derived from the drop/impact peak force via the
+    documented screening heuristic ``sigma = F * 18000 Pa/N`` clamped to
+    [15 MPa, 85 MPa] (no structural shell solve ran) — the caller must
+    disclose it via ``FEA_STRESS_FROM_FORCE_HEURISTIC``.
+    """
     shell = result.get("shell")
     if isinstance(shell, Mapping):
         value = shell.get("peak_stress_pa")
@@ -220,7 +236,7 @@ def _shell_peak_stress_pa(result):
             try:
                 value = float(value)
                 if math.isfinite(value) and value > 0.0:
-                    return value
+                    return value, False
             except (TypeError, ValueError):
                 pass
     # Fallback to drop simulation impact force
@@ -233,7 +249,7 @@ def _shell_peak_stress_pa(result):
                 if math.isfinite(f) and f > 0.0:
                     # Dynamic bending stress on shell plate: sigma = min(85 MPa, max(15 MPa, F * 18000))
                     stress = min(85000000.0, max(15000000.0, f * 18000.0))
-                    return stress
+                    return stress, True
             except (TypeError, ValueError):
                 pass
     impact = result.get("impact")
@@ -244,10 +260,10 @@ def _shell_peak_stress_pa(result):
                 f = float(peak_force)
                 if math.isfinite(f) and f > 0.0:
                     stress = min(85000000.0, max(15000000.0, f * 18000.0))
-                    return stress
+                    return stress, True
             except (TypeError, ValueError):
                 pass
-    return None
+    return None, False
 
 
 def _shell_safety_factor(result):
@@ -317,8 +333,77 @@ def _material_yield_pa(result):
         if shell.get("status") != "not_evaluated" and shell.get("peak_stress_pa") is not None:
             return None, None
 
-    # If drop simulation ran without a structural shell solve, use default engineering reference: 40 MPa
+    # Audit fix (FEA yield reference): when a drop/impact ran WITHOUT a
+    # structural shell solve, the old code returned the hardcoded 40 MPa
+    # ABS-class default for EVERY material — 10-100x wrong for a LiPo
+    # battery pack (5 MPa) or a steel screw (250 MPa), which mis-scaled
+    # the whole damage field.  Read the resolved material's yield/
+    # allowable from the structural section first (the same payload
+    # ``_plate_constants`` consumes); the 40 MPa engineering default is
+    # now the LAST resort and is always disclosed via the basis.
     if result.get("drop_simulation") is not None or result.get("impact") is not None:
+        structural = result.get("structural")
+        resolved = None
+        if isinstance(structural, Mapping):
+            resolved = structural.get("resolved_material")
+        if resolved is not None:
+            from . import physics as physics_module
+
+            # Dataclass payloads: read the yield/allowable properties
+            # directly (SI Quantity.value_si).
+            if isinstance(
+                resolved,
+                (physics_module.MaterialDefinition, physics_module.MaterialProperties),
+            ):
+                properties = (
+                    resolved.properties
+                    if isinstance(resolved, physics_module.MaterialDefinition)
+                    else resolved
+                )
+                for attr, basis in (
+                    ("tensile_allowable", "material_allowable"),
+                    ("yield_strength", "material_yield"),
+                ):
+                    quantity = getattr(properties, attr, None)
+                    value = getattr(quantity, "value_si", None)
+                    if value is not None:
+                        try:
+                            value = float(value)
+                        except (TypeError, ValueError):
+                            continue
+                        if math.isfinite(value) and value > 0.0:
+                            return value, basis
+            # Mapping payloads: physics._material_props gives the derated
+            # tensile allowable; the flat keys may also carry the yield.
+            elif isinstance(resolved, Mapping):
+                try:
+                    _e, _nu, allowable, _info = physics_module._material_props(resolved, None)
+                except Exception:
+                    allowable = None
+                for key, basis in (
+                    ("derated_tensile_allowable_pa", "material_allowable"),
+                    ("tensile_allowable_pa", "material_allowable_underated"),
+                    ("tensile_allowable", "material_allowable_underated"),
+                    ("yield_strength", "material_yield"),
+                ):
+                    value = resolved.get(key)
+                    if value is None:
+                        continue
+                    if isinstance(value, Mapping):
+                        value = value.get("value_si", value.get("value"))
+                    try:
+                        value = float(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(value) and value > 0.0:
+                        return value, basis
+                if allowable is not None:
+                    try:
+                        allowable = float(allowable)
+                    except (TypeError, ValueError):
+                        allowable = None
+                    if allowable is not None and math.isfinite(allowable) and allowable > 0.0:
+                        return allowable, "material_allowable"
         return 40000000.0, "default_material_yield"
 
     return None, None
@@ -834,9 +919,12 @@ def _compute_fea(result, geometry_objs):
     assumptions = [_GAUSSIAN_MODEL_DESCRIPTION_ASSUMPTION]
     flags = []
 
-    sigma_peak = _shell_peak_stress_pa(result)
+    sigma_peak, stress_from_force = _shell_peak_stress_pa(result)
     if sigma_peak is None or sigma_peak <= 0.0:
         return _failed_payload(FEA_PEAK_STRESS_UNAVAILABLE, assumptions)
+    if stress_from_force:
+        flags.append(FEA_STRESS_FROM_FORCE_HEURISTIC)
+        assumptions.append(_STRESS_FROM_FORCE_HEURISTIC_TEXT)
 
     # Honesty: the stress field inherits the structural solve's validity.  An
     # inconclusive solve (e.g. THIN_SHELL_OUT_OF_RANGE) is still visualized,

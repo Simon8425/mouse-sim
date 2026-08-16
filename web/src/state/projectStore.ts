@@ -146,6 +146,8 @@ export type ProjectAction =
   | { type: 'CANCEL_RUN' }
   | { type: 'SET_THEME'; theme: 'light' | 'dark' }
   | { type: 'UPDATE_DRAFT'; patch: Partial<PipelineRequest> }
+  | { type: 'SET_FLOOR'; surface: 'concrete' | 'wood' | 'foam' | 'steel' }
+  | { type: 'SET_DROP_TEST_CONFIG'; patch: Record<string, unknown> }
   | {
       type: 'RUN_DROP_TEST';
       test: 'drop' | 'impact' | 'tumble' | 'population';
@@ -509,6 +511,29 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
     }
     case 'CONSUME_SKIP_AUTO_RUN':
       return { ...state, skipAutoRun: false };
+    case 'SET_FLOOR':
+      if (state.draft?.drop_simulation) {
+        return {
+          ...state,
+          draft: {
+            ...state.draft,
+            drop_simulation: { ...state.draft.drop_simulation, surface: action.surface },
+          },
+        };
+      }
+      return state;
+    case 'SET_DROP_TEST_CONFIG': {
+      if (state.draft?.drop_simulation) {
+        return {
+          ...state,
+          draft: {
+            ...state.draft,
+            drop_simulation: { ...state.draft.drop_simulation, ...action.patch },
+          },
+        };
+      }
+      return state;
+    }
     case 'RUN_DROP_TEST': {
       const base: PipelineRequest = state.draft ?? state.project ?? {};
       const config: Record<string, unknown> = {

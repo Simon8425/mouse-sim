@@ -38,6 +38,10 @@ export const FEA_TEAR_THRESHOLD = 0.92;
 export const FEA_GRADIENT_END = 0.9;
 /** Width of the plastic dent boost ramp (1 + 2·(D−0.7)/0.3), fixed by the backend. */
 export const FEA_PLASTIC_RAMP = 0.3;
+/** Plastic amplification cap, mirroring the backend PLASTIC_AMPLIFICATION_MAX. */
+export const FEA_PLASTIC_AMPLIFICATION_MAX = 3.0;
+/** Dent depth cap (× compression), mirroring the backend DENT_DEPTH_CAP_FACTOR. */
+export const FEA_DENT_DEPTH_CAP = 1.5;
 /** Peak whitening amplitude (fraction of material color toward white). */
 export const FEA_WHITENING_AMPLITUDE = 0.45;
 
@@ -89,11 +93,82 @@ export function damageForDistance(distanceM: number, falloffRadiusM: number, pea
 
 /**
  * Pure helper mirroring the backend plastic dent boost: 0 below the dent
- * threshold, else 1 + 2·(D − 0.7)/0.3, capped at 1.5.
+ * threshold, else 1 + 2·(D − 0.7)/0.3, capped at 3.0 (the backend
+ * PLASTIC_AMPLIFICATION_MAX — the shader previously capped at 1.5, HALF
+ * the backend value, under-denting the procedural path).
  */
 export function dentFactorFor(damage: number): number {
   if (damage < FEA_DENT_THRESHOLD) return 0;
-  return Math.min(1.5, 1 + 2 * ((damage - FEA_DENT_THRESHOLD) / FEA_PLASTIC_RAMP));
+  return Math.min(FEA_PLASTIC_AMPLIFICATION_MAX, 1 + 2 * ((damage - FEA_DENT_THRESHOLD) / FEA_PLASTIC_RAMP));
+}
+
+/**
+ * Dent depth factor mirroring the backend depth cap: the depth is
+ * delta_max · gaussian · amplification capped at DENT_DEPTH_CAP_FACTOR ·
+ * delta_max, i.e. depth_factor = min(1.5, gaussian · amplification). The
+ * cap applies to the COMBINED gaussian·amplification product, never to the
+ * amplification alone (a vertex at gauss = 0.8 with amp = 3.0 dents
+ * 1.5·delta_max, not 0.8·1.5·delta_max).
+ */
+export function dentDepthFactorFor(gaussian: number, damage: number): number {
+  if (!Number.isFinite(gaussian) || gaussian <= 0) return 0;
+  return Math.min(FEA_DENT_DEPTH_CAP, gaussian * dentFactorFor(damage));
+}
+
+/**
+ * Impact pulse envelope driving the dynamic heatmap surge and the
+ * crack-striation flicker: 0 before the impact time, 1 at the moment of
+ * impact, then exponential decay (≈ 1/e every 1/6 s). Each drop's impact
+ * re-triggers its own pulse, so the visualization animates across playback
+ * frames and impacts.
+ */
+export function impactPulseFor(dropTime: number, impactTime: number, windowS: number): number {
+  void windowS; // retained for API stability; the decay is window-independent
+  if (!Number.isFinite(dropTime) || !Number.isFinite(impactTime)) return 0;
+  const since = dropTime - impactTime;
+  if (since < 0) return 0;
+  // Peak AT the moment of impact, decaying over ~1/6 s (≈ 1/e per 1/6 s).
+  return Math.max(0, Math.min(1, Math.exp(-since * 6)));
+}
+
+/**
+ * Normalized yield threshold: where the backend dent threshold (true
+ * damage) sits on the auto-normalized visual ramp (feaDamageVis ∈ [0, 1]).
+ * A field whose peak never reaches the dent threshold clamps to 1, so the
+ * yield mask honestly stays off for safe runs.
+ */
+export function yieldNormFor(fieldMaxDamage: number, dentThreshold: number): number {
+  if (!Number.isFinite(fieldMaxDamage) || fieldMaxDamage <= 0) return 0;
+  if (!Number.isFinite(dentThreshold) || dentThreshold <= 0) return 1;
+  return Math.min(1, Math.max(0, dentThreshold / fieldMaxDamage));
+}
+
+/**
+ * Yield mask: 0 below the (normalized) yield level, ramping to 1 at the
+ * field peak. Mirrors the GLSL smoothstep(uYieldNorm, 1.0, feaDamageVis).
+ */
+export function yieldMaskFor(normalizedDamage: number, yieldNorm: number): number {
+  if (!Number.isFinite(normalizedDamage) || !Number.isFinite(yieldNorm)) return 0;
+  const dn = Math.min(1, Math.max(0, normalizedDamage));
+  const yn = Math.min(1, Math.max(0, yieldNorm));
+  if (yn >= 1) return 0;
+  if (yn <= 0) return dn > 0.999 ? 1 : 0;
+  return Math.min(1, Math.max(0, (dn - yn) / (1 - yn)));
+}
+
+/**
+ * Crack/tear intensity from TRUE damage: 0 below the dent threshold,
+ * ramping to 1 at/above the tear threshold. Mirrors the GLSL feaW ramp.
+ */
+export function crackIntensityFor(
+  damage: number,
+  dentThreshold: number,
+  tearThreshold: number,
+): number {
+  if (!Number.isFinite(damage)) return 0;
+  const span = tearThreshold - dentThreshold;
+  if (!(span > 0)) return damage >= tearThreshold ? 1 : 0;
+  return Math.min(1, Math.max(0, (damage - dentThreshold) / span));
 }
 
 /** Uniform record the runtime agent updates per frame (see updateFeaUniforms). */
@@ -150,6 +225,12 @@ export interface FeaUpdateOptions {
   impactWindow01: number;
   impactWindowActive: boolean;
   time: number;
+  /** Impact pulse amplitude in [0, 1] (0 when idle/static). */
+  impactPulse?: number;
+  /** Drop playback time in seconds; 0 when there is no drop simulation. */
+  dropTime?: number;
+  /** First impact time of the active drop (seconds). */
+  impactTime?: number;
 }
 
 /**
@@ -218,6 +299,18 @@ export function createFeaUniforms(
     },
     uPeakDamage: { value: peakDamage },
     uDamageScale: { value: damageScale },
+    // Dynamic impact pulse (heatmap surge / crack flicker).
+    uImpactPulse: { value: 0 },
+    uDropTime: { value: 0 },
+    uImpactTime: { value: 0 },
+    // Yield threshold on the auto-normalized visual ramp: above this the
+    // yield mask / crack striations trigger (see yieldNormFor).
+    uYieldNorm: {
+      value:
+        fieldMaxDamage > 0 && fea && typeof fea.dent_threshold === 'number' && fea.dent_threshold > 0
+          ? yieldNormFor(fieldMaxDamage, fea.dent_threshold)
+          : 1,
+    },
     // Continuous plate-field layer (dominant Navier term, fragment space).
     uPlateA: { value: plate && plate.a > 0 ? plate.a : 0 },
     uPlateB: { value: plate && plate.b > 0 ? plate.b : 0 },
@@ -243,6 +336,14 @@ export function updateFeaUniforms(uniforms: FeaUniforms, opts: FeaUpdateOptions)
   uniforms.uImpactWindow01.value = opts.impactWindow01;
   uniforms.uImpactWindowActive.value = opts.impactWindowActive ? 1 : 0;
   uniforms.uTime.value = opts.time;
+  uniforms.uImpactPulse.value = opts.impactPulse ?? 0;
+  uniforms.uDropTime.value = opts.dropTime ?? 0;
+  uniforms.uImpactTime.value = opts.impactTime ?? 0;
+}
+
+/** GLSL ES 1.00 has no implicit int->float conversion: emit a float literal. */
+function glslFloat(value: number): string {
+  return Number.isInteger(value) ? `${value}.0` : `${value}`;
 }
 
 const FEA_VERTEX_PREFIX = /* glsl */ `
@@ -255,6 +356,10 @@ uniform vec3 uImpactNormalModel;
 uniform float uMaxCompression;
 uniform float uPeakDamage;
 uniform float uDamageScale;
+uniform float uImpactPulse;
+uniform float uDropTime;
+uniform float uImpactTime;
+uniform float uYieldNorm;
 
 varying float vFeaDamage;
 varying vec3 vFeaPosition;
@@ -272,22 +377,26 @@ const FEA_VERTEX_BODY = /* glsl */ `
 	#ifdef USE_FEA_ATTRIBUTES
 		feaDamage = aDamage;
 		float feaDamageNorm = aDamage * uDamageScale;
-		feaDent = step( 0.5, uFeaMode ) * uImpactWindow01 * step( 0.5, uImpactWindowActive ) * step( ${FEA_DENT_THRESHOLD}, feaDamageNorm );
+		feaDent = step( 0.5, uFeaMode ) * uImpactWindow01 * step( 0.5, uImpactWindowActive ) * step( ${glslFloat(FEA_DENT_THRESHOLD)}, feaDamageNorm );
 		transformed += aDisplacement * feaDent;
 		// Procedural dent complement: sparse meshes have no vertex inside the
 		// impact zone, so the attribute dent would be invisible — dent
 		// continuously wherever the attribute damage is below the threshold.
+		// The depth factor mirrors the backend: min(1.5, gauss·amp) with
+		// amp = 1 + 2·(D−0.7)/0.3 capped at 3.0 — the 1.5 cap applies to the
+		// COMBINED product (backend DENT_DEPTH_CAP_FACTOR), never to the
+		// amplification alone.
 		float feaGaussProc = exp( -dot( position - uImpactPointModel, position - uImpactPointModel ) / max( uFalloffRadius * uFalloffRadius, 1e-6 ) );
-		float feaPlasticProc = min( 1.5, 1.0 + 2.0 * max( 0.0, ( uPeakDamage * feaGaussProc - ${FEA_DENT_THRESHOLD} ) / ${FEA_PLASTIC_RAMP} ) );
-		transformed -= uImpactNormalModel * uMaxCompression * feaGaussProc * feaPlasticProc * step( 0.5, uFeaMode ) * uImpactWindow01 * step( 0.5, uImpactWindowActive ) * ( 1.0 - step( ${FEA_DENT_THRESHOLD}, feaDamageNorm ) );
+		float feaPlasticProc = min( ${glslFloat(FEA_PLASTIC_AMPLIFICATION_MAX)}, 1.0 + 2.0 * max( 0.0, ( uPeakDamage * feaGaussProc - ${glslFloat(FEA_DENT_THRESHOLD)} ) / ${glslFloat(FEA_PLASTIC_RAMP)} ) );
+		transformed -= uImpactNormalModel * uMaxCompression * min( ${glslFloat(FEA_DENT_DEPTH_CAP)}, feaGaussProc * feaPlasticProc ) * step( 0.5, uFeaMode ) * uImpactWindow01 * step( 0.5, uImpactWindowActive ) * ( 1.0 - step( ${glslFloat(FEA_DENT_THRESHOLD)}, feaDamageNorm ) );
 	#else
 		// Procedural path: same Gaussian on the untransformed local position.
 		float feaGauss = exp( -dot( position - uImpactPointModel, position - uImpactPointModel ) / max( uFalloffRadius * uFalloffRadius, 1e-6 ) );
 		feaDamage = uPeakDamage * feaGauss;
 		float feaDamageNorm = feaDamage * uDamageScale;
-		float feaPlastic = min( 1.5, 1.0 + 2.0 * max( 0.0, ( feaDamageNorm - ${FEA_DENT_THRESHOLD} ) / ${FEA_PLASTIC_RAMP} ) );
+		float feaPlastic = min( ${glslFloat(FEA_PLASTIC_AMPLIFICATION_MAX)}, 1.0 + 2.0 * max( 0.0, ( feaDamageNorm - ${glslFloat(FEA_DENT_THRESHOLD)} ) / ${glslFloat(FEA_PLASTIC_RAMP)} ) );
 		feaDent = step( 0.5, uFeaMode ) * uImpactWindow01 * step( 0.5, uImpactWindowActive );
-		transformed -= uImpactNormalModel * uMaxCompression * feaGauss * feaPlastic * feaDent;
+		transformed -= uImpactNormalModel * uMaxCompression * min( ${glslFloat(FEA_DENT_DEPTH_CAP)}, feaGauss * feaPlastic ) * feaDent;
 	#endif
 	vFeaDamage = clamp( feaDamage, 0.0, 1.0 );
 	vFeaPosition = position;
@@ -303,6 +412,10 @@ uniform vec3 uImpactPointModel;
 uniform float uFalloffRadius;
 uniform float uPeakDamage;
 uniform float uDamageScale;
+uniform float uImpactPulse;
+uniform float uDropTime;
+uniform float uImpactTime;
+uniform float uYieldNorm;
 uniform float uPlateA;
 uniform float uPlateB;
 uniform float uPlateCx;
@@ -331,10 +444,6 @@ ${buildGradientColorFrag()}
  * array indexing) mirroring the TS segment walk in feaGradientColor.
  */
 function buildGradientColorFrag(): string {
-  // GLSL ES 1.00 has no implicit int->float conversion: every emitted
-  // literal must be a float ("0" would fail to compile in "t - 0").
-  const glslFloat = (value: number): string =>
-    Number.isInteger(value) ? `${value}.0` : `${value}`;
   const stops = FEA_GRADIENT_STOPS;
   const lines = [
     'vec3 feaGradientColorFrag( float damage ) {',
@@ -374,6 +483,18 @@ const FEA_FRAGMENT_BODY = /* glsl */ `
 	// While the drop is active/falling, progress advances from 0 to 1 at the moment of impact.
 	// When inspecting post-drop or static models, uImpactWindowActive is 0 so progress is 1.0.
 	float feaProg = mix( 1.0, uImpactWindow01, uImpactWindowActive );
+	// Impact pulse: an exponential-decay surge peaking AT the impact moment
+	// (~1/e per 1/6 s), re-triggered at every impact time. It drives the
+	// heatmap ripple and the crack striation flicker so the contour animates
+	// across playback frames. uImpactTime <= 0 means "no drop impact known"
+	// and disables the pulse (static inspection stays static).
+	float feaSince = uDropTime - uImpactTime;
+	float feaPulse = 0.0;
+	if ( uImpactTime > 0.0 && feaSince >= 0.0 ) {
+		// Exponential decay peaking AT the impact moment (~1/e per 1/6 s),
+		// mirroring impactPulseFor() on the CPU side.
+		feaPulse = clamp( exp( -feaSince * 6.0 ), 0.0, 1.0 );
+	}
 	// Continuous procedural base layer: the same Gaussian evaluated on the
 	// interpolated fragment position keeps the heatmap visible even on sparse
 	// meshes whose vertices miss the impact zone (the per-vertex field from
@@ -392,19 +513,37 @@ const FEA_FRAGMENT_BODY = /* glsl */ `
 	}
 	float feaDamage = clamp( max( vFeaDamage * feaProg, max( feaProcedural, feaPlate ) ), 0.0, 1.0 );
 	float feaDamageVis = clamp( feaDamage * uDamageScale, 0.0, 1.0 );
+	// Radial impact ripple: a smooth wave expanding from the impact point
+	// while the pulse is active, modulating the displayed damage so the
+	// heatmap visibly surges outward at every impact. The wave uses the
+	// Gaussian scale so it tracks the actual stress falloff shape.
+	float feaRipple = 0.0;
+	if ( uImpactTime > 0.0 && uFalloffRadius > 1e-6 ) {
+		float feaRad = length( vFeaPosition - uImpactPointModel ) / uFalloffRadius;
+		float feaWave = 0.5 + 0.5 * sin( feaRad * 6.28318 - feaSince * 18.0 );
+		feaRipple = feaPulse * exp( -feaRad * feaRad ) * feaWave;
+	}
+	feaDamageVis = clamp( feaDamageVis + feaRipple * 0.25, 0.0, 1.0 );
 	if ( uFeaMode > 0.5 ) {
-		// YIELD SHADER: distinct from the heatmap — a steel-gray base with
-		// the plastic zone (D in [0.70, 0.92]) showing as crackled
-		// stress-whitening with a hot tint, and the tear zone (D > 0.92)
-		// cut out entirely (fracture hole).
+		// YIELD SHADER: a steel-gray base with a clearly masked plastic
+		// zone. The mask ramps from the normalized yield threshold to the
+		// field peak, so everything ABOVE the material yield strength lights
+		// up hot (contour) instead of a faint broad tint.
 		diffuseColor.rgb = vec3( 0.60, 0.62, 0.66 );
-		float feaYieldContour = smoothstep( 0.20, 0.95, feaDamageVis );
-		diffuseColor.rgb = mix( diffuseColor.rgb, vec3( 0.78, 0.52, 0.20 ), feaYieldContour * 0.45 );
+		float feaYieldMask = smoothstep( uYieldNorm, 1.0, feaDamageVis );
+		diffuseColor.rgb = mix( diffuseColor.rgb, vec3( 1.0, 0.36, 0.05 ), feaYieldMask * 0.85 );
+		// Micro-crack striations inside the plastic zone: deterministic
+		// per-fragment noise striping animated by the impact pulse (and a
+		// slow drift while paused), plus stress-whitening that ramps with
+		// true damage from the dent threshold to the tear threshold.
 		float feaW = clamp( ( feaDamage - ${FEA_DENT_THRESHOLD} ) / ${FEA_TEAR_THRESHOLD - FEA_DENT_THRESHOLD}, 0.0, 1.0 );
-		if ( feaW > 0.0 ) {
+		if ( feaW > 0.001 ) {
 			float feaNoise = feaHashNoise( vFeaPosition, uTime );
-			diffuseColor.rgb = mix( diffuseColor.rgb, vec3( 1.0 ), feaNoise * ${FEA_WHITENING_AMPLITUDE} * feaW );
-			diffuseColor.rgb = mix( diffuseColor.rgb, vec3( 1.0, 0.2, 0.05 ), 0.45 * feaW );
+			float feaStripe = smoothstep( 0.45, 0.75, fract( vFeaPosition.y * 140.0 + feaNoise * 2.0 ) );
+			float feaFlicker = 0.35 + 0.65 * feaPulse;
+			diffuseColor.rgb = mix( diffuseColor.rgb, vec3( 1.0 ), feaNoise * ${FEA_WHITENING_AMPLITUDE} * feaW * feaFlicker );
+			diffuseColor.rgb = mix( diffuseColor.rgb, vec3( 0.05, 0.05, 0.06 ), feaStripe * feaW * feaFlicker );
+			diffuseColor.rgb = mix( diffuseColor.rgb, vec3( 1.0, 0.15, 0.03 ), 0.5 * feaW * feaFlicker );
 		}
 		if ( feaDamage > ${FEA_TEAR_THRESHOLD} ) {
 			discard;

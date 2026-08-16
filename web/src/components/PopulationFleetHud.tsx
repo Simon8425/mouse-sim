@@ -48,7 +48,7 @@ export function PopulationFleetHud({
         <div className="population-hud__divider" />
 
         <div className="population-hud__stat" title={`${(sampleCount - unitsFailed).toLocaleString()} of ${sampleCount.toLocaleString()} units passed`}>
-          <span className="population-hud__stat-label">Yield:</span>
+          <span className="population-hud__stat-label">Pass rate:</span>
           <span className="population-hud__stat-val" style={{ color: '#22c55e' }}>
             {((1 - failureRate) * 100).toFixed(1)}%
           </span>

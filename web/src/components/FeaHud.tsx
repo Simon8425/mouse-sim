@@ -1,4 +1,5 @@
 import type { FeaResult, RenderMode } from '../api/contracts';
+import type { LiveDropData } from '../scene/SceneViewport';
 
 /** Format a stress magnitude in MPa with adaptive units (kPa below 0.1 MPa). */
 export function formatStress(mpa: number): string {
@@ -13,6 +14,9 @@ export function formatStress(mpa: number): string {
 export function computeMaxDamage(fea: FeaResult | null): number {
   if (!fea) return 0;
   let maxDamage = 0;
+  if (typeof fea.peak?.damage === 'number' && Number.isFinite(fea.peak.damage)) {
+    maxDamage = Math.max(maxDamage, fea.peak.damage);
+  }
   for (const field of fea.objects) {
     for (const value of field.damage) {
       if (typeof value === 'number' && Number.isFinite(value) && value > maxDamage) {
@@ -27,6 +31,22 @@ export function computeMaxDamage(fea: FeaResult | null): number {
     }
   }
   return maxDamage;
+}
+
+/**
+ * Number of vertices whose TRUE damage is at/above the given threshold.
+ * `exclusive` uses strict greater-than (the tear zone is defined as
+ * D > tear_threshold by the backend).
+ */
+export function countZoneVertices(fea: FeaResult, threshold: number, exclusive: boolean): number {
+  let count = 0;
+  for (const field of fea.objects) {
+    for (const value of field.damage) {
+      if (typeof value !== 'number' || !Number.isFinite(value)) continue;
+      if (exclusive ? value > threshold : value >= threshold) count += 1;
+    }
+  }
+  return count;
 }
 
 const LEGEND_GRADIENT =
@@ -54,14 +74,19 @@ const FLAG_LABELS: Record<string, string> = {
 /**
  * Professional HUD overlay for the FEA render modes: a compact readout panel
  * with the von-Mises legend bar and the true (non-normalized) headline
- * values. Replaces the in-scene 3D badge sprite.
+ * values. Replaces the in-scene 3D badge sprite. When a drop simulation is
+ * live, the readout also reports the current drop time, impact window
+ * progress, and impact pulse so the dynamic shader behavior is verifiable.
  */
 export function FeaHud({
   mode,
   fea,
+  liveDropData,
 }: {
   mode: RenderMode;
   fea: FeaResult | null;
+  /** Live drop playback telemetry (drop time / impact progress / pulse). */
+  liveDropData?: LiveDropData | null;
 }): JSX.Element | null {
   if (mode === 'default' || !fea?.computed) return null;
 
@@ -79,14 +104,21 @@ export function FeaHud({
   const legendMin = 0;
 
   // Zone vertex counts over the per-vertex fields (dent >= 0.7, tear > 0.92).
-  let dentVertices = 0;
-  let tearVertices = 0;
-  for (const field of fea.objects) {
-    for (const value of field.damage) {
-      if (typeof value !== 'number' || !Number.isFinite(value)) continue;
-      if (value >= fea.dent_threshold) dentVertices += 1;
-      if (value > fea.tear_threshold) tearVertices += 1;
-    }
+  const dentVertices = countZoneVertices(fea, fea.dent_threshold, false);
+  const tearVertices = countZoneVertices(fea, fea.tear_threshold, true);
+
+  // Live impact telemetry: how far into the impact window the playback is,
+  // and the pulse amplitude driving the heatmap ripple / crack flicker.
+  const impactWindowS = fea.impact_window_s ?? 0.3;
+  let impactProgress: number | null = null;
+  let impactPulse: number | null = null;
+  const liveDropTime = liveDropData?.dropTime ?? null;
+  const impactTime =
+    liveDropData?.activeDrop?.end_s != null ? liveDropData.activeDrop.end_s * 0.38 : null;
+  if (liveDropTime !== null && impactTime !== null && impactWindowS > 0) {
+    impactProgress = Math.min(1, Math.max(0, (liveDropTime - impactTime) / impactWindowS));
+    // Mirror impactPulseFor(): 1 at the impact moment, ~1/e decay per 1/6 s.
+    impactPulse = Math.max(0, Math.min(1, Math.exp(-Math.max(0, liveDropTime - impactTime) * 6)));
   }
 
   return (
@@ -161,6 +193,24 @@ export function FeaHud({
           <div className="fea-hud__row">
             <dt>Tear zone vertices</dt>
             <dd>{tearVertices}</dd>
+          </div>
+        ) : null}
+        {liveDropTime !== null ? (
+          <div className="fea-hud__row">
+            <dt>Drop time</dt>
+            <dd>{liveDropTime.toFixed(2)}s</dd>
+          </div>
+        ) : null}
+        {impactProgress !== null ? (
+          <div className="fea-hud__row">
+            <dt>Impact window</dt>
+            <dd>{Math.round(impactProgress * 100)}%</dd>
+          </div>
+        ) : null}
+        {impactPulse !== null ? (
+          <div className="fea-hud__row">
+            <dt>Impact pulse</dt>
+            <dd>{impactPulse.toFixed(2)}</dd>
           </div>
         ) : null}
       </dl>

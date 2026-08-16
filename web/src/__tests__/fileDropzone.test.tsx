@@ -12,6 +12,7 @@ const { parseInWorkerMock, normalizeGeometryMock } = vi.hoisted(() => ({
 
 vi.mock('../workers/workerProtocol', () => ({
   parseInWorker: parseInWorkerMock,
+  cancelPendingParses: vi.fn(),
 }));
 
 vi.mock('../api/client', () => ({

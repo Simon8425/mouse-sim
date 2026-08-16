@@ -185,7 +185,7 @@ export const ModelTree = React.memo(function ModelTree(): React.ReactElement {
     if (isRunning) return `${job?.done ?? 0}/${job?.total || '…'}`;
     if (suggestionCount > 0) return `Review (${suggestionCount})`;
     if (job?.status === 'error') return 'Retry AI';
-    return 'Classify';
+    return 'AI Classify';
   };
 
   if (entries.length === 0) {
@@ -199,10 +199,19 @@ export const ModelTree = React.memo(function ModelTree(): React.ReactElement {
         <div className="model-tree__empty-state">
           {state.previewStatus === 'working' ? (
             <div className="empty-state-loading">
-              <span>Loading assembly...</span>
+              <span className="import-progress-minimal__status">Loading assembly...</span>
             </div>
           ) : (
-            <span className="empty-state-text">No geometry loaded</span>
+            <div className="model-tree__empty-card">
+              <svg className="model-tree__empty-icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.25" aria-hidden="true">
+                <path d="M4 6h16M4 12h16M4 18h10" strokeLinecap="round" />
+                <circle cx="4" cy="6" r="1.5" fill="currentColor" />
+                <circle cx="4" cy="12" r="1.5" fill="currentColor" />
+                <circle cx="4" cy="18" r="1.5" fill="currentColor" />
+              </svg>
+              <span className="empty-state-title">Awaiting Assembly</span>
+              <span className="empty-state-subtitle">Import CAD or load baseline to inspect hierarchy</span>
+            </div>
           )}
         </div>
       </div>

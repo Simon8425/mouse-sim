@@ -416,7 +416,7 @@ class QualificationIntegrityPipelineTests(unittest.TestCase):
         self.assertEqual(qualification["evidence_disposition"], "qualification_pending_review")
         self.assertTrue(qualification["qualified"])
         self.assertEqual(qualification["blocking_keys"], [])
-        self.assertEqual(len(qualification["integrity_gates"]), 6)
+        self.assertEqual(len(qualification["integrity_gates"]), 7)
 
     def test_qualification_mode_invalid_structural_response_blocks(self):
         result = run_pipeline(qualification_request(

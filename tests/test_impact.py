@@ -960,6 +960,101 @@ class EnergyPartitionTests(unittest.TestCase):
         self.assertEqual(result.method_id, "energy_quasi_static_v1")
         self.assertTrue(any("screening estimate only" in item for item in result.assumptions))
 
+    def test_partition_impulse_consistency_with_restitution(self):
+        # Audit fix: the partition must use the SAME impulse the result
+        # reports (m*(1+e)*v), not the plastic-only m*v.  With e = 1 the
+        # old code used HALF the reported impulse, understating the
+        # rotational share before the energy scaling.
+        mass, velocity, offset, inertia = 0.1, 4.0, 0.01, 1e-6
+        result = estimate_impact(
+            mass_kg=mass,
+            velocity_m_s=velocity,
+            restitution=1.0,
+            contact_stiffness_n_per_m=1e5,
+            total_mass_kg=mass,
+            inertia_tensor_kg_m2=[[inertia, 0.0, 0.0], [0.0, inertia, 0.0], [0.0, 0.0, inertia]],
+            contact_location_m=(offset, 0.0, 0.0),
+            center_of_mass_m=(0.0, 0.0, 0.0),
+        )
+        partition = result.energy_partition
+        self.assertIsNotNone(partition)
+        reported_impulse = result.impulse_n_s
+        self.assertAlmostEqual(reported_impulse, mass * 2.0 * velocity, places=9)
+        self.assertAlmostEqual(partition["impulse_n_s"], reported_impulse, places=9)
+        # Raw partition totals with the restitution-corrected impulse:
+        impulse = mass * 2.0 * velocity
+        t_trans = impulse * impulse / (2.0 * mass)
+        t_rot = 0.5 * impulse * impulse * offset * offset / inertia
+        total = t_trans + t_rot
+        scale = result.impact_energy_j / total
+        self.assertAlmostEqual(
+            partition["rotational_energy_j"], t_rot * scale, places=6
+        )
+        self.assertAlmostEqual(
+            partition["translational_energy_j"], t_trans * scale, places=6
+        )
+        # The plastic-impulse bookkeeping would have reported a HALF impulse.
+        self.assertGreater(
+            partition["impulse_n_s"], mass * velocity
+        )
+
+
+class ExtremeMassTests(unittest.TestCase):
+    """Boundary-value audit: ultralight 1 g parts and heavy 500 g battery
+    packs must produce finite, physically plausible screening results."""
+
+    def test_ultralight_1g_part(self):
+        result = estimate_impact(
+            mass_kg=0.001,
+            velocity_m_s=4.0,
+            contact_stiffness_n_per_m=1e5,
+        )
+        self.assertEqual(result.validity, "valid")
+        self.assertTrue(math.isfinite(result.peak_force_n))
+        self.assertTrue(math.isfinite(result.peak_acceleration_m_s2))
+        self.assertAlmostEqual(result.peak_force_n, 4.0 * math.sqrt(0.001 * 1e5), places=9)
+        self.assertAlmostEqual(result.peak_acceleration_m_s2, result.peak_force_n / 0.001, places=9)
+        self.assertNotIn(IMPACT_ACCELERATION_IMPLAUSIBLE, result.flags)
+
+    def test_heavy_500g_battery_pack(self):
+        result = estimate_impact(
+            mass_kg=0.5,
+            velocity_m_s=4.0,
+            contact_stiffness_n_per_m=1e5,
+            load_path_area_m2=1e-4,
+            allowable_pa=3e6,
+        )
+        self.assertEqual(result.validity, "valid")
+        self.assertTrue(math.isfinite(result.peak_force_n))
+        self.assertAlmostEqual(result.peak_force_n, 4.0 * math.sqrt(0.5 * 1e5), places=9)
+        self.assertAlmostEqual(result.load_path_stress_pa, result.peak_force_n / 1e-4, places=6)
+        self.assertAlmostEqual(result.safety_factor, 3e6 / result.load_path_stress_pa, places=9)
+
+    def test_heavy_500g_hertz_half_sine_consistency(self):
+        # The half-sine branch must stay impulse-consistent for a heavy pack.
+        result = estimate_impact(
+            mass_kg=0.5,
+            velocity_m_s=4.0,
+            restitution=0.3,
+            contact_duration_s=0.002,
+        )
+        self.assertEqual(result.validity, "valid")
+        self.assertAlmostEqual(result.peak_force_n, math.pi * result.impulse_n_s / (2.0 * 0.002), places=9)
+        self.assertAlmostEqual(result.impulse_n_s, 0.5 * 1.3 * 4.0, places=9)
+
+    def test_hertz_near_incompressible_and_near_zero_poisson(self):
+        # nu -> 0.499 (incompressible) and nu -> 0.0 must both stay finite
+        # and physically ordered in the effective modulus.
+        low = effective_modulus(2.3e9, 0.0, 1e9, 0.0)
+        high = effective_modulus(2.3e9, 0.499, 1e9, 0.499)
+        self.assertTrue(math.isfinite(low))
+        self.assertTrue(math.isfinite(high))
+        # Incompressible materials are stiffer in contact.
+        self.assertGreater(high, low)
+        # nu = 0.5 exactly is rejected (incompressibility limit is open).
+        with self.assertRaises(ValueError):
+            effective_modulus(2.3e9, 0.5, 1e9, 0.3)
+
 
 class StoppingDistanceTests(unittest.TestCase):
     """Finding 4: stopping distance reports an average work-equivalent

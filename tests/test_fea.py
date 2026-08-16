@@ -621,6 +621,117 @@ class FailureModeTests(unittest.TestCase):
         self.assertFalse(out["computed"])
         self.assertIn(fea.FEA_YIELD_REFERENCE_UNAVAILABLE, out["flags"])
 
+    def test_no_shell_solve_uses_resolved_material_yield_not_40mpa_default(self):
+        # Audit fix: a drop ran WITHOUT a structural shell solve.  The old
+        # code fell straight back to the hardcoded 40 MPa ABS default, which
+        # is 8x the LiPo yield (5 MPa) and 50x off the steel yield (250 MPa).
+        # The resolved material's own yield/allowable must be used instead.
+        result = _synthetic_result()
+        # No shell section -> no inputs_trace -> the drop-only path applies.
+        del result["shell"]
+        # The force-derived peak stress path needs the peak force number.
+        result["drop_simulation"]["peak_force_estimate_n"] = 320.0
+        # LiPo-class resolved material (5 MPa yield, 3 MPa allowable).
+        result["structural"] = {
+            "resolved_material": {
+                "young_modulus_pa": 100e6,
+                "poissons_ratio": 0.30,
+                "yield_strength": 5e6,
+                "tensile_allowable_pa": 3e6,
+            }
+        }
+        out = fea.compute_fea(result, {"m": _tetrahedron()})
+        self.assertTrue(out["computed"])
+        # The derated/plain allowable wins over the yield per the basis order.
+        self.assertEqual(out["yield_stress_pa"], 3e6)
+        self.assertEqual(out["damage_basis"], "material_allowable_underated")
+        # Damage saturates: sigma_peak 15 MPa (force heuristic floor) vs 3 MPa reference.
+        self.assertEqual(out["peak"]["damage"], 1.0)
+
+    def test_no_shell_solve_yield_strength_basis_when_allowable_absent(self):
+        # Same path with ONLY yield_strength: the basis is material_yield.
+        result = _synthetic_result()
+        del result["shell"]
+        result["drop_simulation"]["peak_force_estimate_n"] = 320.0
+        result["structural"] = {
+            "resolved_material": {
+                "young_modulus_pa": 200e9,
+                "poissons_ratio": 0.30,
+                "yield_strength": 250e6,
+            }
+        }
+        out = fea.compute_fea(result, {"m": _tetrahedron()})
+        self.assertTrue(out["computed"])
+        self.assertEqual(out["yield_stress_pa"], 250e6)
+        self.assertEqual(out["damage_basis"], "material_yield")
+        self.assertAlmostEqual(out["peak"]["damage"], round(min(1.0, 15e6 / 250e6), 6))
+
+    def test_no_shell_solve_unknown_material_falls_back_to_40mpa_disclosed(self):
+        # No resolved material anywhere: the 40 MPa engineering default is
+        # the LAST resort and the basis discloses it.
+        result = _synthetic_result()
+        del result["shell"]
+        result["drop_simulation"]["peak_force_estimate_n"] = 320.0
+        result["structural"] = {}
+        out = fea.compute_fea(result, {"m": _tetrahedron()})
+        self.assertTrue(out["computed"])
+        self.assertEqual(out["yield_stress_pa"], 40e6)
+        self.assertEqual(out["damage_basis"], "default_material_yield")
+
+    def test_force_derived_peak_stress_is_disclosed(self):
+        # No shell peak stress: the drop/impact force heuristic
+        # sigma = F * 18000 Pa/N clamped to [15, 85] MPa must be disclosed,
+        # never silent.
+        result = {
+            "drop_simulation": {
+                "model": {"mass_kg": 0.06, "restitution": 0.3},
+                "peak": {"impact_speed_m_s": 3.9, "kinetic_energy_j": 0.456},
+                "peak_force_estimate": {
+                    "mass_kg": 0.06,
+                    "restitution": 0.3,
+                    "energy_j": 0.456,
+                    "impact_speed_m_s": 3.9,
+                    "contact_stiffness_n_per_m": 1e5,
+                },
+                "impacts": [
+                    {
+                        "impact_speed_m_s": 3.9,
+                        "contact_location": [0.0, 0.0, 0.0],
+                        "contact_normal": [0.0, 0.0, 1.0],
+                    }
+                ],
+                "contact_stiffness_n_per_m": 1e5,
+                "peak_force_estimate_n": 320.0,
+            },
+            "impact": {
+                "result": {"peak_force_n": 320.0},
+            },
+        }
+        out = fea.compute_fea(result, {"m": _tetrahedron()})
+        self.assertTrue(out["computed"])
+        self.assertIn(fea.FEA_STRESS_FROM_FORCE_HEURISTIC, out["flags"])
+        self.assertTrue(
+            any("F * 18000" in assumption for assumption in out["assumptions"])
+        )
+        # F*18000 = 5.76 MPa -> floored at 15 MPa.
+        self.assertEqual(out["objects"][0]["stress_pa"][0], 15e6)
+
+    def test_extreme_material_props_never_break_the_field(self):
+        # Degenerate resolved material data (zero modulus, missing poisson)
+        # must not crash: the plate field falls back to the Gaussian and the
+        # payload stays computed.
+        result = _synthetic_result()
+        result["structural"] = {
+            "structure": {"type": "shell_panel", "a_m": 0.06, "b_m": 0.04, "t_m": 0.002},
+            "load_case": {"kind": "pressure", "magnitude_pa": 1000.0},
+            "resolved_material": {"young_modulus_pa": 0.0, "poissons_ratio": 0.35},
+            "response": result["structural"]["response"],
+        }
+        out = fea.compute_fea(result, {"m": _grid_mesh()})
+        self.assertTrue(out["computed"])
+        self.assertIn(fea.FEA_PLATE_FIELD_UNAVAILABLE, out["flags"])
+        self.assertTrue(out["objects"][0]["damage"][12], 0.5)
+
     def test_no_drop_sim_uses_critical_region_with_zero_window(self):
         center = (0.005, 0.01, 0.015)
         result = _synthetic_result(with_drop=False)

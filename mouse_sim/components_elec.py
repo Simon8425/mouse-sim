@@ -105,6 +105,13 @@ def defaults(component_type):
             "crush_load_n": 130.0,
             "shock_limit_g": 500.0,
             "temperature_max_k": 333.15,
+            # Snap-fit retention hook holding the cell in the cradle: the
+            # hook force that must beat the cell inertia during a drop.
+            "latch_retention_n": 8.0,
+            # Chassis-to-cell force transmission for the latch channel
+            # (mirrors the crush channel's 0.5 screening factor; the
+            # rigid-mount bound would be ~1.0).
+            "latch_transmission_factor": 0.5,
         }
     if component_type == "switch":
         return {
@@ -349,6 +356,8 @@ def _analyze_battery(spec, context):
     crush = _finite_float(spec.get("crush_load_n"), 130.0)
     shock_limit = _finite_float(spec.get("shock_limit_g"), 500.0)
     temp_max = _finite_float(spec.get("temperature_max_k"), 333.15)
+    latch_retention = max(0.0, _finite_float(spec.get("latch_retention_n"), 8.0))
+    latch_transmission = max(0.0, _finite_float(spec.get("latch_transmission_factor"), 0.5))
     accel_g = drop["accel_g"]
     env_temp = context.get("environment_temperature_k")
     env_temp = _finite_float(env_temp, None) if env_temp is not None else None
@@ -361,8 +370,19 @@ def _analyze_battery(spec, context):
     transmitted = 0.5 * impact_force
     crush_margin = transmitted / crush if crush > 0.0 else 1.0
     shock_margin = accel_g / shock_limit if shock_limit > 0.0 else 1.0
+    # Snap-fit latch retention: if the transmitted cell inertia
+    # F_inertia = m_battery * a_peak (chassis-attenuated) exceeds the
+    # retention hook force, the cell dislodges.  BLOCKER-class finding; the
+    # latch channel never drives the status below "warn" on its own.
+    latch_inertia = latch_transmission * impact_force
+    latch_margin = latch_retention / latch_inertia if latch_inertia > 0.0 else 1.0
     findings = []
     status = "pass"
+    if latch_inertia > latch_retention:
+        status = "fail"
+        findings.append(
+            {"code": "BATTERY_LATCH_DISLODGED", "severity": "error", "message": "transmitted cell inertia {:.1f} N exceeds the latch retention force {:.1f} N; battery dislodgement risk under drop shock".format(latch_inertia, latch_retention)}
+        )
     if crush_margin >= _FAIL_RATIO or shock_margin >= _FAIL_RATIO:
         status = "fail"
         if crush_margin >= _FAIL_RATIO:
@@ -395,14 +415,18 @@ def _analyze_battery(spec, context):
         "shock_g": round(accel_g, 3),
         "crush_margin": round(crush_margin, 6),
         "shock_margin": round(shock_margin, 6),
+        "latch_inertia_n": round(latch_inertia, 3),
+        "latch_retention_n": round(latch_retention, 3),
+        "latch_margin": round(latch_margin, 6),
     }
     assumptions = [
         "chassis-to-cell force transmission factor 0.5 (screening; rigid-mount bound ~1.0, foam-mount lower)",
         "LiPo pouch cell crush threshold class ~130 N (published cell crush-test data class)",
         "shock limit 500 g class (published cell shock ratings ~50 g continuous, 500-1500 g shock); duration-blind screening",
         "crush channel loads the cell by its OWN inertia; the chassis-level force path is not separately modeled (screening)",
+        "latch channel: transmitted cell inertia m * a_peak * 0.5 vs the retention hook force; hook force class 8 N for a cantilever snap-fit cell cradle (assembly-force class data)",
     ]
-    return _result("battery", "battery", status, metrics, findings, assumptions, max(crush_margin, shock_margin))
+    return _result("battery", "battery", status, metrics, findings, assumptions, max(crush_margin, shock_margin, latch_margin))
 
 
 def _analyze_switch(spec, context):

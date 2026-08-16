@@ -46,6 +46,20 @@ export function MissionControl({ onClose }: MissionControlProps): React.ReactEle
     const merged = clampDropConfig({ ...testConfig, ...next });
     persistConfigForTest(selectedTest, merged);
     setTestConfig(merged);
+    // Live-update an active test's draft so the scene floor (and any overlay
+    // geometry derived from it) tracks the selection without waiting for a
+    // full re-run.
+    dispatch({
+      type: 'SET_DROP_TEST_CONFIG',
+      patch: {
+        height_m: merged.height_m,
+        surface: merged.surface,
+        drop_count: merged.drop_count,
+        orientation: merged.orientation,
+        spin_rps: merged.spin_rps,
+        pause_between_drops_s: merged.pause_between_drops_s,
+      },
+    });
   };
 
   const runSimulation = () => {
@@ -310,7 +324,11 @@ export function MissionControl({ onClose }: MissionControlProps): React.ReactEle
                   <select
                     className="settings-default-material"
                     value={testConfig.surface}
-                    onChange={(e) => updateConfig({ surface: e.target.value as DropSurface })}
+                    onChange={(e) => {
+                      const surface = e.target.value as DropSurface;
+                      dispatch({ type: 'SET_FLOOR', surface });
+                      updateConfig({ surface });
+                    }}
                   >
                     {DROP_SURFACES.map((s) => (
                       <option key={s.value} value={s.value}>

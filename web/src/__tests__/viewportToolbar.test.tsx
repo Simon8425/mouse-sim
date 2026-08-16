@@ -116,7 +116,7 @@ function renderToolbar() {
         }}
       />
       <LeaveTestButton />
-      <ViewportToolbar viewport={React.createRef()} stats={null} />
+      <ViewportToolbar stats={null} />
     </ProjectProvider>,
   );
 }
@@ -139,7 +139,7 @@ describe('ViewportToolbar', () => {
             name: 'mouse_baseline',
           }}
         />
-        <ViewportToolbar viewport={React.createRef()} stats={null} />
+        <ViewportToolbar stats={null} />
       </ProjectProvider>,
     );
 
@@ -199,7 +199,7 @@ describe('ViewportToolbar', () => {
           }}
         />
         <DispatchHelper action={{ type: 'SET_DROP_PLAYING', playing: true }} />
-        <ViewportToolbar viewport={React.createRef()} stats={null} />
+        <ViewportToolbar stats={null} />
       </ProjectProvider>,
     );
 
@@ -229,7 +229,7 @@ describe('ViewportToolbar', () => {
         />
         <DispatchHelper action={{ type: 'SET_DROP_PLAYING', playing: true }} />
         <DispatchHelper action={{ type: 'SET_DROP_PLAYING', playing: false }} />
-        <ViewportToolbar viewport={React.createRef()} stats={null} />
+        <ViewportToolbar stats={null} />
       </ProjectProvider>,
     );
 

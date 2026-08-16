@@ -323,14 +323,183 @@ def _promote_warnings(findings):
     )
 
 
+# Optical tracking lens stack: the lens height above the PCB is a design
+# parameter (gaming-mouse class 1.2-1.5 mm); the lens z-displacement budget
+# under shock is 0.15 mm — beyond it the tracking surface distance drifts
+# out of the sensor's depth of field (OPTICAL_TRACKING_LOD_SHIFT).
+LENS_HEIGHT_MIN_M = 1.2e-3
+LENS_HEIGHT_MAX_M = 1.5e-3
+LENS_DEFOCUS_BUDGET_M = 0.15e-3
+
+
+def check_optical_defocus(
+    pcb_geometry,
+    sensor_geometry,
+    object_id,
+    drop_peak_accel_g,
+    lens_height_m=None,
+    pcb_young_modulus_pa=22e9,
+    pcb_poissons_ratio=0.14,
+    pcb_density_kg_m3=1850.0,
+    pcb_thickness_m=None,
+    sensor_mass_kg=0.0015,
+    lens_defocus_budget_m=LENS_DEFOCUS_BUDGET_M,
+):
+    """Optical sensor lens z-defocus under drop shock (PCB plate bending).
+
+    The sensor lens mounts on the PCB; the shock-induced PCB deflection
+    displaces the lens out of the tracking surface's depth of field.  The
+    PCB is modeled as a simply supported rectangular plate (Roark 11.4 case
+    1, uniform load) PLUS a central point load from the sensor package
+    inertia (Roark 11.4 case 7); the lens z-displacement is the combined
+    plate deflection at the sensor location.  A displacement beyond the
+    0.15 mm defocus budget emits ``OPTICAL_TRACKING_LOD_SHIFT`` (warning —
+    non-blocking, the tracking degrades but the sensor survives).
+
+    Returns a tuple of :class:`ValidationFinding`; never raises.  Missing
+    data emits ``OPTICAL_TRACKING_LOD_UNKNOWN`` (warning) instead of
+    crashing, mirroring ``PCB_CLEARANCE_UNKNOWN``.
+    """
+
+    def unknown(reason):
+        return (
+            _finding(
+                "OPTICAL_TRACKING_LOD_UNKNOWN",
+                "warning",
+                "optics",
+                "optical lens defocus cannot be assessed: {}".format(reason),
+                object_id,
+            ),
+        )
+
+    pcb_bounds = _geometry_bounds(pcb_geometry)
+    sensor_bounds = _geometry_bounds(sensor_geometry)
+    if pcb_bounds is None or sensor_bounds is None:
+        return unknown("missing PCB or sensor bounds")
+    if drop_peak_accel_g is None or not math.isfinite(float(drop_peak_accel_g)) or float(drop_peak_accel_g) <= 0.0:
+        return unknown("no positive drop shock data")
+    if pcb_young_modulus_pa is None or pcb_young_modulus_pa <= 0.0:
+        return unknown("PCB modulus is not positive")
+    if pcb_thickness_m is None or pcb_thickness_m <= 0.0:
+        pcb_thickness_m = min(
+            pcb_bounds.max_point[i] - pcb_bounds.min_point[i] for i in range(3)
+        )
+        if pcb_thickness_m <= 0.0:
+            return unknown("PCB thickness unavailable")
+    # Plate in-plane dimensions (largest two spans of the PCB AABB).
+    spans = sorted(
+        (pcb_bounds.max_point[i] - pcb_bounds.min_point[i] for i in range(3)),
+        reverse=True,
+    )
+    length, width = spans[0], spans[1]
+    if length <= 0.0 or width <= 0.0:
+        return unknown("PCB spans unavailable")
+    a = min(length, width)
+    b = max(length, width)
+    aspect = b / a if a > 0.0 else 1.0
+    # Simply-supported plate coefficients (Roark 11.4 case 1 uniform load
+    # alpha_u, case 7 central point load alpha_p; nu = 0.3 tables).  The
+    # standoff-mounted board sits between the clamped and simply-supported
+    # bounds; the simply-supported case is the screening choice because the
+    # sensor cutout and mounting-hole pattern soften the panel.
+    if aspect <= 1.0:
+        alpha_u = 0.00406
+        alpha_p = 0.1267
+    elif aspect <= 1.2:
+        alpha_u = 0.00564
+        alpha_p = 0.1240
+    elif aspect <= 1.4:
+        alpha_u = 0.00705
+        alpha_p = 0.1210
+    elif aspect <= 1.6:
+        alpha_u = 0.00773
+        alpha_p = 0.1200
+    elif aspect <= 1.8:
+        alpha_u = 0.00832
+        alpha_p = 0.1190
+    elif aspect <= 2.0:
+        alpha_u = 0.01013
+        alpha_p = 0.1180
+    else:
+        alpha_u = 0.01013
+        alpha_p = 0.1180
+    # Combined shock load: uniform load from the whole accelerated board
+    # mass PLUS a central point load from the sensor package inertia.
+    pcb_mass = pcb_density_kg_m3 * a * b * pcb_thickness_m
+    sensor_mass = max(0.0, sensor_mass_kg)
+    q = (pcb_mass + sensor_mass) * float(drop_peak_accel_g) * 9.80665 / (a * b)
+    point_load = sensor_mass * float(drop_peak_accel_g) * 9.80665
+    d = pcb_young_modulus_pa * pcb_thickness_m ** 3 / (12.0 * (1.0 - pcb_poissons_ratio * pcb_poissons_ratio))
+    deflection = alpha_u * q * a ** 4 / d + alpha_p * point_load * a ** 2 / d
+    # Sensor z-offset from the PCB mid-plane (lens height class 1.2-1.5 mm)
+    # amplifies the plate slope; the lever contribution is bounded by the
+    # local slope at the sensor x a half-span.  Screening-level estimate.
+    sensor_center = (
+        (sensor_bounds.min_point[0] + sensor_bounds.max_point[0]) / 2.0,
+        (sensor_bounds.min_point[1] + sensor_bounds.max_point[1]) / 2.0,
+        (sensor_bounds.min_point[2] + sensor_bounds.max_point[2]) / 2.0,
+    )
+    pcb_center = (
+        (pcb_bounds.min_point[0] + pcb_bounds.max_point[0]) / 2.0,
+        (pcb_bounds.min_point[1] + pcb_bounds.max_point[1]) / 2.0,
+        (pcb_bounds.min_point[2] + pcb_bounds.max_point[2]) / 2.0,
+    )
+    radial = math.sqrt(
+        (sensor_center[0] - pcb_center[0]) ** 2
+        + (sensor_center[1] - pcb_center[1]) ** 2
+    )
+    slope = 4.0 * deflection / a if a > 0.0 else 0.0
+    lens_height = LENS_HEIGHT_MIN_M if lens_height_m is None else float(lens_height_m)
+    if not math.isfinite(lens_height) or lens_height <= 0.0:
+        lens_height = LENS_HEIGHT_MIN_M
+    delta_z = deflection + slope * radial * (lens_height / a)
+    if delta_z > lens_defocus_budget_m:
+        return (
+            _finding(
+                "OPTICAL_TRACKING_LOD_SHIFT",
+                "warning",
+                "optics",
+                "optical sensor lens z-displacement {:.3f} mm exceeds the {:.3f} mm defocus budget under {:.0f} g shock (PCB deflection {:.3f} mm); tracking surface distance drift risk".format(
+                    delta_z * 1e3,
+                    lens_defocus_budget_m * 1e3,
+                    float(drop_peak_accel_g),
+                    deflection * 1e3,
+                ),
+                object_id,
+            ),
+        )
+    return ()
+
+
+def _lens_height_from_classification(classification):
+    """Best-effort lens height (m) from a classification record; None if absent."""
+    if isinstance(classification, Mapping):
+        raw = classification.get("lens_height_m")
+        if raw is None:
+            raw = classification.get("tracking_height_m")
+    else:
+        raw = getattr(classification, "lens_height_m", None)
+        if raw is None:
+            raw = getattr(classification, "tracking_height_m", None)
+    if raw is None:
+        return None
+    try:
+        height = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return height if math.isfinite(height) and height > 0.0 else None
+
+
 def run_validation(geometry_objs, material_map, classifications, options):
     """Orchestrate DFM-lite checks into a sorted :class:`ValidationReport`.
 
     options: min_thickness_m, max_thickness_m, min_clearance_m,
     clearance_tolerance_m (or tolerance_m), pcb_object_id, shell_object_id,
-    repair_records (mapping object id -> records, or one list for all objects).
-    strict (bool): when true, promote warning findings to evidence-blocking
-    errors so the report status is fail.
+    sensor_object_id, drop_peak_accel_g, pcb_young_modulus_pa,
+    pcb_poissons_ratio, pcb_density_kg_m3, pcb_thickness_m, sensor_mass_kg,
+    lens_height_m, repair_records (mapping object id -> records, or one list
+    for all objects).  strict (bool): when true, promote warning findings to
+    evidence-blocking errors so the report status is fail.
     """
 
     geometry_objs = dict(geometry_objs or {})
@@ -344,6 +513,7 @@ def run_validation(geometry_objs, material_map, classifications, options):
     tolerance = options.get("clearance_tolerance_m", options.get("tolerance_m", 0.0))
     pcb_id = options.get("pcb_object_id")
     shell_id = options.get("shell_object_id")
+    sensor_id = options.get("sensor_object_id")
     repair_records = options.get("repair_records", {})
     if isinstance(repair_records, (list, tuple)):
         repair_records = {object_id: repair_records for object_id in geometry_objs}
@@ -365,6 +535,22 @@ def run_validation(geometry_objs, material_map, classifications, options):
             findings.extend(check_wall_thickness(geometry, object_id, min_thickness, max_thickness))
     if pcb_id and shell_id and min_clearance is not None and pcb_id in geometry_objs and shell_id in geometry_objs:
         findings.extend(check_pcb_clearance(geometry_objs[pcb_id], geometry_objs[shell_id], min_clearance, tolerance, pcb_object_id=pcb_id, shell_object_id=shell_id))
+    if pcb_id and sensor_id and pcb_id in geometry_objs and sensor_id in geometry_objs:
+        drop_g = options.get("drop_peak_accel_g")
+        findings.extend(
+            check_optical_defocus(
+                geometry_objs[pcb_id],
+                geometry_objs[sensor_id],
+                sensor_id,
+                drop_g,
+                lens_height_m=options.get("lens_height_m"),
+                pcb_young_modulus_pa=options.get("pcb_young_modulus_pa", 22e9),
+                pcb_poissons_ratio=options.get("pcb_poissons_ratio", 0.14),
+                pcb_density_kg_m3=options.get("pcb_density_kg_m3", 1850.0),
+                pcb_thickness_m=options.get("pcb_thickness_m"),
+                sensor_mass_kg=options.get("sensor_mass_kg", 0.0015),
+            )
+        )
     if options.get("strict"):
         findings = _promote_warnings(findings)
     return ValidationReport.build(findings)
@@ -378,5 +564,6 @@ __all__ = [
     "check_classification",
     "check_wall_thickness",
     "check_pcb_clearance",
+    "check_optical_defocus",
     "run_validation",
 ]

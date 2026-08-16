@@ -17,6 +17,12 @@ import { DropPhysicsDebug } from '../components/DropPhysicsDebug';
 import { PopulationFleetHud } from '../components/PopulationFleetHud';
 import type { FleetUnitData } from './populationFleetScene';
 
+import type {
+  TelemetryFrame,
+  TelemetryEvent,
+  TelemetryLogSession,
+} from '../api/telemetryDebuggerContracts';
+
 /**
  * Resolve the drop active at a playback time.
  *
@@ -42,6 +48,9 @@ export interface SceneViewportHandle {
   setDropPlayback: (playing: boolean) => void;
   /** Seek live drop playback to an absolute time (seconds). */
   seekDropTime: (t: number) => void;
+  getTelemetryFrames: () => TelemetryFrame[];
+  getTelemetryEvents: () => TelemetryEvent[];
+  buildTelemetrySession: () => TelemetryLogSession | null;
 }
 
 export interface LiveDropData {
@@ -296,10 +305,25 @@ export const SceneViewport = React.forwardRef<
   }, [props.visibility]);
 
   React.useEffect(() => {
+    // Keep the floor's material in sync with the configured drop-test surface
+    // (floor look follows the test surface selection).
+    const surfaceKey =
+      (props.dropSimulation as DropSimulationResult | null)?.config?.surface ??
+      (props.overlays ? null : 'concrete');
+    runtimeRef.current?.setFloorMaterial(surfaceKey);
+  }, [props.dropSimulation, props.overlays]);
+
+  React.useEffect(() => {
+    // Changing or ending a drop test (floor/surface switch, LEAVE_TEST, new
+    // config) must drop every stale overlay glyph — load vector arrow, stress
+    // badge, fixtures, contact plane. Clear first, then reapply the current
+    // spec so geometry-derived overlays (e.g. severity markers) stay live.
+    runtimeRef.current?.clearOverlays();
+    runtimeRef.current?.setOverlays(props.overlays);
     runtimeRef.current?.setDropSimulation(props.dropSimulation ?? null);
     setDropPlaying(props.dropSimulation !== null && props.dropSimulation !== undefined);
     setDropTime(0);
-  }, [props.dropSimulation]);
+  }, [props.dropSimulation, props.overlays]);
 
   const dropEndedRef = React.useRef<() => void>(() => {});
   const { onDropEnded: onDropEndedProp } = props;
@@ -314,6 +338,7 @@ export const SceneViewport = React.forwardRef<
   const [liveDropIndex, setLiveDropIndex] = React.useState(0);
   const [playbackSpeed, setPlaybackSpeed] = React.useState(1.0);
   const [liveFrame, setLiveFrame] = React.useState<LiveBodyState | null>(null);
+  const [liveDropData, setLiveDropData] = React.useState<LiveDropData | null>(null);
 
   const { onLiveDropData, dropSimulation } = props;
 
@@ -340,9 +365,11 @@ export const SceneViewport = React.forwardRef<
     ? (dropSimulation.drops[liveDropIndex] ?? resolveActiveDrop(dropSimulation.drops, dropTime))
     : null;
 
-  // Broadcast live frame / telemetry to listeners (e.g. ResultsRail)
+  // Broadcast live frame / telemetry to listeners (e.g. ResultsRail) and
+  // mirror it locally so the FEA HUD can show the live impact readout.
   React.useEffect(() => {
     if (!dropSimulation) {
+      setLiveDropData(null);
       onLiveDropData?.(null);
       return;
     }
@@ -365,7 +392,7 @@ export const SceneViewport = React.forwardRef<
         status = 'free_fall';
       }
     }
-    onLiveDropData?.({
+    const data: LiveDropData = {
       activeDropIndex: activeDrop?.index ?? 0,
       totalDrops: dropSimulation.drops.length,
       dropTime,
@@ -375,7 +402,9 @@ export const SceneViewport = React.forwardRef<
       kineticEnergyJ: ke,
       isPlaying: dropPlaying,
       status,
-    });
+    };
+    setLiveDropData(data);
+    onLiveDropData?.(data);
   }, [dropSimulation, dropPlaying, dropTime, liveFrame, activeDrop, onLiveDropData]);
 
   const handleTogglePlay = React.useCallback(() => {
@@ -461,6 +490,15 @@ export const SceneViewport = React.forwardRef<
       seekDropTime(t: number) {
         runtimeRef.current?.seekDropTime(t);
       },
+      getTelemetryFrames() {
+        return runtimeRef.current?.getTelemetryFrames() ?? [];
+      },
+      getTelemetryEvents() {
+        return runtimeRef.current?.getTelemetryEvents() ?? [];
+      },
+      buildTelemetrySession() {
+        return runtimeRef.current?.buildTelemetrySession() ?? null;
+      },
     }),
     [],
   );
@@ -472,7 +510,11 @@ export const SceneViewport = React.forwardRef<
       aria-label="3D engineering viewport"
     >
       <canvas ref={canvasRef} aria-hidden="true" />
-      <FeaHud mode={props.renderMode ?? 'default'} fea={props.feaResult ?? null} />
+      <FeaHud
+        mode={props.renderMode ?? 'default'}
+        fea={props.feaResult ?? null}
+        liveDropData={liveDropData}
+      />
       {!props.populationResult ? (
         <DropPhysicsDebug simulation={props.dropSimulation ?? null} dropTime={dropTime} liveFrame={liveFrame} />
       ) : null}

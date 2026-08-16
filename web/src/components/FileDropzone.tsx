@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { useProjectStore } from '../state/projectStore';
 import { createClient } from '../api/client';
-import { parseInWorker, type PreviewFormat } from '../workers/workerProtocol';
+import { cancelPendingParses, parseInWorker, type PreviewFormat } from '../workers/workerProtocol';
 import { errorMessage, isAbortError, isUnsupportedGeometryPreview } from '../api/errors';
 import { LENGTH_UNITS, type LengthUnit } from '../lib/units';
 import type { GeometryPreview, ImportDiagnostic, MeshGeometryJson } from '../api/contracts';
@@ -47,6 +47,9 @@ export function FileDropzone({ onClose, variant = 'modal' }: FileDropzoneProps):
 
   const invalidateUpload = (): number => {
     abortRef.current?.abort();
+    // A newer file supersedes any in-flight worker parse: reject its pending
+    // promise immediately so a stale result can never resolve into a preview.
+    cancelPendingParses();
     const version = Math.max(uploadVersionRef.current, state.previewRequestVersion) + 1;
     uploadVersionRef.current = version;
     abortRef.current = null;
@@ -265,6 +268,7 @@ export function FileDropzone({ onClose, variant = 'modal' }: FileDropzoneProps):
         <div
           role="button"
           tabIndex={0}
+          aria-label="Drop geometry file (.json, .obj, .stl, .step/.stp) or click to browse"
           className="dropzone-area"
           onClick={() => inputRef.current?.click()}
           onKeyDown={(e) => {
@@ -282,18 +286,11 @@ export function FileDropzone({ onClose, variant = 'modal' }: FileDropzoneProps):
           }}
         >
           <div className="dropzone-icon-container">
-            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 16.5V9.75m0 0l-3 3m3-3l3 3M6.75 19.5a4.5 4.5 0 01-1.41-8.775 5.25 5.25 0 0110.233-2.33 3 3 0 013.758 3.848A3.752 3.752 0 0118 19.5H6.75z" />
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+              <path d="M12 16.5V9.75m0 0l-3 3m3-3l3 3M6.75 19.5a4.5 4.5 0 01-1.41-8.775 5.25 5.25 0 0110.233-2.33 3 3 0 013.758 3.848A3.752 3.752 0 0118 19.5H6.75z" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
           </div>
-          <p>Drop geometry file (.json, .obj, .stl, .step/.stp) or click to browse</p>
-          <div className="dropzone-format-tags">
-            <span className="format-tag">JSON</span>
-            <span className="format-tag">OBJ</span>
-            <span className="format-tag">STL</span>
-            <span className="format-tag">STEP</span>
-            <span className="format-tag">STP</span>
-          </div>
+          <p className="dropzone-prompt">Drop geometry file (.json, .obj, .stl, .step/.stp) or click to browse</p>
         </div>
       ) : (
         <div className="dropzone-unit-selector">
@@ -340,6 +337,7 @@ export function FileDropzone({ onClose, variant = 'modal' }: FileDropzoneProps):
       ) : null}
     </>
   );
+
 
   if (isFlat) {
     return (

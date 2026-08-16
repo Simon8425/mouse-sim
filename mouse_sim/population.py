@@ -214,7 +214,7 @@ DEFAULT_COMPONENT_SPECS = [
     # the platform component module design defaults.
     {"component_id": "switch_primary", "type": "switch", "actuation_force_n": 0.7},
     {"component_id": "scroll_encoder", "type": "encoder"},
-    {"component_id": "battery_pack", "type": "battery", "mass_kg": 0.008, "shock_limit_g": 500.0},
+    {"component_id": "battery_pack", "type": "battery", "mass_kg": 0.008, "shock_limit_g": 500.0, "latch_retention_n": 25.0},
     {"component_id": "pcb_main", "type": "pcb", "thickness_m": 0.0016},
     {"component_id": "adhesive_plate", "type": "adhesive", "area_m2": 4e-4, "adhered_mass_kg": 0.002},
     {"component_id": "screw_boss_m1_6", "type": "screw", "preload_n": 8.0, "supported_mass_kg": 0.015},
@@ -1346,7 +1346,13 @@ def _fold_unit(stats, record, params):
         pass
     elif ratio >= 1.0:
         failure_fraction = 1.0 / ratio
-        stats["ratio_bins"][min(10, int(failure_fraction * 10.0))] += 1
+        # Audit fix (survival off-by-one): bin on CEIL so that a unit
+        # failing at exactly u_f = 1.0 (ratio exactly 1.0) lands in bin 10
+        # and is NOT counted as alive at the horizon S(1.0) — the old
+        # int() floor put it in bin 10 too, but the inconsistency was that
+        # a unit at u_f = 1.0 was indistinguishable from one at u_f = 0.95
+        # in the survival tail.  Bin k now means (k-1)/10 < u_f <= k/10.
+        stats["ratio_bins"][min(10, math.ceil(failure_fraction * 10.0))] += 1
     else:
         stats["survivors"] += 1
     failed = 1 if record["failed"] else 0
@@ -1493,16 +1499,25 @@ def _survival(bins, survivors, n):
     Each unit's worst usage ratio ``r`` (fraction of its screening life
     consumed over the full lifespan) gives a failure time fraction
     ``u_f = 1/r`` (units with ``r >= 1`` fail within the lifespan; units with
-    ``r < 1`` outlive the horizon).  ``bins`` histogram ``min(1, u_f)`` for
-    the units that fail within the horizon; ``survivors`` counts the rest.
+    ``r < 1`` outlive the horizon).  ``bins`` histogram ``u_f`` on CEIL
+    semantics: bin ``k`` holds units with ``(k-1)/10 < u_f <= k/10`` (bin 0
+    is always empty; bin 10 holds ``(0.9, 1.0]`` including the exact-horizon
+    failures).  ``survivors`` counts the rest.
     ``S(u) = P(u_f > u)`` — the fraction of units still alive at usage
-    fraction ``u`` — so ``S(1.0) = P(r < 1) = 1 - failure_rate``.  ``n`` is
-    the failure-rate denominator (units with a determinable outcome); units
-    with unknown outcomes are excluded from the distribution and from ``n``.
+    fraction ``u`` — so ``S(1.0) = P(r < 1) = 1 - failure_rate`` (units that
+    fail exactly AT the horizon are dead there, never counted in ``S(1.0)``).
+    ``n`` is the failure-rate denominator (units with a determinable
+    outcome); units with unknown outcomes are excluded from the distribution
+    and from ``n``.
     """
     curve = []
     for step in range(1, 11):
-        fraction = (survivors + sum(bins[step:])) / n if n > 0 else 0.0
+        # Alive at u = step/10  <=>  u_f > step/10  <=>  bin >= step+1
+        # (with the ceil convention above).  The old int() floor binning
+        # combined with bins[step:] double-counted the exact-horizon
+        # failures (u_f == 1.0) as alive at S(1.0) and mis-binned every
+        # decile boundary.
+        fraction = (survivors + sum(bins[step + 1:])) / n if n > 0 else 0.0
         curve.append(
             {
                 "usage_fraction": round(step / 10.0, 1),
@@ -1644,6 +1659,86 @@ def _aggregate_diagnostics(config, context, total, per_unit_records):
     return lines
 
 
+def _weibull_fit(bins, survivors, n):
+    """Fit a 2-parameter Weibull to the usage-fraction failure distribution.
+
+    The screening survival model already emits an empirical S(u) curve; this
+    adds the parametric companion the reliability workflow needs: a Weibull
+    fit over the same binned failure-time fractions (bin k = (k-1)/10 <
+    u_f <= k/10) using median-rank regression (plotting position
+    (i - 0.3)/(n + 0.4)) on the cumulative failure CDF.
+
+        F(u) = 1 - exp(-(u/eta)^beta)   =>   ln(-ln(1-F)) = beta*ln(u) - beta*ln(eta)
+
+    Returns ``None`` (no fit) when there are no failures, when all units
+    survive, or when the failure sample is too small / degenerate for a
+    meaningful regression — the caller must never emit NaN/Inf into the
+    result.  ``n`` is the failure-rate denominator.
+    """
+    if n <= 0:
+        return None
+    failed = sum(bins)
+    if failed == 0 or survivors >= n:
+        # 0 failures -> infinite life: no finite eta/beta exists.
+        return None
+    # Cumulative failures in rank order.  A unit in bin k failed at the
+    # MIDPOINT of its decile (u_mid = (k - 0.5) / 10) — the median-rank
+    # plotting position for that failure.
+    times = []
+    for k in range(1, 11):
+        count = bins[k]
+        if count > 0:
+            times.extend([(k - 0.5) / 10.0] * count)
+    times.sort()
+    m = len(times)
+    if m < 3:
+        # Fewer than 3 failures cannot support a 2-parameter regression.
+        return None
+    xs = []
+    ys = []
+    for i, t in enumerate(times, start=1):
+        # Median rank F_hat = (i - 0.3) / (m + 0.4); require the point to be
+        # strictly inside (0, 1) so ln(-ln(1-F)) is finite.
+        f = (i - 0.3) / (m + 0.4)
+        if f <= 0.0 or f >= 1.0:
+            continue
+        if t <= 0.0:
+            continue
+        xs.append(math.log(t))
+        ys.append(math.log(-math.log(1.0 - f)))
+    if len(xs) < 2:
+        return None
+    # Least-squares slope/intercept: y = beta*x + c, c = -beta*ln(eta).
+    sum_x = sum(xs)
+    sum_y = sum(ys)
+    sum_xx = sum(x * x for x in xs)
+    sum_xy = sum(x * y for x, y in zip(xs, ys))
+    denom = len(xs) * sum_xx - sum_x * sum_x
+    if not math.isfinite(denom) or abs(denom) < 1e-12:
+        return None
+    beta = (len(xs) * sum_xy - sum_x * sum_y) / denom
+    intercept = (sum_y - beta * sum_x) / len(xs)
+    if not math.isfinite(beta) or not math.isfinite(intercept) or beta <= 0.0:
+        return None
+    eta = math.exp(-intercept / beta)
+    if not math.isfinite(eta) or eta <= 0.0:
+        return None
+    # B10 life: t_10 = eta * (-ln(0.9))^(1/beta).
+    b10 = eta * ((-math.log(0.9)) ** (1.0 / beta))
+    return {
+        "eta": _sig(eta),
+        "beta": round(beta, 3),
+        "b10_usage_fraction": _sig(b10),
+        "failures_fit": m,
+        "note": (
+            "2-parameter Weibull fit over the binned usage-fraction failure "
+            "distribution (median-rank regression, plotting position "
+            "(i-0.3)/(m+0.4)); B10 = eta*(-ln(0.9))^(1/beta); screening "
+            "companion to the empirical survival curve"
+        ),
+    }
+
+
 def _assemble_result(config, context, total, per_unit_records, diagnostics, contact_kwargs):
     n = config["sample_count"]
     units_failed = total["unit_failures"]
@@ -1739,6 +1834,7 @@ def _assemble_result(config, context, total, per_unit_records, diagnostics, cont
         "shell": shell_block,
         "sensitivity": _sensitivity(total, n),
         "survival": _survival(total["ratio_bins"], total["survivors"], failure_denominator),
+        "weibull": _weibull_fit(total["ratio_bins"], total["survivors"], failure_denominator),
         "per_unit_failures": _per_unit_failures(per_unit_records),
         "total_component_failures": sum(total["component_failures"].values()),
         "model": _model(config, context, contact_kwargs),

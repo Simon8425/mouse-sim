@@ -750,7 +750,7 @@ class RequirementEvaluationTests(unittest.TestCase):
             "structural_validity",
         ):
             self.assertIn(key, payload)
-        self.assertEqual(len(payload["integrity_gates"]), 6)
+        self.assertEqual(len(payload["integrity_gates"]), 7)
 
 
 class ConvergenceEvidenceTests(unittest.TestCase):
@@ -868,11 +868,13 @@ class RobustnessQualificationTests(unittest.TestCase):
         self.assertIn("ANALYSIS_VALIDITY", result.blocking_keys)
         failed_gates = [gate.key for gate in result.integrity_gates if not gate.passed]
         # CORRELATION_MEASURED is listed as not-passed without a measured-drop
-        # campaign, but it is non-evaluable and non-blocking in that state.
+        # campaign, and COMPONENT_CHECKS_CLEAN is not-passed without component
+        # screening; both are non-evaluable and non-blocking in that state.
         self.assertEqual(
             sorted(failed_gates),
             sorted((
                 "ANALYSIS_VALIDITY",
+                "COMPONENT_CHECKS_CLEAN",
                 "CONVERGENCE_EVIDENCE",
                 "REQUIREMENT_EVALUATION",
                 "CORRELATION_MEASURED",
@@ -928,8 +930,96 @@ class RobustnessQualificationTests(unittest.TestCase):
         self.assertNotEqual(result.evidence_disposition, "qualification_accepted")
 
 
-if __name__ == "__main__":
-    unittest.main()
+class ComponentChecksGateTests(unittest.TestCase):
+    def test_component_error_blocks_qualification(self):
+        # A battery latch dislodgement (error finding in the component
+        # screening) hard-blocks qualification via COMPONENT_CHECKS_CLEAN.
+        result = evaluate_qualification(
+            "qualification",
+            **approved_inputs(
+                pipeline_result={
+                    "components": {
+                        "components": [
+                            {
+                                "component_id": "battery-01",
+                                "status": "fail",
+                                "findings": [
+                                    {
+                                        "code": "BATTERY_LATCH_DISLODGED",
+                                        "severity": "error",
+                                        "message": "cell inertia exceeds latch retention",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                }
+            ),
+        )
+        self.assertEqual(result.evidence_disposition, "qualification_blocked")
+        self.assertIn("COMPONENT_CHECKS_CLEAN", result.blocking_keys)
+        gate = {item.key: item for item in result.integrity_gates}["COMPONENT_CHECKS_CLEAN"]
+        self.assertFalse(gate.passed)
+        self.assertTrue(gate.blocker)
+        self.assertIn("BATTERY_LATCH_DISLODGED", gate.explanation)
+
+    def test_component_blocker_severity_blocks(self):
+        result = evaluate_qualification(
+            "qualification",
+            **approved_inputs(
+                pipeline_result={
+                    "components": {
+                        "components": [
+                            {
+                                "component_id": "battery-01",
+                                "findings": [
+                                    {"code": "BATTERY_LATCH_DISLODGED", "severity": "blocker"}
+                                ],
+                            }
+                        ]
+                    }
+                }
+            ),
+        )
+        self.assertIn("COMPONENT_CHECKS_CLEAN", result.blocking_keys)
+
+    def test_component_warnings_do_not_block(self):
+        result = evaluate_qualification(
+            "qualification",
+            **approved_inputs(
+                pipeline_result={
+                    "components": {
+                        "components": [
+                            {
+                                "component_id": "battery-01",
+                                "findings": [
+                                    {
+                                        "code": "BATTERY_SHOCK_MARGINAL",
+                                        "severity": "warning",
+                                        "message": "at the screening boundary",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                }
+            ),
+        )
+        self.assertNotIn("COMPONENT_CHECKS_CLEAN", result.blocking_keys)
+        self.assertEqual(result.evidence_disposition, "qualification_pending_review")
+
+    def test_missing_component_data_non_blocking(self):
+        result = evaluate_qualification("qualification", **approved_inputs())
+        gate = {item.key: item for item in result.integrity_gates}["COMPONENT_CHECKS_CLEAN"]
+        self.assertFalse(gate.passed)
+        self.assertFalse(gate.evaluable)
+        self.assertFalse(gate.blocker)
+        self.assertNotIn("COMPONENT_CHECKS_CLEAN", result.blocking_keys)
+
+    def test_standards_reference_mentions_iec_and_mil_std(self):
+        from mouse_sim.qualification import DROP_STANDARDS_REFERENCE
+        self.assertIn("IEC 60068-2-31", DROP_STANDARDS_REFERENCE)
+        self.assertIn("516.8", DROP_STANDARDS_REFERENCE)
 
 
 class MissingInputGateTests(unittest.TestCase):
@@ -982,3 +1072,7 @@ class MissingInputGateTests(unittest.TestCase):
         self.assertEqual(result.evidence_disposition, "qualification_pending_review")
         self.assertNotEqual(result.evidence_disposition, "qualification_accepted")
         self.assertTrue(result.qualified)
+
+
+if __name__ == "__main__":
+    unittest.main()
