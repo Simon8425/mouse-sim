@@ -1,5 +1,6 @@
 import json
 import os
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,21 @@ from mouse_sim.step_kernel import freecadcmd_path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_STEP = REPO_ROOT / "G3-20260320.stp"
 RUN_INTEGRATION = os.environ.get("MOUSE_SIM_RUN_SLOW_STEP_INTEGRATION") == "1"
+
+
+def _tiny_binary_stl():
+    """One open cube-style triangle pair, sized in millimetres."""
+    count = 2
+    binary = b" " * 80 + struct.pack("<I", count)
+    for base in (0, 3):
+        binary += struct.pack(
+            "<12f",
+            0.0, 0.0, 1.0,
+            float(base), 0.0, 0.0,
+            float(base + 1), 0.0, 0.0,
+            float(base + 1), float(base + 2), 0.0,
+        ) + struct.pack("<H", 0)
+    return binary
 
 
 class StdlibFacetedStepImportTests(unittest.TestCase):
@@ -30,6 +46,83 @@ class StdlibFacetedStepImportTests(unittest.TestCase):
         self.assertEqual(result.source_units, "mm")
         self.assertEqual(len(result.geometry.triangles), 12)
         self.assertIsNone(result.display_asset)
+
+
+class StdlibStlImportTests(unittest.TestCase):
+    def test_stl_stdlib_backend_never_runs_kernel(self):
+        """The stdlib STL parser must stay available and produce NO display
+        asset; the FreeCAD kernel is an opt-in upgrade, never a hard
+        dependency for reading an STL."""
+        with mock.patch(
+            "mouse_sim.step_kernel.tessellate_stl",
+            side_effect=AssertionError("kernel must not run"),
+        ):
+            result = load_geometry(
+                _tiny_binary_stl(),
+                fmt="stl",
+                units="mm",
+                stl_backend="stdlib",
+            )
+        self.assertTrue(result.is_supported)
+        self.assertEqual(result.source_units, "mm")
+        self.assertIsInstance(result.geometry, TriangleMesh)
+        self.assertIsNone(result.display_asset)
+
+    def test_stl_default_backend_is_stdlib(self):
+        """Direct/CLI STL loads keep using the stdlib parser by default so
+        existing behavior (and the 926-test suite) is unchanged."""
+        with mock.patch(
+            "mouse_sim.step_kernel.tessellate_stl",
+            side_effect=AssertionError("kernel must not run"),
+        ), mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MOUSE_SIM_STL_BACKEND", None)
+            result = load_geometry(_tiny_binary_stl(), fmt="stl", units="mm")
+        self.assertTrue(result.is_supported)
+        self.assertIsNone(result.display_asset)
+
+
+@unittest.skipUnless(
+    RUN_INTEGRATION and freecadcmd_path() is not None,
+    "set MOUSE_SIM_RUN_SLOW_STEP_INTEGRATION=1 with FreeCADCmd to run kernel tests",
+)
+class RealStlKernelTests(unittest.TestCase):
+    def test_stl_kernel_produces_smooth_glb_and_analysis_mesh(self):
+        with tempfile.TemporaryDirectory(prefix="mouse-sim-stl-integration-") as directory:
+            result = load_geometry(
+                _tiny_binary_stl(),
+                fmt="stl",
+                units="mm",
+                stl_backend="kernel",
+                step_asset_dir=directory,
+                step_timeout=300,
+            )
+            self.assertTrue(result.is_supported)
+            self.assertEqual(result.source_units, "mm")
+            self.assertIsInstance(result.geometry, TriangleMesh)
+            self.assertGreater(len(result.geometry.triangles), 0)
+            asset = result.display_asset
+            self.assertIsNotNone(asset)
+            self.assertEqual(asset["format"], "glb")
+            self.assertEqual(asset["backend"], "freecad-occt")
+            glb_path = Path(asset["path"])
+            self.assertTrue(glb_path.is_file())
+            # The GLB must carry per-vertex smooth normals and match the
+            # analysis mesh's bounds so the displayed asset lines up with
+            # physics/bounds.
+            from mouse_sim.freecad_step_worker import _glb_json_and_bin
+
+            gltf, _ = _glb_json_and_bin(glb_path.read_bytes())
+            primitive = gltf["meshes"][0]["primitives"][0]
+            self.assertIn("POSITION", primitive["attributes"])
+            self.assertIn("NORMAL", primitive["attributes"])
+
+            analysis = result.geometry
+            source = Path(directory) / (asset["asset_id"] + ".mesh.json")
+            payload = json.loads(source.read_text(encoding="utf-8"))
+            self.assertEqual(payload["geometry"]["type"], "mesh")
+            self.assertEqual(payload["geometry"]["units"], "m")
+            self.assertEqual(len(payload["geometry"]["vertices"]), len(analysis.vertices))
+            self.assertEqual(len(payload["geometry"]["triangles"]), len(analysis.triangles))
 
 
 @unittest.skipUnless(

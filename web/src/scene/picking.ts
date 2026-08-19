@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 
 export interface PickerOptions {
-  onClick: (id: string | null) => void;
+  onClick: (id: string | null, meta: { shiftKey: boolean }) => void;
   thresholdPx?: number;
 }
 
@@ -86,7 +86,10 @@ export function createPicker(
 
     if (dist <= threshold) {
       const pickedId = pickObjectId(canvas, camera, root, e.clientX, e.clientY);
-      options.onClick(pickedId);
+      // Shift is read from pointerup: Shift+click toggles a member of the
+      // selection set; clicking empty 3D space reports null and clears the
+      // whole selection (Shift+empty keeps the current set untouched).
+      options.onClick(pickedId, { shiftKey: e.shiftKey });
     }
   };
 

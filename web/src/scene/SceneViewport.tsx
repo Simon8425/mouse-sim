@@ -67,7 +67,7 @@ export interface LiveDropData {
 export interface SceneViewportProps {
   entries: ObjectSceneEntry[];
   visibility: Record<string, boolean>;
-  selectedId: string | null;
+  selectedIds: string[];
   explode: number;
   theme: 'light' | 'dark';
   quality: QualityTier;
@@ -77,7 +77,7 @@ export interface SceneViewportProps {
   renderMode?: RenderMode;
   feaResult?: FeaResult | null;
   insets?: { left?: number; right?: number; top?: number; bottom?: number };
-  onPick: (id: string | null) => void;
+  onPick: (id: string | null, meta?: { shiftKey?: boolean }) => void;
   onDoublePick?: (id: string | null) => void;
   onStats?: (stats: RenderStats) => void;
   onDropEnded?: () => void;
@@ -270,7 +270,7 @@ export const SceneViewport = React.forwardRef<
         precision,
         theme: propsRef.current.theme,
         quality: propsRef.current.quality,
-        onPick: (id) => propsRef.current.onPick(id),
+        onPick: (id, meta) => propsRef.current.onPick(id, meta),
         onStats: (stats) => propsRef.current.onStats?.(stats),
         onDropEnded: () => dropEndedRef.current(),
       });
@@ -284,7 +284,7 @@ export const SceneViewport = React.forwardRef<
     // Initial sync
     runtime.setObjects(propsRef.current.entries);
     runtime.setVisibility(propsRef.current.visibility);
-    runtime.setSelection(propsRef.current.selectedId);
+    runtime.setSelection(propsRef.current.selectedIds);
     runtime.setExplode(propsRef.current.explode);
     runtime.setOverlays(propsRef.current.overlays);
 
@@ -338,14 +338,23 @@ export const SceneViewport = React.forwardRef<
 
   const { onLiveDropData, dropSimulation } = props;
 
+  // Keep the latest playback-state callback in a ref so the broadcast effect
+  // below depends ONLY on `dropPlaying`. Depending on the whole `props`
+  // object (a fresh identity every parent render) re-runs the effect on every
+  // render; dispatching from it then re-renders the parent, re-firing the
+  // effect, and the loop trips React's "Maximum update depth exceeded"
+  // safeguard, tearing down the viewport (and any FreeCAD GLB display).
+  const onPlaybackStateChangeRef = React.useRef(props.onPlaybackStateChange);
+  onPlaybackStateChangeRef.current = props.onPlaybackStateChange;
+
   // The status interval only needs to run while playback is active: the
   // runtime's drop clock is frozen whenever the simulation is paused or
   // finished, so polling it every 100 ms would otherwise keep a timer (and
   // a setState call per tick) alive for the whole lifetime of a displayed
   // drop result.
   React.useEffect(() => {
-    props.onPlaybackStateChange?.(dropPlaying);
-  }, [dropPlaying, props]);
+    onPlaybackStateChangeRef.current?.(dropPlaying);
+  }, [dropPlaying]);
 
   React.useEffect(() => {
     if (!props.dropSimulation) return;
@@ -423,8 +432,8 @@ export const SceneViewport = React.forwardRef<
   }, []);
 
   React.useEffect(() => {
-    runtimeRef.current?.setSelection(props.selectedId);
-  }, [props.selectedId]);
+    runtimeRef.current?.setSelection(props.selectedIds);
+  }, [props.selectedIds]);
 
   React.useEffect(() => {
     runtimeRef.current?.setExplode(props.explode);

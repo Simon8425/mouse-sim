@@ -61,7 +61,7 @@ export interface SceneRuntimeOptions {
   precision?: ShaderPrecision;
   theme: 'light' | 'dark';
   quality: QualityTier;
-  onPick: (id: string | null) => void;
+  onPick: (id: string | null, meta?: { shiftKey?: boolean }) => void;
   onDoublePick?: (id: string | null) => void;
   onStats?: (stats: RenderStats) => void;
   onDropEnded?: () => void;
@@ -132,7 +132,7 @@ export function exactModelLowestZ(vertices: Vec3[], quaternion: THREE.Quaternion
 export interface SceneRuntime {
   setObjects: (entries: ObjectSceneEntry[]) => void;
   setVisibility: (visibility: Record<string, boolean>) => void;
-  setSelection: (id: string | null) => void;
+  setSelection: (ids: string[]) => void;
   setExplode: (factor: number) => void;
   setTheme: (theme: 'light' | 'dark') => void;
   setQuality: (quality: QualityTier) => void;
@@ -642,7 +642,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   // State variables
   let currentEntries: ObjectSceneEntry[] = [];
   let currentVisibility: Record<string, boolean> = {};
-  let currentSelectionId: string | null = null;
+  let currentSelectedIds = new Set<string>();
   let currentDropSimulation: DropSimulationResult | null = null;
   /** Instanced batches for geometrically identical parts (see buildInstancedBatches). */
   let instancedBatches: InstancedBatchGroup | null = null;
@@ -1009,6 +1009,70 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
           return;
         }
         markAssetResourcesOwned(gltf.scene);
+        // Detect STL display assets (FreeCAD STL worker) for FreeCAD-faithful
+        // shading: the worker bakes crease-angle aware vertex normals
+        // (SoShapeHints logic) so sharp edges stay crisp while shallow curves
+        // are smooth — exactly like FreeCAD's mesh view. Add a subtle edge
+        // overlay like FreeCAD's "Flat Lines" mode for a crisp, sharp look
+        // and enable polygon offset on the faces so the lines sit cleanly on
+        // top without Z-fighting. This uses the real FreeCAD creaseAngle
+        // threshold (30°) that the worker baked into the GLB.
+        const parserJson = (gltf.parser as unknown as { json?: { asset?: { generator?: string } } })?.json;
+        const isStlAsset = Boolean(
+          parserJson?.asset?.generator?.includes('freecad-stl') ||
+            (() => {
+              let found = false;
+              gltf.scene.traverse((o) => {
+                const m = o as THREE.Mesh & { material?: { name?: string } | { name?: string }[] };
+                if (found || !m.isMesh || !m.material) return;
+                const mats = Array.isArray(m.material) ? m.material : [m.material];
+                for (const mat of mats) if ((mat as { name?: string }).name === 'stl') found = true;
+              });
+              return found;
+            })(),
+        );
+        if (isStlAsset) {
+          gltf.scene.traverse((object) => {
+            const mesh = object as THREE.Mesh;
+            if (!mesh.isMesh || !mesh.geometry) return;
+            const mat = mesh.material as THREE.MeshStandardMaterial | THREE.Material[];
+            const materials = Array.isArray(mat) ? mat : [mat];
+            for (const m of materials) {
+              if (m instanceof THREE.MeshStandardMaterial) {
+                // FreeCAD's SoShapeHints + headlight gives a tight, bright
+                // highlight. Our worker bakes roughness 0.35 for this; ensure
+                // the face is rendered smooth (not flat) so the baked
+                // per-vertex normals are used, and push the face back
+                // slightly so the edge lines can sit on top.
+                m.flatShading = false;
+                m.needsUpdate = true;
+                m.polygonOffset = true;
+                m.polygonOffsetFactor = 1;
+                m.polygonOffsetUnits = 1;
+              }
+            }
+            // Flat Lines style: subtle edge overlay like FreeCAD's
+            // SoIndexedFaceSet + SoIndexedLineSet with polygon offset.
+            // Only for moderate meshes to avoid huge line buffers.
+            const triCount = (mesh.geometry.index?.count ?? mesh.geometry.attributes.position.count) / 3;
+            if (triCount < 500000) {
+              const edges = new THREE.EdgesGeometry(mesh.geometry, 30);
+              const lineMat = new THREE.LineBasicMaterial({
+                color: 0x0a0a0a,
+                transparent: true,
+                opacity: 0.18,
+              });
+              lineMat.userData.owned = true;
+              const lines = new THREE.LineSegments(edges, lineMat);
+              lines.userData.owned = true;
+              // EdgesGeometry is in local space; parent it to the mesh so
+              // it inherits the mesh's transform (the GLB node transform
+              // already baked into the mesh's world matrix via the scene
+              // flip above, so local edges are correct).
+              mesh.add(lines);
+            }
+          });
+        }
         // The OCCT glTF converter preserves the STEP Z-up frame. The source
         // assembly is authored from its underside, while this scene presents
         // the engineering top view by default; flip the complete asset once,
@@ -1311,7 +1375,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
         curr = curr.parent;
       }
 
-      if (objId && objId === currentSelectionId && mesh.isMesh) {
+      if (objId && currentSelectedIds.has(objId) && mesh.isMesh) {
         selectedMeshesCache.push(mesh);
         if (quality === 'low' && mesh.material) {
           const mat = mesh.material as THREE.MeshStandardMaterial;
@@ -1323,7 +1387,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       }
     });
 
-    if (currentSelectionId && selectedMeshesCache.length > 0) {
+    if (currentSelectedIds.size > 0 && selectedMeshesCache.length > 0) {
       for (const mesh of selectedMeshesCache) {
         if (!mesh.geometry) continue;
 
@@ -1517,7 +1581,7 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
     }
 
     // Keep selection highlight overlay transforms in sync during camera motion, explode, and drop
-    if (currentSelectionId && selectionHighlightGroup.children.length > 0 && selectedMeshesCache.length > 0) {
+    if (currentSelectedIds.size > 0 && selectionHighlightGroup.children.length > 0 && selectedMeshesCache.length > 0) {
       let childIdx = 0;
       for (const mesh of selectedMeshesCache) {
         if (childIdx < selectionHighlightGroup.children.length) {
@@ -1585,9 +1649,9 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       applyVisibility();
     },
 
-    setSelection(id: string | null) {
+    setSelection(ids: string[]) {
       if (disposed) return;
-      currentSelectionId = id;
+      currentSelectedIds = new Set(ids);
       applySelection();
     },
 

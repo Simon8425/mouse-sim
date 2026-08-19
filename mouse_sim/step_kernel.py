@@ -27,6 +27,10 @@ BACKEND_NAME = "freecad-occt"
 # layout changes so previously cached assets rebuild (parts export added).
 ASSET_FORMAT_VERSION = "parts-v7"
 
+# Format marker embedded in the STL asset id.  Bumped whenever the STL worker
+# output layout changes so previously cached assets rebuild.
+_STL_ASSET_FORMAT_VERSION = "stl-v1"
+
 
 _TESSELLATE_LOCK = threading.Lock()
 
@@ -345,9 +349,19 @@ def _read_json(path, max_bytes=1024 * 1024 * 1024):
 
 
 def _worker_script_hash():
-    """Hash of the worker script; asset ids change when the worker changes."""
+    """Hash of the STEP worker script; asset ids change when it changes."""
     try:
         path = os.path.join(os.path.dirname(__file__), "freecad_step_worker.py")
+        with open(path, "rb") as stream:
+            return hashlib.sha256(stream.read()).hexdigest()[:16]
+    except OSError:
+        return "unknown"
+
+
+def _stl_worker_script_hash():
+    """Hash of the STL worker script; asset ids change when it changes."""
+    try:
+        path = os.path.join(os.path.dirname(__file__), "freecad_stl_worker.py")
         with open(path, "rb") as stream:
             return hashlib.sha256(stream.read()).hexdigest()[:16]
     except OSError:
@@ -646,6 +660,291 @@ def tessellate_step(data, source_name, source_units, asset_dir, timeout=DEFAULT_
         return result
 
 
+def stl_scale_to_m(source_units):
+    """Return the STL source unit -> metre scale, or ``None`` when unknown.
+
+    STL declares no units; the caller supplies the assumed source unit and the
+    worker scales the raw coordinates to metres.
+    """
+    try:
+        return _UNIT_SCALE_TO_M[str(source_units).strip().lower()]
+    except (KeyError, AttributeError):
+        return None
+
+
+def _stl_settings(source_units, scale_to_m):
+    return {
+        "asset_format": _STL_ASSET_FORMAT_VERSION,
+        "backend": BACKEND_NAME,
+        "format": "stl",
+        "source_units": str(source_units).strip().lower(),
+        "scale_to_m": float(scale_to_m),
+        "worker_script_sha256": _stl_worker_script_hash(),
+    }
+
+
+def _stl_diagnostics(metadata, cached):
+    from .importers import ImportDiagnostic
+
+    details = {
+        "backend": BACKEND_NAME,
+        "object_count": str(metadata.get("object_count", 0)),
+        "triangle_count": str(metadata.get("triangle_count", 0)),
+        "vertex_count": str(metadata.get("vertex_count", 0)),
+        "cached": "true" if cached else "false",
+    }
+    return (
+        ImportDiagnostic(
+            "stl_kernel_tessellated",
+            "info",
+            "FreeCAD imported and smoothed the STL mesh for display; geometry is the mesh source, not CAD-exact",
+            tuple((key, str(details[key])) for key in sorted(details)),
+        ),
+    )
+
+
+def _valid_stl_glb(path, vertex_count, triangle_count):
+    """Certify a cached STL GLB before serving it.
+
+    The STEP pipeline validates cached GLB output by parsing it back; the STL
+    worker's own GLB is certified the same way so a torn or tampered file is a
+    cache miss (rebuild) instead of a broken display asset.
+    """
+    try:
+        from .freecad_step_worker import _glb_json_and_bin, _read_accessor
+
+        with open(path, "rb") as stream:
+            data = stream.read()
+        gltf, bin_data = _glb_json_and_bin(data)
+        meshes = gltf.get("meshes") or []
+        if not meshes:
+            return False
+        primitives = meshes[0].get("primitives") or []
+        if not primitives:
+            return False
+        primitive = primitives[0]
+        attributes = primitive.get("attributes") or {}
+        if "POSITION" not in attributes or "NORMAL" not in attributes:
+            return False
+        positions = _read_accessor(gltf, bin_data, attributes["POSITION"])
+        # Crease-angle splitting duplicates vertices at sharp edges, so the
+        # GLB may have *more* positions than the analysis mesh (which stays
+        # welded). Allow >= and validate index bounds against the GLB's own
+        # position count instead.
+        if len(positions) < vertex_count:
+            return False
+        glb_vertex_count = len(positions)
+        if "indices" not in primitive:
+            return False
+        indices = _read_accessor(gltf, bin_data, primitive["indices"])
+        if len(indices) != triangle_count * 3:
+            return False
+        for item in indices:
+            if not (0 <= int(item[0]) < glb_vertex_count):
+                return False
+        # Normals must match the (possibly split) position count
+        normals = _read_accessor(gltf, bin_data, attributes["NORMAL"])
+        if len(normals) != glb_vertex_count:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _cached_stl_result(asset_id, root, settings, source_sha256, cached=True):
+    """Load a cached FreeCAD STL tessellation, or return ``None`` for a miss.
+
+    Unlike the STEP pipeline, an STL is a single part: no ``parts.json`` is
+    produced (the preview carries no per-part list), so the cache completeness
+    check covers the mesh and GLB only.
+    """
+    mesh_path = root / (asset_id + ".mesh.json")
+    glb_path = root / (asset_id + ".glb")
+    manifest_path = root / (asset_id + ".manifest.json")
+    try:
+        complete = mesh_path.is_file() and glb_path.is_file() and glb_path.stat().st_size > 0
+    except OSError:
+        complete = False
+    if not complete:
+        return None
+    try:
+        payload = _read_json(mesh_path)
+        if not isinstance(payload, dict):
+            raise ValueError("STL worker mesh payload is not an object")
+        geometry_payload = payload.get("geometry")
+        geometry = geometry_from_dict(geometry_payload, units="m")
+        if not isinstance(geometry, TriangleMesh):
+            raise ValueError("STL worker geometry is not a mesh")
+        # Certify the paired GLB (positions/normals/indices consistent with the
+        # analysis mesh) before treating the cache entry as complete.
+        if not _valid_stl_glb(glb_path, len(geometry.vertices), len(geometry.triangles)):
+            return None
+        metadata = payload.get("metadata") if isinstance(payload, dict) else None
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        manifest = _read_json(manifest_path) if manifest_path.is_file() else {}
+        if isinstance(manifest, dict):
+            manifest_mesh = manifest.get("mesh")
+            if isinstance(manifest_mesh, dict):
+                for key, value in manifest_mesh.items():
+                    metadata.setdefault(key, value)
+        metadata.setdefault("object_count", 1)
+        metadata.setdefault("triangle_count", len(geometry.triangles))
+        metadata.setdefault("vertex_count", len(geometry.vertices))
+        asset = {
+            "asset_id": asset_id,
+            "path": str(glb_path.resolve()),
+            "format": "glb",
+            "sha256": _sha256_file(glb_path),
+            "source_sha256": source_sha256,
+            "bytes": glb_path.stat().st_size,
+            "object_count": int(metadata.get("object_count", 1)),
+            "triangle_count": int(metadata.get("triangle_count", len(geometry.triangles))),
+            "backend": BACKEND_NAME,
+            "tessellation_deflection_mm": 0.0,
+        }
+        return geometry, _stl_diagnostics(metadata, cached=cached), asset
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError, StepKernelFailure):
+        return None
+
+
+def tessellate_stl(data, source_name, source_units, asset_dir, timeout=DEFAULT_TIMEOUT):
+    """Run the FreeCAD STL worker and return ``(mesh, diagnostics, asset)``.
+
+    The worker parses the STL with FreeCAD's Mesh module (robust against
+    nonconforming headers and footers), welds seams, computes smooth vertex
+    normals, and writes a GLB display asset plus an analysis mesh.  Falls back
+    to stdlib parsing is handled by the caller when the kernel is unavailable.
+    """
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    elif not isinstance(data, bytes):
+        data = bytes(data)
+    scale_to_m = stl_scale_to_m(source_units)
+    if scale_to_m is None:
+        raise StepKernelFailure(
+            "unsupported STL source length unit: {!r}".format(source_units)
+        )
+    settings = _stl_settings(source_units, scale_to_m)
+    source_sha256 = _sha256_bytes(data)
+    asset_id = _asset_id(source_sha256, settings)
+    root = _asset_dir(asset_dir)
+    mesh_path = root / (asset_id + ".mesh.json")
+    glb_path = root / (asset_id + ".glb")
+    manifest_path = root / (asset_id + ".manifest.json")
+    input_path = root / (asset_id + ".stl")
+    cached = _cached_stl_result(asset_id, root, settings, source_sha256)
+    if cached is not None:
+        return cached
+    with _TESSELLATE_LOCK:
+        cached = _cached_stl_result(asset_id, root, settings, source_sha256)
+        if cached is not None:
+            return cached
+
+        command_path = freecadcmd_path()
+        if command_path is None:
+            raise StepKernelUnavailable(
+                "FreeCADCmd is unavailable; set {} or install FreeCAD at {}".format(
+                    FREECADCMD_ENV, DEFAULT_FREECADCMD
+                )
+            )
+        if timeout is None:
+            timeout = DEFAULT_TIMEOUT
+        try:
+            timeout = float(timeout)
+        except (TypeError, ValueError):
+            raise StepKernelFailure("STL kernel timeout must be a finite positive number")
+        if not math.isfinite(timeout) or timeout <= 0.0:
+            raise StepKernelFailure("STL kernel timeout must be a finite positive number")
+
+        try:
+            temp_input = input_path.with_suffix(".stl.tmp")
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(
+                str(temp_input), os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600
+            )
+            try:
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(data)
+            except OSError:
+                try:
+                    os.remove(temp_input)
+                except OSError:
+                    pass
+                raise
+            os.replace(temp_input, input_path)
+        except OSError as exc:
+            raise StepKernelFailure("cannot write temporary STL input: {}".format(exc))
+
+        worker_script = Path(__file__).with_name("freecad_stl_worker.py").resolve()
+        env = dict(os.environ)
+        env.update(
+            {
+                "MOUSE_SIM_STL_INPUT": str(input_path),
+                "MOUSE_SIM_STL_MESH_OUTPUT": str(mesh_path),
+                "MOUSE_SIM_STL_GLB_OUTPUT": str(glb_path),
+                "MOUSE_SIM_STL_MANIFEST_OUTPUT": str(manifest_path),
+                "MOUSE_SIM_STL_SOURCE_UNITS": str(source_units).strip().lower(),
+                "MOUSE_SIM_STL_SCALE": str(scale_to_m),
+                "MOUSE_SIM_STL_SOURCE_SHA256": source_sha256,
+            }
+        )
+        expression = "exec(open({}).read())".format(repr(str(worker_script)))
+        command = [str(command_path), "-c", expression]
+
+        def _limit_worker():
+            try:
+                import resource
+
+                try:
+                    resource.setrlimit(resource.RLIMIT_CPU, (600, 600))
+                except Exception as exc:
+                    sys.stderr.write("mouse_sim stl worker: RLIMIT_CPU failed: {}\n".format(exc))
+                try:
+                    resource.setrlimit(resource.RLIMIT_NOFILE, (1024, 1024))
+                except Exception as exc:
+                    sys.stderr.write("mouse_sim stl worker: RLIMIT_NOFILE failed: {}\n".format(exc))
+                try:
+                    resource.setrlimit(
+                        resource.RLIMIT_AS, (6 * 1024 * 1024 * 1024, 6 * 1024 * 1024 * 1024)
+                    )
+                except Exception as exc:
+                    sys.stderr.write("mouse_sim stl worker: RLIMIT_AS failed: {}\n".format(exc))
+            except Exception as exc:
+                sys.stderr.write("mouse_sim stl worker: resource module unavailable: {}\n".format(exc))
+
+        worker_kwargs = {}
+        if os.name == "posix":
+            worker_kwargs["preexec_fn"] = _limit_worker
+        else:
+            worker_kwargs["start_new_session"] = False
+        try:
+            completed = subprocess.run(
+                command,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+                **worker_kwargs
+            )
+        except subprocess.TimeoutExpired:
+            raise StepKernelFailure("FreeCAD STL tessellation timed out after {} seconds".format(timeout))
+        except OSError as exc:
+            raise StepKernelUnavailable("FreeCADCmd could not be started: {}".format(exc))
+        if completed.returncode != 0:
+            raise StepKernelFailure(
+                "FreeCAD STL worker exited with status {}: {}".format(
+                    completed.returncode, _failure_output(completed)
+                )
+            )
+        if not (mesh_path.is_file() and glb_path.is_file() and glb_path.stat().st_size > 0):
+            raise StepKernelFailure("FreeCAD STL worker completed without mesh and GLB outputs")
+        result = _cached_stl_result(asset_id, root, settings, source_sha256, cached=False)
+        if result is None:
+            raise StepKernelFailure("FreeCAD STL worker produced invalid mesh or GLB metadata")
+        return result
+
+
 __all__ = [
     "BACKEND_NAME",
     "DEFAULT_TIMEOUT",
@@ -659,4 +958,6 @@ __all__ = [
     "detect_step_units",
     "default_asset_dir",
     "tessellate_step",
+    "stl_scale_to_m",
+    "tessellate_stl",
 ]

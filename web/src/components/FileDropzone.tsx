@@ -69,7 +69,7 @@ export function FileDropzone({ onClose, variant = 'modal' }: FileDropzoneProps):
   };
 
   const normalizeServerSide = async (
-    format: 'json' | 'step',
+    format: 'json' | 'step' | 'stl',
     file: File,
     controller: AbortController,
     version: number,
@@ -163,7 +163,20 @@ export function FileDropzone({ onClose, variant = 'modal' }: FileDropzoneProps):
     const version = uploadVersionRef.current || invalidateUpload();
     const controller = new AbortController();
     abortRef.current = controller;
-    const format: PreviewFormat = file.name.toLowerCase().endsWith('.obj') ? 'obj' : 'stl';
+    // STL goes through the server-side importer (which routes it through the
+    // FreeCAD kernel for a CAD-quality GLB display and a canonical analysis
+    // mesh). This mirrors the JSON/STEP flow: no client-side temp preview, so
+    // the scene never flashes a differently-framed mesh before the asset
+    // loads.
+    if (file.name.toLowerCase().endsWith('.stl')) {
+      // Mirrors the JSON/STEP flow: mark the preview working first so the
+      // PREVIEW_OK dispatch (version-guarded) is accepted.
+      setIsParsing(true);
+      dispatch({ type: 'PREVIEW_START', temp: null, version });
+      await normalizeServerSide('stl', file, controller, version);
+      return;
+    }
+    const format: PreviewFormat = 'obj';
 
     setIsParsing(true);
     dispatch({ type: 'PREVIEW_START', temp: null, version });

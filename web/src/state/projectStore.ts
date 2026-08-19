@@ -47,7 +47,10 @@ export interface ProjectState {
   previewError: string | null;
   previewDiagnostics: ImportDiagnostic[] | null;
   tempPreview: TempPreview | null;
+  /** Primary selection (last-picked object id; null when nothing is selected). */
   selectedId: string | null;
+  /** Full selection set; Shift+click toggles members (multi-select). */
+  selectedIds: string[];
   visibility: Record<string, boolean>;
   isolatedId: string | null;
   explode: number;
@@ -123,7 +126,14 @@ export type ProjectAction =
   | { type: 'MATERIALS_OK'; materials: MaterialEntry[] }
   | { type: 'MATERIALS_ERROR'; message: string }
   | { type: 'SET_MODE'; mode: Mode }
-  | { type: 'SELECT'; id: string | null }
+  /**
+   * Set the selection. Without `ids`, `id` selects a single object (null
+   * clears). With `ids`, the full selection-set is replaced (used by
+   * Shift+click toggling). `selectedId` always mirrors the last entry of
+   * `selectedIds` for backward compatibility.
+   */
+  | { type: 'SELECT'; id?: string | null; ids?: string[] }
+  | { type: 'SELECT_TOGGLE'; id: string }
   | { type: 'TOGGLE_VISIBILITY'; id: string }
   | { type: 'SET_VISIBILITY'; id: string; visible: boolean }
   | { type: 'ISOLATE'; id: string }
@@ -291,8 +301,24 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
         return { ...state, mode: action.mode, stale: state.lastResult != null, draft };
       }
       return { ...state, mode: action.mode, stale: state.lastResult != null };
-    case 'SELECT':
-      return { ...state, selectedId: action.id };
+    case 'SELECT': {
+      const selectedIds = action.ids ?? (action.id ? [action.id] : []);
+      return {
+        ...state,
+        selectedIds,
+        selectedId: selectedIds.length > 0 ? selectedIds[selectedIds.length - 1] : null,
+      };
+    }
+    case 'SELECT_TOGGLE': {
+      const id = action.id;
+      const has = state.selectedIds.includes(id);
+      const selectedIds = has ? state.selectedIds.filter((item) => item !== id) : [...state.selectedIds, id];
+      return {
+        ...state,
+        selectedIds,
+        selectedId: selectedIds.length > 0 ? selectedIds[selectedIds.length - 1] : null,
+      };
+    }
     case 'TOGGLE_VISIBILITY':
       return {
         ...state,
@@ -963,6 +989,7 @@ export const initialState: ProjectState = {
   previewDiagnostics: null,
   tempPreview: null,
   selectedId: null,
+  selectedIds: [],
   visibility: {},
   isolatedId: null,
   explode: 0,
@@ -1044,6 +1071,7 @@ function resetGeometryView(state: ProjectState): ProjectState {
   return {
     ...state,
     selectedId: null,
+    selectedIds: [],
     isolatedId: null,
     visibility: {},
     objectMaterials: {},

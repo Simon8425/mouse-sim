@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 import json
 import math
+import os
 from pathlib import Path
 import struct
 from typing import Any, Mapping, Optional, Tuple
@@ -1983,15 +1984,21 @@ def load_geometry(
     step_backend="auto",
     step_asset_dir=None,
     step_timeout=None,
+    stl_backend=None,
 ):
     """Load analytic JSON, OBJ, ASCII/binary STL, or STEP geometry.
 
     OBJ and STL have no portable unit declaration, so ``units`` is mandatory
     for those formats.  STEP declares its own length units in the file, so an
-    explicit ``units`` argument is ignored for STEP. Unsupported curve types
-    or malformed standard-library B-rep structures return structured
-    diagnostics; advanced STEP uses the optional kernel backend and never
-    substitutes a mesh or bounding box for an unavailable CAD operation.
+    explicit ``units`` argument is ignored for STEP. ``stl_backend`` mirrors
+    ``step_backend``: ``"auto"`` uses the FreeCAD kernel when available and
+    falls back to the stdlib parser (the default for direct/CLI use is the
+    stdlib parser unless ``MOUSE_SIM_STL_BACKEND`` is set), ``"kernel"``
+    requires the kernel, ``"stdlib"`` always uses the hand-rolled parser.
+    Unsupported curve types or malformed standard-library B-rep structures
+    return structured diagnostics; advanced STEP uses the optional kernel
+    backend and never substitutes a mesh or bounding box for an unavailable
+    CAD operation.
     """
 
     data, source_name = _source_bytes(path_or_bytes)
@@ -2029,6 +2036,46 @@ def load_geometry(
         geometry, repair_diagnostics = repair_open_mesh(geometry)
         return _result(geometry, "obj", source_units, source_name, diagnostics=tuple(diagnostics) + _mesh_diagnostics(geometry) + repair_diagnostics)
     if format_name == "stl":
+        # Prefer the FreeCAD kernel for STL when requested ("auto" from the
+        # web console): it parses ASCII/binary STL robustly and emits a
+        # smoothly-shaded GLB like a CAD viewer instead of a faceted mesh.
+        stl_mode = (
+            str(stl_backend).strip().lower()
+            if stl_backend is not None
+            else str(os.environ.get("MOUSE_SIM_STL_BACKEND", "stdlib")).strip().lower()
+        )
+        if stl_mode not in ("auto", "kernel", "stdlib"):
+            raise ValueError("unsupported STL backend: {!r}".format(stl_backend))
+        if stl_mode in ("auto", "kernel"):
+            from .step_kernel import (
+                StepKernelFailure,
+                StepKernelUnavailable,
+                kernel_available,
+                tessellate_stl,
+            )
+
+            forced = stl_mode == "kernel"
+            if forced or kernel_available():
+                try:
+                    geometry, kernel_diagnostics, display_asset = tessellate_stl(
+                        data,
+                        source_name,
+                        source_units,
+                        step_asset_dir,
+                        timeout=step_timeout,
+                    )
+                    return _result(
+                        geometry,
+                        "stl",
+                        source_units,
+                        source_name,
+                        diagnostics=kernel_diagnostics,
+                        display_asset=display_asset,
+                    )
+                except (StepKernelUnavailable, StepKernelFailure):
+                    if forced:
+                        raise
+                    # auto mode: fall through to the stdlib parser.
         if _looks_binary_stl(data):
             geometry = _parse_binary_stl(data, source_units)
         else:

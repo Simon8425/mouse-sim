@@ -197,7 +197,14 @@ def _cmd_import(args):
         return EXIT_INTERNAL
     fmt = "stl" if args.format == "ascii" else args.format
     try:
-        result = load_geometry(args.input, fmt=fmt, units=args.units)
+        from .step_kernel import StepKernelFailure, StepKernelUnavailable
+    except Exception:
+        StepKernelFailure = StepKernelUnavailable = RuntimeError
+    try:
+        result = load_geometry(args.input, fmt=fmt, units=args.units, stl_backend=args.backend)
+    except (StepKernelUnavailable, StepKernelFailure) as exc:
+        _emit_error(error_format, "E_KERNEL_UNAVAILABLE", "kernel import failed: {}".format(exc))
+        return EXIT_INVALID_INPUT
     except ValueError as exc:
         _emit_error(error_format, "E_PARSE", "geometry import failed: {}".format(exc))
         return EXIT_INVALID_INPUT
@@ -356,6 +363,7 @@ def build_parser():
     import_parser.add_argument("--input", required=True, metavar="PATH")
     import_parser.add_argument("--format", default="auto", metavar="FMT", help="auto, json, obj, stl, or ascii")
     import_parser.add_argument("--units", default=None, metavar="UNIT", help="source length units: mm, cm, m, or in")
+    import_parser.add_argument("--backend", choices=("auto", "stdlib", "kernel"), default=None, metavar="BACKEND", help="STL import backend: kernel uses FreeCAD/OCCT when available (default: stdlib)")
     import_parser.add_argument("--out", default=None, metavar="PATH", help="write normalized JSON to PATH")
     import_parser.add_argument("--debug", action="store_true")
     import_parser.add_argument("--error-format", choices=("text", "json"), default="text")

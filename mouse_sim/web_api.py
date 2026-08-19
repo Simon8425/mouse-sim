@@ -699,6 +699,7 @@ def handle_normalize(config, query, body):
                 fmt=fmt,
                 units=units,
                 step_backend="auto",
+                stl_backend="auto",
                 step_asset_dir=asset_dir,
             )
         except UnitError as exc:

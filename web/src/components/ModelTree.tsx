@@ -105,6 +105,21 @@ export const ModelTree = React.memo(function ModelTree(): React.ReactElement {
     }
   };
 
+  // Clicking empty space in the tree (anywhere that is not a model row)
+  // clears the selection and closes the inspector — a "click away to
+  // deselect" that matches the viewport: with a single-element model the
+  // user selects the row, then clicks the empty list to unselect it.
+  const handleListClickDeselect = React.useCallback(
+    (e: React.MouseEvent) => {
+      if (state.selectedIds.length === 0) return;
+      const target = e.target as HTMLElement | null;
+      if (!target || target.closest('.model-row')) return;
+      dispatch({ type: 'SELECT', id: null });
+      dispatch({ type: 'SET_INSPECTOR_OPEN', open: false });
+    },
+    [state.selectedIds, dispatch],
+  );
+
   // Auto-classify: start a job and poll until done (or error).
   const clientRef = React.useRef<ReturnType<typeof createClient> | null>(null);
   if (clientRef.current === null) clientRef.current = createClient();
@@ -252,7 +267,7 @@ export const ModelTree = React.memo(function ModelTree(): React.ReactElement {
         ) : null}
       </div>
 
-      <div className="model-tree__list" role="tree" aria-label="Model Hierarchy" ref={listRef}>
+      <div className="model-tree__list" role="tree" aria-label="Model Hierarchy" ref={listRef} onClick={handleListClickDeselect}>
         {state.preview?.display_asset?.parts &&
           state.preview.display_asset.parts.length > 0 &&
           state.partGeometry ? (
@@ -283,7 +298,7 @@ export const ModelTree = React.memo(function ModelTree(): React.ReactElement {
         ) : null}
 
         {entries.map((entry, index) => {
-          const isSelected = state.selectedId === entry.id;
+          const isSelected = state.selectedIds.includes(entry.id);
           const isVisible = state.visibility[entry.id] ?? true;
           const displayName = entry.name || entry.id;
           const assignedMatKey = state.objectMaterials?.[entry.id];
@@ -301,7 +316,13 @@ export const ModelTree = React.memo(function ModelTree(): React.ReactElement {
               aria-selected={isSelected}
               tabIndex={focusedIndex === index ? 0 : -1}
               onKeyDown={(e) => handleKeyDown(e, index, entry.id)}
-              onClick={() => dispatch({ type: 'SELECT', id: entry.id })}
+              onClick={(e) => {
+                if (e.shiftKey) {
+                  dispatch({ type: 'SELECT_TOGGLE', id: entry.id });
+                } else {
+                  dispatch({ type: 'SELECT', id: entry.id });
+                }
+              }}
             >
               <button
                 type="button"

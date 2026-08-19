@@ -126,6 +126,39 @@ export function App(): React.ReactElement {
     };
   }, [needsPartGeometry, partsAssetId, dispatch]);
 
+  // Click-away to deselect: when an object is selected, clicking empty chrome
+  // space (the inspector/rail/drawer background or gaps around the model)
+  // clears the selection and closes the inspector. Real interactive surfaces
+  // are excluded so controls never behave unexpectedly:
+  //   - the canvas (the picker already selects/deselects on the model and on
+  //     empty 3D space),
+  //   - the model tree (rows select; its own empty-area click also deselects),
+  //   - buttons/selects/inputs/links and the other panels/overlays.
+  React.useEffect(() => {
+    if (state.selectedIds.length === 0) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Element | null;
+      if (!target || !(target instanceof Element)) return;
+      // The viewport canvas is handled by the picker: empty 3D space clears
+      // the selection, model clicks select, Shift+clicks toggle members.
+      if (target.closest('canvas')) return;
+      if (target.closest('.model-tree')) return;
+      if (
+        target.closest(
+          'button, select, input, textarea, a, [role="button"], [role="menuitem"], ' +
+            '.mission-control, .file-dropzone, .ai-classify, .fea-hud, .results-rail__toggle, ' +
+            '.model-row__mat-pill, .model-row__floating-card',
+        )
+      ) {
+        return;
+      }
+      dispatch({ type: 'SELECT', id: null });
+      dispatch({ type: 'SET_INSPECTOR_OPEN', open: false });
+    };
+    document.addEventListener('pointerdown', handlePointerDown);
+    return () => document.removeEventListener('pointerdown', handlePointerDown);
+  }, [state.selectedIds, dispatch]);
+
   // Analysis is explicit. Model loading and draft edits prepare the request;
   // only an incremented runNonce (from a Run button) may start the pipeline.
   // The token guard prevents stale responses from overwriting newer runs.
@@ -349,9 +382,11 @@ export function App(): React.ReactElement {
   const isIntro = entries.length === 0 && !state.webglError;
 
   const leftInset = isIntro ? 0 : (state.navOpen ? 294 : 0);
+  // The inspector details panel only hosts exactly one part; with a multi-
+  // selection it stays closed (the model-tree rows show the full set).
   const rightDrawerOpen =
     state.classifyModalOpen ||
-    (state.inspectorOpen && state.selectedId !== null);
+    (state.inspectorOpen && state.selectedIds.length === 1);
   const rightInset =
     (rightDrawerOpen ? 374 : 0) +
     (isIntro ? 0 : resultsOpen ? 334 : 42);
@@ -409,7 +444,7 @@ export function App(): React.ReactElement {
                 insets={insets}
                 entries={sceneEntries}
                 visibility={state.visibility}
-                selectedId={state.selectedId}
+                selectedIds={state.selectedIds}
                 explode={state.explode}
                 theme={state.theme}
                 quality={quality}
@@ -435,10 +470,31 @@ export function App(): React.ReactElement {
                 onDropEnded={() => viewportRef.current?.setDropPlayback?.(false)}
                 onPlaybackStateChange={(playing) => dispatch({ type: 'SET_DROP_PLAYING', playing })}
                 onLiveDropData={setLiveDropData}
-                onPick={(id) => {
+                onPick={(id, meta) => {
+                  if (id === null) {
+                    // Empty 3D space: clear the whole selection.
+                    dispatch({ type: 'SELECT', id: null });
+                    dispatch({ type: 'SET_INSPECTOR_OPEN', open: false });
+                    return;
+                  }
+                  if (meta?.shiftKey) {
+                    // Shift+click toggles a member of the multi-selection.
+                    dispatch({ type: 'SELECT_TOGGLE', id });
+                    const wasSelected = state.selectedIds.includes(id);
+                    dispatch({ type: 'SET_INSPECTOR_OPEN', open: state.selectedIds.length - (wasSelected ? 1 : 0) === 1 });
+                    return;
+                  }
+                  if (state.selectedIds.includes(id)) {
+                    // Clicking an already-selected object un-selects it —
+                    // standard CAD "click to release" so a click on what the
+                    // user perceives as background (but is on a large solid's
+                    // silhouette) reliably deselects.
+                    dispatch({ type: 'SELECT_TOGGLE', id });
+                    dispatch({ type: 'SET_INSPECTOR_OPEN', open: false });
+                    return;
+                  }
                   dispatch({ type: 'SELECT', id });
-                  // Clicking an object opens the inspector; clicking empty space closes it.
-                  dispatch({ type: 'SET_INSPECTOR_OPEN', open: id !== null });
+                  dispatch({ type: 'SET_INSPECTOR_OPEN', open: true });
                 }}
                 onStats={setStats}
                 onWebGLUnsupported={(reason) =>
@@ -457,7 +513,7 @@ export function App(): React.ReactElement {
           </aside>
         ) : (
           <aside
-            className={`drawer drawer--inspector${state.inspectorOpen && state.selectedId !== null ? ' is-open' : ''}`}
+            className={`drawer drawer--inspector${state.inspectorOpen && state.selectedIds.length === 1 ? ' is-open' : ''}`}
             aria-label="Inspector"
           >
             <InspectorPanel />

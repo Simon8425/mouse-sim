@@ -78,19 +78,19 @@ python3 -S -m mouse_sim import --input part.obj --format obj --units mm --out pa
 - Advanced **BREP STEP** uses the optional FreeCAD/OCCT backend, auto-detected on Windows (`C:\Program Files\FreeCAD*\bin\freecadcmd.exe`), macOS (`/Applications/FreeCAD.app`), and via `PATH`.
 - Override detection with `MOUSE_SIM_FREECADCMD=/path/to/freecadcmd`.
 
-Check the backend first:
+### STL display backend (FreeCAD/OCCT)
+
+The web console routes uploaded STL files through the same optional FreeCAD/OCCT kernel when available (`MOUSE_SIM_STL_BACKEND=auto|stdlib|kernel`, default `stdlib` outside the web console). The kernel reads ASCII and binary STL robustly (nonconforming headers, trailing footers), welds seam-identical vertices, computes smooth per-vertex normals, and emits a GLB display asset — the same pipeline as advanced STEP — so the uploaded STL renders like a CAD viewer (smooth shading) instead of a faceted triangle soup. The analysis mesh stays deterministic and metre-scaled; when FreeCAD is absent, STL uploads transparently fall back to the stdlib parser with no asset.
 
 ```bash
+# Check the backend first:
 python scripts/find_freecad.py
+
+# CLI import (stdlib by default; use --backend kernel to force FreeCAD):
+python -m mouse_sim import --input part.stl --format stl --units mm --out part.json --backend kernel
 ```
 
-Then import (the backend is used only when the file actually needs it):
-
-```bash
-python -m mouse_sim import --input part.step --format step --units mm --out part.json
-```
-
-When FreeCAD is absent, advanced STEP uploads fail with a clear `FreeCADCmd is unavailable` error instead of fabricating geometry — fail-closed by design.
+When FreeCAD is absent, advanced STEP uploads fail with a clear `FreeCADCmd is unavailable` error instead of fabricating geometry — fail-closed by design. STL is the exception: it never fails closed because the stdlib parser is a complete fallback.
 
 ### Run the web console
 
@@ -123,7 +123,7 @@ cd web && npm run e2e
 | Command | Purpose | Key flags |
 |---|---|---|
 | `run` | Run the analysis pipeline over a project document | `--input PATH` (required), `--output DIR` (default `reports`), `--emit json,html`, `--stdout json\|summary\|none`, `--mode exploration\|qualification`, `--cache-dir PATH`, `--no-cache`, `--strict`, `--debug`, `--error-format text\|json` |
-| `import` | Normalize geometry to JSON | `--input PATH`, `--format auto\|json\|obj\|stl\|ascii\|step\|stp`, `--units mm\|cm\|m\|in`, `--out PATH` |
+| `import` | Normalize geometry to JSON | `--input PATH`, `--format auto\|json\|obj\|stl\|ascii\|step\|stp`, `--units mm\|cm\|m\|in`, `--backend auto\|stdlib\|kernel` (STL), `--out PATH` |
 | `material validate` | Validate a material catalog JSON | `--input PATH` |
 | `validate` | Validate a full project document | `--input PATH`, `--emit json`, `--debug`, `--error-format` |
 | `--version` | Print `mouse-sim 0.1.0` | — |
@@ -219,7 +219,7 @@ On startup the dashboard opens an empty workspace. No baseline or demo geometry 
 
 ### Upload lifecycle
 
-1. The user drops a geometry file; OBJ/STL parsing runs in a **Web Worker** (`geometry.worker.ts`) off the UI thread — text/binary parsing with unit conversion, triangulation, and bounded warning collection. JSON and STEP/STP files skip the worker and are sent straight to the server. Advanced STEP is imported by the isolated FreeCAD/OCCT worker and its native GLB is used for display.
+1. The user drops a geometry file; OBJ parsing runs in a **Web Worker** (`geometry.worker.ts`) off the UI thread — text/binary parsing with unit conversion, triangulation, and bounded warning collection. JSON and STEP/STP files skip the worker and are sent straight to the server; STL is sent straight to the server too (its unit selector is kept), routed through the FreeCAD/OCCT kernel when available so the scene displays the kernel's smooth GLB instead of a client-side faceted mesh. Advanced STEP is imported by the isolated FreeCAD/OCCT worker and its native GLB is used for display.
 2. The parsed preview is posted to `POST /api/geometry/normalize?format=...&units=...`, which runs the Python importer and returns a `gms.geometry-preview/1` envelope.
 3. Missing CAD-kernel support, kernel failures, unsupported formats, and parse failures return **422 envelopes with diagnostics** (e.g. `step_kernel_unavailable`, `step_kernel_failed`, `parse_failed`); the client deliberately accepts 422 as a valid envelope carrying the preview error diagnostics.
 
