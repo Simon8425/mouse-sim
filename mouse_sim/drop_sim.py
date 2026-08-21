@@ -107,6 +107,20 @@ JITTER_MAX_TILT_DEG = 6.0
 JITTER_MAX_LATERAL_FRACTION = 0.03
 JITTER_MAX_SPIN_RAD_S = 0.5
 
+# Multi-drop campaign variation for drops 1+ in a normal drop/tumble test
+# with more than one drop: a REAL random start pose — uniform over the solid
+# angle of the [6, 45] deg tilt band about a random horizontal axis (every
+# campaign drop is visibly distinct from the pristine reference drop 0,
+# never a near-duplicate), plus the standard lateral drift and an
+# independent-axis release spin — so each drop clearly differs: a
+# verification campaign instead of three nearly-identical falls.  The
+# reference drop 0 stays pristine, the impact test keeps its homogeneous
+# corner jitter, and explicit poses follow the same seeded envelope as
+# their mode twin so cross-mode determinism holds.  The range is bounded so
+# the part tips toward edge/face poses and topples naturally on impact — it
+# never launches.
+CAMPAIGN_MAX_TILT_DEG = 45.0
+
 SUPPORT_DIRECTIONS = (
     (1.0, 0.0, 0.0),
     (-1.0, 0.0, 0.0),
@@ -544,9 +558,11 @@ def _drop_variation(
     """Seeded initial-condition variation for drops 1+ (drop 0 is the reference).
 
     Returns (tilt_quaternion, tilt_deg, lateral_offset_m, initial_angular):
-    a small tilt about a seeded horizontal axis, a horizontal drift offset of
-    the initial position (up to ``max_lateral_fraction * height_m``), and a
-    small release spin about the same axis so the first contact point's
+    a tilt about a seeded horizontal axis (uniform over the solid angle of
+    the tilt cap for campaign runs, uniform in [0, max_tilt] for the fine
+    jitter envelope), a horizontal drift offset of the initial position (up
+    to ``max_lateral_fraction * height_m``), and a small release spin about
+    an independent random horizontal axis so the first contact point's
     velocity differs between drops.  Draws come from a fresh LCG seeded
     by a multiplicative hash of ``(seed, drop_index)`` so consecutive
     drops' draws are independent, and independent of the base orientation.
@@ -565,10 +581,42 @@ def _drop_variation(
     offset_angle_unit = next_unit()
     offset_radius_unit = next_unit()
     spin_unit = next_unit()
+    roll_unit = next_unit()
 
     axis_angle = 2.0 * math.pi * axis_unit
     axis = (math.cos(axis_angle), math.sin(axis_angle), 0.0)
-    tilt_deg = max_tilt_deg * tilt_unit
+    # CAMPAIGN tilt distribution: a UNIFORM draw from [0, max_tilt] makes a
+    # multi-drop campaign look broken — most drops land nearly flat
+    # (indistinguishable from the pristine reference drop 0), one drops at
+    # the full 45 deg envelope, and the release spin about the same tiny
+    # tilt axis barely differs.  The cap is instead sampled UNIFORMLY OVER
+    # THE SOLID ANGLE of the tilt cap (theta = acos(1 - u*(1 - cos cap)),
+    # the standard sphere-cap sampler): every solid-angle element is equally
+    # likely, so the per-drop landings are evenly spread across the
+    # envelope and no value piles up at the cap.  Every campaign drop is
+    # visibly distinct yet never a near-duplicate of the configured flat
+    # orientation (the base face of a real drop is the reference; a
+    # campaign repeats the test, it does not repeat the identical pose).
+    # Single-drop and impact-corner runs keep the fine jitter envelope and
+    # are unchanged (they are not campaigns).
+    if max_tilt_deg > JITTER_MAX_TILT_DEG:
+        cap_rad = math.radians(max_tilt_deg)
+        # Uniform over the solid angle of the cap (sphere-cap sampler).
+        tilt_deg = math.degrees(math.acos(1.0 - tilt_unit * (1.0 - math.cos(cap_rad))))
+        tilt_deg = min(tilt_deg, max_tilt_deg)
+        # CAMPAIGN MINIMUM TILT: a campaign drop must be VISIBLY distinct
+        # from the pristine reference drop 0 (the configured orientation) —
+        # a drop that lands within ~6 deg of the reference reads as a
+        # replayed copy ("the object barely moved").  The fine-jitter
+        # envelope (6 deg) is the maximum the single-drop reference allows,
+        # so every campaign drop is drawn from the solid-angle slice
+        # [6 deg, max_tilt] — distinct from the reference by construction,
+        # while the lateral drift and release spin still vary within it.
+        min_campaign_tilt = JITTER_MAX_TILT_DEG
+        if tilt_deg < min_campaign_tilt:
+            tilt_deg = min_campaign_tilt
+    else:
+        tilt_deg = max_tilt_deg * tilt_unit
     tilt_quaternion = _axis_angle_quaternion(axis, math.radians(tilt_deg))
     max_offset = max_lateral_fraction * height_m
     # sqrt(u): uniform sampling over the DISK (a raw uniform radius
@@ -580,7 +628,14 @@ def _drop_variation(
         offset_radius * math.sin(offset_angle),
     )
     spin_scale = max_spin_rad_s * spin_unit
-    initial_angular = (axis[0] * spin_scale, axis[1] * spin_scale, 0.0)
+    # The release spin acts about a distinct RANDOM horizontal axis (a
+    # fresh draw) instead of the same axis as the tilt: the first-contact
+    # velocity of every campaign drop then differs in direction AND
+    # magnitude from the reference, so two drops can never look like
+    # replayed copies of the pristine flat drop.
+    roll_angle = 2.0 * math.pi * roll_unit
+    spin_axis = (math.cos(roll_angle), math.sin(roll_angle), 0.0)
+    initial_angular = (spin_axis[0] * spin_scale, spin_axis[1] * spin_scale, 0.0)
     return tilt_quaternion, tilt_deg, lateral_offset, initial_angular
 
 
@@ -2550,15 +2605,17 @@ def simulate(
 
     Drop 0 is the pristine reference (exactly the configured orientation,
     zero lateral offset).  Every later drop gets a deterministic, seeded
-    initial-condition variation (tilt jitter, lateral drift, small release
-    spin) so repeated drops are unique while staying bit-reproducible for a
-    fixed seed and configuration.  ``orientation`` is a mode string ("flat",
-    "edge", "corner", "random") or an explicit pose dict
-    ``{"quaternion_wxyz": [w, x, y, z]}``; with an explicit pose, drop 0
-    uses exactly that orientation and drops 1+ add the seeded jitter on top.
-    An ``impact`` test forces the corner base orientation for EVERY drop
-    (with the same per-drop jitter on drops 1+) so an impact run is a
-    homogeneous corner campaign; an explicit pose bypasses the override.
+    initial-condition variation (a solid-angle-uniform tilt at least 6 deg
+    from the reference orientation, lateral drift, small release spin about
+    an independent axis) so repeated drops are clearly distinct while
+    staying bit-reproducible for a fixed seed and configuration.
+    ``orientation`` is a mode string ("flat", "edge", "corner", "random")
+    or an explicit pose dict ``{"quaternion_wxyz": [w, x, y, z]}``; with an
+    explicit pose, drop 0 uses exactly that orientation and drops 1+ add the
+    seeded jitter on top.  An ``impact`` test forces the corner base
+    orientation for EVERY drop (with the same per-drop jitter on drops 1+)
+    so an impact run is a homogeneous corner campaign; an explicit pose
+    bypasses the override.
 
     ``unit_seed`` adds a deterministic manufacturing-tolerance layer: the
     same seed always produces the same unit (mass/inertia/CoM/friction/
@@ -2712,6 +2769,17 @@ def simulate(
     all_checks = []
     drop_interval_s = float(config.get("pause_between_drops_s", config.get("drop_interval_s", 0.50)))
     t_offset = 0.0
+    # Campaign variation: a normal drop/tumble test with more than one drop
+    # gives every drop after the reference a real random start pose (uniform
+    # over the solid angle of [6, CAMPAIGN_MAX_TILT_DEG] — always visibly
+    # distinct from the reference flat drop).  The impact test stays a
+    # homogeneous corner campaign and explicit poses mirror their mode twin
+    # so the documented determinism contract (bit-reproducible for a fixed
+    # seed) is preserved.
+    campaign_variation = (
+        config["test"] in ("drop", "tumble") and int(config["drop_count"]) > 1
+    )
+    run_max_tilt_deg = CAMPAIGN_MAX_TILT_DEG if campaign_variation else JITTER_MAX_TILT_DEG
     for drop_index in range(config["drop_count"]):
         explicit_quaternion = config.get("orientation_quaternion_wxyz")
         if explicit_quaternion is not None:
@@ -2738,7 +2806,7 @@ def simulate(
             # initial-condition variation (tilt + lateral drift + release
             # spin), so repeated drops are unique but still bit-reproducible.
             tilt_q, tilt_deg, lateral_offset, initial_angular = _drop_variation(
-                seed, drop_index, config["height_m"]
+                seed, drop_index, config["height_m"], max_tilt_deg=run_max_tilt_deg
             )
             orientation_q = _normalize_quaternion(
                 _quaternion_multiply(tilt_q, orientation_q)
@@ -2891,10 +2959,25 @@ def simulate(
         "initial_velocity_m_s": [0.0, 0.0, 0.0],
         "starting_pose_m": drops[0]["starting_pose_m"],
         "jitter": {
-            "max_tilt_deg": JITTER_MAX_TILT_DEG,
+            "max_tilt_deg": run_max_tilt_deg,
             "max_lateral_fraction": JITTER_MAX_LATERAL_FRACTION,
             "max_initial_spin_rad_s": JITTER_MAX_SPIN_RAD_S,
             "seed": seed,
+            # Discloses whether this run gives drops 1+ a real random start
+            # pose (multi-drop drop/tumble campaign) or keeps the fine jitter
+            # (single-drop, impact corner campaign, explicit-pose twins).
+            "campaign_random_orientation": campaign_variation,
+            # Campaign tilt is drawn uniformly over the solid angle of
+            # [min_campaign_tilt_deg, max_tilt_deg] — every campaign drop is
+            # at least min_campaign_tilt_deg from the reference orientation
+            # (visibly distinct, never a near-duplicate of the flat drop).
+            # Fine-jitter runs keep the uniform [0, max_tilt] draw.
+            "tilt_distribution": (
+                "solid_angle_uniform" if campaign_variation else "uniform"
+            ),
+            "min_campaign_tilt_deg": (
+                JITTER_MAX_TILT_DEG if campaign_variation else 0.0
+            ),
         },
         "variation": {
             "unit_seed": unit_seed,

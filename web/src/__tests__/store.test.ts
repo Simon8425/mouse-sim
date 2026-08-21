@@ -321,6 +321,17 @@ describe('projectStore state reducer and selectors', () => {
     state = reducer(state, { type: 'SET_RENDER_MODE', mode: 'fea' });
     expect(state.renderMode).toBe('fea');
     expect(state.stale).toBe(false);
+
+    // Re-running or restarting the test must preserve the user's active renderMode
+    state = reducer(state, {
+      type: 'RUN_DROP_TEST',
+      test: 'drop',
+      config: { height_m: 0.75, surface: 'concrete', drop_count: 3, orientation: 'corner' },
+    });
+    expect(state.renderMode).toBe('fea');
+
+    state = reducer(state, { type: 'ANALYZE_START', version: 2, requestKey: 'k2' });
+    expect(state.renderMode).toBe('fea');
   });
 
   it('SET_DROP_PLAYING tracks the playback state and LEAVE_TEST resets it', () => {

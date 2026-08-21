@@ -82,11 +82,21 @@ export function RunControls({ onReplaceModel, uploadOpen }: RunControlsProps = {
   };
 
   if (isRunning) {
+    // A restart re-runs an already-completed test (the previous result is
+    // still on screen); a fresh run has no prior result.  Label the two
+    // differently so the user knows the restart is in flight.
+    const isRestart = state.lastResult?.drop_simulation != null;
     return (
-      <div className="run-controls run-controls--loading" role="status" aria-label="Loading test">
+      <div
+        className="run-controls run-controls--loading"
+        role="status"
+        aria-label={isRestart ? 'Restarting test' : 'Loading test'}
+      >
         <div className="run-controls__loading-indicator">
           <span className="run-controls__spinner" aria-hidden="true" />
-          <span className="run-controls__loading-text">Loading test…</span>
+          <span className="run-controls__loading-text">
+            {isRestart ? 'Restarting test…' : 'Loading test…'}
+          </span>
         </div>
         <div className="run-controls__divider" aria-hidden="true" />
         <button

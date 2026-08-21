@@ -372,12 +372,13 @@ varying vec3 vFeaPosition;
 
 const FEA_VERTEX_BODY = /* glsl */ `
 	// --- FEA vertex (after begin_vertex) ---
+	float feaProg = mix( 1.0, uImpactWindow01, uImpactWindowActive );
 	float feaDamage = 0.0;
 	float feaDent = 0.0;
 	#ifdef USE_FEA_ATTRIBUTES
 		feaDamage = aDamage;
 		float feaDamageNorm = aDamage * uDamageScale;
-		feaDent = step( 0.5, uFeaMode ) * uImpactWindow01 * step( 0.5, uImpactWindowActive ) * step( ${glslFloat(FEA_DENT_THRESHOLD)}, feaDamageNorm );
+		feaDent = step( 0.5, uFeaMode ) * feaProg * step( ${glslFloat(FEA_DENT_THRESHOLD)}, feaDamageNorm );
 		transformed += aDisplacement * feaDent;
 		// Procedural dent complement: sparse meshes have no vertex inside the
 		// impact zone, so the attribute dent would be invisible — dent
@@ -388,14 +389,14 @@ const FEA_VERTEX_BODY = /* glsl */ `
 		// amplification alone.
 		float feaGaussProc = exp( -dot( position - uImpactPointModel, position - uImpactPointModel ) / max( uFalloffRadius * uFalloffRadius, 1e-6 ) );
 		float feaPlasticProc = min( ${glslFloat(FEA_PLASTIC_AMPLIFICATION_MAX)}, 1.0 + 2.0 * max( 0.0, ( uPeakDamage * feaGaussProc - ${glslFloat(FEA_DENT_THRESHOLD)} ) / ${glslFloat(FEA_PLASTIC_RAMP)} ) );
-		transformed -= uImpactNormalModel * uMaxCompression * min( ${glslFloat(FEA_DENT_DEPTH_CAP)}, feaGaussProc * feaPlasticProc ) * step( 0.5, uFeaMode ) * uImpactWindow01 * step( 0.5, uImpactWindowActive ) * ( 1.0 - step( ${glslFloat(FEA_DENT_THRESHOLD)}, feaDamageNorm ) );
+		transformed -= uImpactNormalModel * uMaxCompression * min( ${glslFloat(FEA_DENT_DEPTH_CAP)}, feaGaussProc * feaPlasticProc ) * step( 0.5, uFeaMode ) * feaProg * ( 1.0 - step( ${glslFloat(FEA_DENT_THRESHOLD)}, feaDamageNorm ) );
 	#else
 		// Procedural path: same Gaussian on the untransformed local position.
 		float feaGauss = exp( -dot( position - uImpactPointModel, position - uImpactPointModel ) / max( uFalloffRadius * uFalloffRadius, 1e-6 ) );
 		feaDamage = uPeakDamage * feaGauss;
 		float feaDamageNorm = feaDamage * uDamageScale;
 		float feaPlastic = min( ${glslFloat(FEA_PLASTIC_AMPLIFICATION_MAX)}, 1.0 + 2.0 * max( 0.0, ( feaDamageNorm - ${glslFloat(FEA_DENT_THRESHOLD)} ) / ${glslFloat(FEA_PLASTIC_RAMP)} ) );
-		feaDent = step( 0.5, uFeaMode ) * uImpactWindow01 * step( 0.5, uImpactWindowActive );
+		feaDent = step( 0.5, uFeaMode ) * feaProg;
 		transformed -= uImpactNormalModel * uMaxCompression * min( ${glslFloat(FEA_DENT_DEPTH_CAP)}, feaGauss * feaPlastic ) * feaDent;
 	#endif
 	vFeaDamage = clamp( feaDamage, 0.0, 1.0 );
@@ -524,14 +525,15 @@ const FEA_FRAGMENT_BODY = /* glsl */ `
 		feaRipple = feaPulse * exp( -feaRad * feaRad ) * feaWave;
 	}
 	feaDamageVis = clamp( feaDamageVis + feaRipple * 0.25, 0.0, 1.0 );
+	vec3 baseColor = diffuseColor.rgb;
 	if ( uFeaMode > 0.5 ) {
 		// YIELD SHADER: a steel-gray base with a clearly masked plastic
 		// zone. The mask ramps from the normalized yield threshold to the
 		// field peak, so everything ABOVE the material yield strength lights
 		// up hot (contour) instead of a faint broad tint.
-		diffuseColor.rgb = vec3( 0.60, 0.62, 0.66 );
+		vec3 yieldColor = vec3( 0.60, 0.62, 0.66 );
 		float feaYieldMask = smoothstep( uYieldNorm, 1.0, feaDamageVis );
-		diffuseColor.rgb = mix( diffuseColor.rgb, vec3( 1.0, 0.36, 0.05 ), feaYieldMask * 0.85 );
+		yieldColor = mix( yieldColor, vec3( 1.0, 0.36, 0.05 ), feaYieldMask * 0.85 );
 		// Micro-crack striations inside the plastic zone: deterministic
 		// per-fragment noise striping animated by the impact pulse (and a
 		// slow drift while paused), plus stress-whitening that ramps with
@@ -541,18 +543,20 @@ const FEA_FRAGMENT_BODY = /* glsl */ `
 			float feaNoise = feaHashNoise( vFeaPosition, uTime );
 			float feaStripe = smoothstep( 0.45, 0.75, fract( vFeaPosition.y * 140.0 + feaNoise * 2.0 ) );
 			float feaFlicker = 0.35 + 0.65 * feaPulse;
-			diffuseColor.rgb = mix( diffuseColor.rgb, vec3( 1.0 ), feaNoise * ${FEA_WHITENING_AMPLITUDE} * feaW * feaFlicker );
-			diffuseColor.rgb = mix( diffuseColor.rgb, vec3( 0.05, 0.05, 0.06 ), feaStripe * feaW * feaFlicker );
-			diffuseColor.rgb = mix( diffuseColor.rgb, vec3( 1.0, 0.15, 0.03 ), 0.5 * feaW * feaFlicker );
+			yieldColor = mix( yieldColor, vec3( 1.0 ), feaNoise * ${FEA_WHITENING_AMPLITUDE} * feaW * feaFlicker );
+			yieldColor = mix( yieldColor, vec3( 0.05, 0.05, 0.06 ), feaStripe * feaW * feaFlicker );
+			yieldColor = mix( yieldColor, vec3( 1.0, 0.15, 0.03 ), 0.5 * feaW * feaFlicker );
 		}
-		if ( feaDamage > ${FEA_TEAR_THRESHOLD} ) {
+		if ( feaDamage > ${FEA_TEAR_THRESHOLD} && feaProg > 0.5 ) {
 			discard;
 		}
+		diffuseColor.rgb = mix( baseColor, yieldColor, feaProg );
 	} else if ( uFeaMode > -0.5 ) {
 		// FEA HEATMAP: Full von Mises stress gradient contour mapped across the full range.
 		float feaDither = ( feaHashNoise( vFeaPosition, 0.37 ) - 0.5 ) / 48.0;
 		float feaVisDithered = clamp( feaDamageVis + feaDither, 0.0, 1.0 );
-		diffuseColor.rgb = feaGradientColorFrag( feaVisDithered );
+		vec3 feaColor = feaGradientColorFrag( feaVisDithered );
+		diffuseColor.rgb = mix( baseColor, feaColor, feaProg );
 	}
 	// --- end FEA fragment ---
 `;

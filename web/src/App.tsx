@@ -47,6 +47,28 @@ export function App(): React.ReactElement {
   const [resultsOpen, setResultsOpen] = React.useState(false);
   const [liveDropData, setLiveDropData] = React.useState<LiveDropData | null>(null);
 
+  // "Restart" on the playback bar starts a NEW random run (fresh seed ->
+  // new drops) instead of replaying the same recorded motion.  The reducer
+  // generates a fresh seed whenever a run is not in flight, so every
+  // restart produces visibly different drops.
+  const handleDropRestart = React.useCallback(() => {
+    const config = state.draft?.drop_simulation ?? state.lastResult?.drop_simulation?.config ?? null;
+    if (!config) return;
+    dispatch({
+      type: 'RUN_DROP_TEST',
+      test: (config.test as 'drop' | 'impact' | 'tumble' | 'population') ?? 'drop',
+      config: {
+        height_m: config.height_m ?? 0.75,
+        surface: (config.surface as 'concrete' | 'wood' | 'foam' | 'steel') ?? 'concrete',
+        drop_count: config.drop_count ?? 3,
+        orientation: (config.orientation as 'flat' | 'edge' | 'corner' | 'random') ?? 'flat',
+        spin_rps: config.spin_rps ?? 0,
+        mass_kg: config.mass_kg ?? null,
+        pause_between_drops_s: config.pause_between_drops_s,
+      },
+    });
+  }, [state.draft, state.lastResult, dispatch]);
+
   // Results open automatically once a run finishes — the user never has to
   // hunt for the panel after clicking Run. On narrow viewports the panel
   // would crush the scene, so there it stays collapsed (toggle available).
@@ -126,14 +148,9 @@ export function App(): React.ReactElement {
     };
   }, [needsPartGeometry, partsAssetId, dispatch]);
 
-  // Click-away to deselect: when an object is selected, clicking empty chrome
-  // space (the inspector/rail/drawer background or gaps around the model)
-  // clears the selection and closes the inspector. Real interactive surfaces
-  // are excluded so controls never behave unexpectedly:
-  //   - the canvas (the picker already selects/deselects on the model and on
-  //     empty 3D space),
-  //   - the model tree (rows select; its own empty-area click also deselects),
-  //   - buttons/selects/inputs/links and the other panels/overlays.
+  // Click-away to deselect: when an object is selected, clicking empty viewport
+  // space clears the selection. All UI panels, cards, drawers, inspector, toolbars,
+  // and interactive controls are excluded so users can select, inspect, and copy text freely.
   React.useEffect(() => {
     if (state.selectedIds.length === 0) return;
     const handlePointerDown = (event: PointerEvent) => {
@@ -145,9 +162,11 @@ export function App(): React.ReactElement {
       if (target.closest('.model-tree')) return;
       if (
         target.closest(
-          'button, select, input, textarea, a, [role="button"], [role="menuitem"], ' +
-            '.mission-control, .file-dropzone, .ai-classify, .fea-hud, .results-rail__toggle, ' +
-            '.model-row__mat-pill, .model-row__floating-card',
+          'button, select, input, textarea, a, label, table, [role="button"], [role="menuitem"], [role="dialog"], [role="tab"], [role="tabpanel"], [role="region"], ' +
+            '.inspector-panel, .drawer, .results-rail, .results-rail-dock, .top-bar, .app-header, .viewport-toolbar, ' +
+            '.mission-control, .file-dropzone, .ai-classify, .ai-classify-modal, .fea-hud, .results-rail__toggle, ' +
+            '.telemetry-debugger, .physics-log-debugger, .drop-physics-debug, .drop-debug-panel, .population-fleet-hud, ' +
+            '.model-row__mat-pill, .model-row__floating-card, .modal, .card',
         )
       ) {
         return;
@@ -178,6 +197,7 @@ export function App(): React.ReactElement {
       state.draft,
       state.mode,
       state.objectMaterials,
+      state.objectClassifications,
       state.partGeometry,
       state.defaultMaterialKey,
     ],
@@ -456,12 +476,19 @@ export function App(): React.ReactElement {
                   // Only playback trajectories that match the current inputs,
                   // and only while the test has not been dismissed (LEAVE_TEST
                   // keeps the results visible but exits playback).
-                  state.stale || state.playbackDismissed
+                  //
+                  // While a RESTART is loading (a re-run of the SAME test with
+                  // a fresh seed), keep the previous playback visible instead
+                  // of blanking the scene — the new result replaces it the
+                  // moment the analysis completes, so the restart feels
+                  // seamless.  A truly stale result (model/inputs changed) is
+                  // still hidden.
+                  state.playbackDismissed
                     ? null
                     : (state.lastResult?.drop_simulation ?? null)
                 }
                 populationResult={
-                  state.stale || state.playbackDismissed
+                  state.playbackDismissed
                     ? null
                     : (state.lastResult?.population ?? null)
                 }
@@ -469,6 +496,7 @@ export function App(): React.ReactElement {
                 feaResult={state.lastResult?.fea ?? null}
                 onDropEnded={() => viewportRef.current?.setDropPlayback?.(false)}
                 onPlaybackStateChange={(playing) => dispatch({ type: 'SET_DROP_PLAYING', playing })}
+                onRestart={handleDropRestart}
                 onLiveDropData={setLiveDropData}
                 onPick={(id, meta) => {
                   if (id === null) {

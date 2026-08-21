@@ -7,7 +7,7 @@ from mouse_sim.reports import render_evidence_package, render_html_report, rende
 def sample_bundle(**overrides):
     bundle = {
         "schema_id": "gms.bundle/1",
-        "engine_version": "0.1.0",
+        "engine_version": "0.1.1",
         "run_id": "run-0001",
         "mode": "exploration",
         "lifecycle_state": "completed",
@@ -23,7 +23,7 @@ def sample_bundle(**overrides):
             "gates": [],
             "inputs": {"requirements": [{"id": "req-1", "title": "Survive drop <script>", "internal": True}]},
         },
-        "manifest": {"engine_version": "0.1.0", "run_id": "run-0001", "input_hashes": {"project": "abc123"}},
+        "manifest": {"engine_version": "0.1.1", "run_id": "run-0001", "input_hashes": {"project": "abc123"}},
         "errors": [],
     }
     bundle.update(overrides)
@@ -118,7 +118,7 @@ class RenderJsonReportTests(unittest.TestCase):
     def test_pipeline_manifest_inputs_materials_and_requirements_rendered(self):
         manifest = {
             "schema_id": "gms.run-manifest/1",
-            "engine_version": "0.1.0",
+            "engine_version": "0.1.1",
             "run_id": "run-0001",
             "input_hashes": {"project": "abc123"},
             "inputs": {

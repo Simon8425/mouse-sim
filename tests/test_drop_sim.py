@@ -201,7 +201,10 @@ class DropSimulationPhysicsTests(unittest.TestCase):
         self.assertEqual(first["impacts"], second["impacts"])
         self.assertEqual(first["drops"], second["drops"])
         self.assertEqual(first["model"]["jitter"], second["model"]["jitter"])
-        self.assertEqual(first["model"]["jitter"]["max_tilt_deg"], 6.0)
+        # A multi-drop drop/tumble campaign gives drops 1+ a real random
+        # start pose (up to CAMPAIGN_MAX_TILT_DEG), disclosed in the model.
+        self.assertTrue(first["model"]["jitter"]["campaign_random_orientation"])
+        self.assertEqual(first["model"]["jitter"]["max_tilt_deg"], 45.0)
         self.assertEqual(first["model"]["jitter"]["max_lateral_fraction"], 0.03)
 
     def test_lateral_offset_bounded(self):
@@ -209,13 +212,56 @@ class DropSimulationPhysicsTests(unittest.TestCase):
             result = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, drop_count=3, seed=seed)
             self.assertEqual(result["model"]["jitter"]["seed"], seed)
             for drop in result["drops"]:
-                self.assertLessEqual(drop["tilt_deg"], 6.0)
+                self.assertLessEqual(drop["tilt_deg"], 45.0)
                 offset = drop["lateral_offset_m"]
                 magnitude = math.hypot(offset[0], offset[1])
                 self.assertLessEqual(magnitude, 0.03 * 0.5 + 1e-9)
             # Drop 0 stays the pristine reference for every seed.
             self.assertEqual(result["drops"][0]["tilt_deg"], 0.0)
-            self.assertEqual(result["drops"][0]["lateral_offset_m"], [0.0, 0.0])
+
+    def test_multi_drop_campaign_is_varied_and_visible(self):
+        # A 3-drop Drop Test must clearly differ: drop 0 pristine flat, drops
+        # 1+ each from a real random start pose (up to the 45 deg campaign
+        # tilt), with distinct orientations and no micro-jitter collapse.
+        result = simulate(
+            0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, drop_count=3, orientation="flat", seed=5
+        )
+        self.assertTrue(result["model"]["jitter"]["campaign_random_orientation"])
+        self.assertEqual(result["model"]["jitter"]["max_tilt_deg"], 45.0)
+        self.assertEqual(result["drops"][0]["tilt_deg"], 0.0)
+        orientations = []
+        for drop in result["drops"][1:]:
+            self.assertGreater(drop["tilt_deg"], 1.0)
+            self.assertLessEqual(drop["tilt_deg"], 45.0)
+            orientations.append(tuple(drop["orientation_quaternion_wxyz"]))
+        # Drops 1+ mutually differ in pose (varied, not degenerate).
+        self.assertNotEqual(orientations[0], orientations[1])
+        # Deterministic: identical run reproduces bit-for-bit.
+        again = simulate(
+            0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, drop_count=3, orientation="flat", seed=5
+        )
+        self.assertEqual(result["trajectory"], again["trajectory"])
+        self.assertEqual(result["drops"], again["drops"])
+
+    def test_single_drop_and_impact_keep_reference_jitter(self):
+        # Single-drop runs have no drops 1+ and must report the fine jitter
+        # envelope (no campaign), keeping single-drop baselines stable.
+        single = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, drop_count=1, orientation="flat")
+        self.assertFalse(single["model"]["jitter"]["campaign_random_orientation"])
+        self.assertEqual(single["model"]["jitter"]["max_tilt_deg"], 6.0)
+        # The impact test is a homogeneous corner campaign: fine jitter kept.
+        impact = simulate(
+            0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5,
+            test="impact", orientation="flat", drop_count=3, seed=5,
+        )
+        self.assertFalse(impact["model"]["jitter"]["campaign_random_orientation"])
+        self.assertEqual(impact["model"]["jitter"]["max_tilt_deg"], 6.0)
+        corner_q = _orientation_quaternion("corner", 0)
+        for drop in impact["drops"]:
+            recorded = tuple(drop["orientation_quaternion_wxyz"])
+            dot = abs(sum(a * b for a, b in zip(recorded, corner_q)))
+            separation = 2.0 * math.acos(min(1.0, dot))
+            self.assertLessEqual(separation, math.radians(7.0))
 
     def test_tumble_with_spin_impacts_multiple_times(self):
         result = simulate(0.1, CUBE_INERTIA, CUBE_SUPPORT, 0.5, test="tumble", spin_rps=6.0)

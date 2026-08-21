@@ -612,7 +612,6 @@ code,
 
 .run-controls--loading {
   padding: 2px 6px;
-  background: var(--bg-surface-raised);
 }
 
 .run-controls__loading-indicator {
@@ -626,7 +625,7 @@ code,
   width: 10px;
   height: 10px;
   border: 1.5px solid var(--border-strong);
-  border-top-color: #3b82f6;
+  border-top-color: var(--text-primary);
   border-radius: 50%;
   animation: run-controls-spin 0.7s linear infinite;
 }

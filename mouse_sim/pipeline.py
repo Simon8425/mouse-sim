@@ -35,7 +35,7 @@ from mouse_sim.units import to_si
 # The module itself, for tests that spy on execution.
 pipeline_module = __import__("importlib").import_module(__name__)
 
-ENGINE_VERSION = "0.1.0"
+ENGINE_VERSION = "0.1.1"
 RESULT_SCHEMA_ID = "gms.pipeline-result/1"
 MANIFEST_SCHEMA_ID = "gms.run-manifest/1"
 

@@ -125,7 +125,9 @@ def _cmd_run(args):
     # injecting it into options would change the run id for the same
     # analysis across cache locations and defeat cross-dir cache reuse.
     request["options"] = options
-    cache = ArtifactCache(args.cache_dir) if args.cache_dir else None
+    from .pipeline import ENGINE_VERSION
+
+    cache = ArtifactCache(args.cache_dir, ENGINE_VERSION) if args.cache_dir else None
     try:
         bundle = run_pipeline(request, cache=cache, use_cache=not args.no_cache)
     except Exception as exc:
@@ -314,7 +316,9 @@ def _cmd_serve(args):
     project_root = Path(args.project_root) if args.project_root else None
     cache_dir = Path(args.cache_dir) if args.cache_dir else None
     if cache_dir is not None:
-        ArtifactCache(cache_dir)
+        from .pipeline import ENGINE_VERSION
+
+        ArtifactCache(cache_dir, ENGINE_VERSION)
     config_kwargs = {
         "host": args.host,
         "port": args.port,

@@ -968,6 +968,64 @@ export function applyFeaPlateField(mesh: THREE.Mesh, fea: FeaResult): boolean {
   return true;
 }
 
+/**
+ * Fill `aDamage` from a DROP-DERIVED impact severity (peak damage 0..1),
+ * evaluated on the mesh's own vertices with the same bbox→panel mapping as
+ * `applyFeaPlateField`. The field peaks at the panel center (the impact
+ * hotspot) with the supplied drop peak damage, so the heat/yield map
+ * recomputes identically for every drop even when no structural FEA ran.
+ * Returns false when the geometry is unusable.
+ */
+export function applyDropPlateField(mesh: THREE.Mesh, peakDamage: number): boolean {
+  const geometry = mesh.geometry;
+  const damageAttr = geometry.getAttribute('aDamage');
+  const positionAttr = geometry.getAttribute('position');
+  if (
+    !(damageAttr instanceof THREE.BufferAttribute) ||
+    !(positionAttr instanceof THREE.BufferAttribute)
+  ) {
+    return false;
+  }
+  if (!Number.isFinite(peakDamage) || peakDamage <= 0) return false;
+  const positions = positionAttr.array as Float32Array;
+  const count = positionAttr.count;
+  let xmin = Infinity;
+  let xmax = -Infinity;
+  let ymin = Infinity;
+  let ymax = -Infinity;
+  for (let i = 0; i < count; i += 1) {
+    const x = positions[i * 3];
+    const y = positions[i * 3 + 1];
+    if (x < xmin) xmin = x;
+    if (x > xmax) xmax = x;
+    if (y < ymin) ymin = y;
+    if (y > ymax) ymax = y;
+  }
+  const xExtent = xmax - xmin;
+  const yExtent = ymax - ymin;
+  if (!(xExtent > 0) || !(yExtent > 0)) return false;
+  const a = Math.max(xExtent, yExtent);
+  const b = Math.min(xExtent, yExtent);
+  const cx = (xmin + xmax) / 2;
+  const cy = (ymin + ymax) / 2;
+  const centerRaw = plateStressShape(a / 2, b / 2, a, b);
+  if (!(centerRaw > 0) || !Number.isFinite(centerRaw)) return false;
+  const damage = Math.min(1, Math.max(0, peakDamage));
+  const damageArray = damageAttr.array as Float32Array;
+  for (let i = 0; i < count; i += 1) {
+    const xPanel = a / 2 + (positions[i * 3] - cx) * (a / xExtent);
+    const yPanel = b / 2 + (positions[i * 3 + 1] - cy) * (b / yExtent);
+    const raw = plateStressShape(xPanel, yPanel, a, b);
+    // Cap at the drop severity so the field max exactly equals the drop peak
+    // (the truncated Navier series can peak marginally off-center for very
+    // elongated panels — same cap the backend applies for safety).
+    const value = raw > 0 && Number.isFinite(raw) ? Math.min(damage, damage * (raw / centerRaw)) : 0;
+    damageArray[i] = Math.min(1, Math.max(0, value));
+  }
+  damageAttr.needsUpdate = true;
+  return true;
+}
+
 export function objectMeshesFor(group: THREE.Object3D): THREE.Mesh[] {
   const meshes: THREE.Mesh[] = [];
   group.traverse((obj) => {

@@ -13,6 +13,7 @@ import {
   worldVerticesForGeometryFull,
   disposeObjectGroup,
   applyFeaPlateField,
+  applyDropPlateField,
   plateStressShape,
   buildInstancedBatches,
   syncInstancedPose,
@@ -296,6 +297,61 @@ describe('plateStressShape', () => {
     const mid = plateStressShape(a / 2, b / 4, a, b);
     expect(mid).toBeGreaterThan(0);
     expect(mid).toBeLessThan(center);
+  });
+});
+
+describe('applyDropPlateField', () => {
+  it('fills aDamage from a drop-derived peak, peaked at plate center', () => {
+    const geometry = new THREE.PlaneGeometry(0.1, 0.06, 16, 12);
+    geometry.rotateX(-Math.PI / 2); // planar XY mesh in world XY
+    geometry.setAttribute(
+      'aDamage',
+      new THREE.BufferAttribute(new Float32Array(geometry.attributes.position.count), 1),
+    );
+    const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial());
+    expect(applyDropPlateField(mesh, 0.6)).toBe(true);
+    const damage = geometry.getAttribute('aDamage').array as Float32Array;
+    const positions = geometry.attributes.position.array as Float32Array;
+    let max = -1;
+    let min = Infinity;
+    let maxDistFromCenter = 0;
+    let maxDamageAtCenter = -1;
+    let maxDamageAtEdge = -1;
+    for (let i = 0; i < damage.length; i += 1) {
+      const x = positions[i * 3];
+      const y = positions[i * 3 + 1];
+      const r = Math.hypot(x, y);
+      if (r > maxDistFromCenter) {
+        maxDistFromCenter = r;
+        maxDamageAtEdge = damage[i];
+      }
+      if (r < 0.005 && damage[i] > maxDamageAtCenter) maxDamageAtCenter = damage[i];
+      if (damage[i] > max) max = damage[i];
+      if (damage[i] < min) min = damage[i];
+    }
+    // Field is in [0, peak] and strictly peaked at the center, lower at edges.
+    expect(min).toBeGreaterThanOrEqual(0);
+    // float32 representation of 0.6 can round above the exact value.
+    expect(max).toBeLessThanOrEqual(0.6 + 1e-5);
+    expect(maxDamageAtCenter).toBeGreaterThan(0.55);
+    expect(maxDamageAtEdge).toBeLessThan(maxDamageAtCenter);
+    expect((geometry.getAttribute('aDamage') as THREE.BufferAttribute).version).toBeGreaterThan(0);
+  });
+
+  it('returns false for degenerate/unsafe inputs', () => {
+    const geometry = new THREE.BoxGeometry(0.1, 0.06, 0.04);
+    geometry.setAttribute(
+      'aDamage',
+      new THREE.BufferAttribute(new Float32Array(geometry.attributes.position.count), 1),
+    );
+    const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial());
+    expect(applyDropPlateField(mesh, 0)).toBe(false);
+    expect(applyDropPlateField(mesh, Number.NaN)).toBe(false);
+
+    const bad = new THREE.PlaneGeometry(0.1, 0.06, 2, 2);
+    bad.rotateX(-Math.PI / 2);
+    const badMesh = new THREE.Mesh(bad, new THREE.MeshStandardMaterial());
+    expect(applyDropPlateField(badMesh, 0.5)).toBe(false);
   });
 });
 

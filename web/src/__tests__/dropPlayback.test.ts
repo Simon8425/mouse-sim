@@ -182,4 +182,20 @@ describe('resolveActiveDrop', () => {
     expect(resolveActiveDrop([], 0.5)).toBeNull();
     expect(resolveActiveDrop(DROPS, -1)?.index).toBe(0);
   });
+
+  it('correctly tracks impact timing separately for multi-drop simulations', () => {
+    // Drop 0 impact at t=0.38s (window 0.38..0.68s)
+    const drop0Impact = 0.38;
+    expect(impactWindowProgress(0.1, drop0Impact, 0.3)).toBe(0); // pre-impact in air
+    expect(impactWindowProgress(0.38, drop0Impact, 0.3)).toBe(0); // moment of contact
+    expect(impactWindowProgress(0.53, drop0Impact, 0.3)).toBeCloseTo(0.5, 8); // mid impact
+    expect(impactWindowProgress(0.68, drop0Impact, 0.3)).toBe(1); // settled
+
+    // Drop 1 impact at t=1.23s (window 1.23..1.53s)
+    const drop1Impact = 1.23;
+    expect(impactWindowProgress(0.9, drop1Impact, 0.3)).toBe(0); // drop 1 in air before impact
+    expect(impactWindowProgress(1.23, drop1Impact, 0.3)).toBe(0); // moment of drop 1 contact
+    expect(impactWindowProgress(1.38, drop1Impact, 0.3)).toBeCloseTo(0.5, 8); // mid drop 1 impact
+    expect(impactWindowProgress(1.6, drop1Impact, 0.3)).toBe(1); // settled
+  });
 });

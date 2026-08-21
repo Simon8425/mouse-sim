@@ -3,17 +3,23 @@ drop-count bounds, and timeline pacing (IEC 60068-2-31-style repeated drops).
 
 These tests document the CURRENT deterministic backend contract:
 - Drop 0 is the pristine reference at the configured orientation.
-- Drops 1+ re-fixture to the configured orientation with seeded jitter —
-  they do NOT inherit the previous drop's resting pose, and there is no
-  plastic-strain/crack accumulation between drops (each drop is an
-  independent re-fixture of the same pristine body).
+- Drops 1+ re-fixture to the configured orientation with seeded variation —
+  a real random start pose (up to CAMPAIGN_MAX_TILT_DEG) in a multi-drop
+  drop/tumble campaign, fine jitter for impact/corner and explicit twins.
+  Every drop still releases with its LOWEST supported vertex at the same
+  height_m (constant floor-relative release energy), drops do NOT inherit
+  the previous drop's resting pose, and there is no plastic-strain/crack
+  accumulation between drops (each drop is an independent re-fixture of the
+  same pristine body).
 - The drop timeline is monotonic with an inter-drop floor of
-  max(motion_stop, free-fall time) + 0.5 s pause.
+  max(motion_stop, free-fall time) + 0.5 s pause, and every drop settles or
+  is duration-clamped within MAX_DURATION_S.
 """
 import math
 import unittest
 
 from mouse_sim.drop_sim import (
+    MAX_DURATION_S,
     DropSimulationError,
     box_inertia,
     simulate,
@@ -48,44 +54,73 @@ def run_multi(drop_count, height_m=0.75, seed=42, **overrides):
     )
 
 
+def _support_min_world_z(drop):
+    """Lowest world-frame z of the supported vertices at a drop's release.
+
+    In-independent: every drop re-fixtures so this clears the floor by
+    exactly the configured release height, regardless of start pose.
+    """
+    origin = drop["starting_pose_m"]
+    w, x, y, z = drop["orientation_quaternion_wxyz"]
+    min_z = float("inf")
+    for (sx, sy, sz) in MOUSE_SUPPORT:
+        # Rotate the support vector by the release quaternion (w, x, y, z).
+        rx = (1 - 2 * (y * y + z * z)) * sx + (2 * (x * y - z * w)) * sy + (2 * (x * z + y * w)) * sz
+        ry = (2 * (x * y + z * w)) * sx + (1 - 2 * (x * x + z * z)) * sy + (2 * (y * z - x * w)) * sz
+        rz = (2 * (x * z - y * w)) * sx + (2 * (y * z + x * w)) * sy + (1 - 2 * (x * x + y * y)) * sz
+        world_z = origin[2] + rz
+        if world_z < min_z:
+            min_z = world_z
+    return min_z
+
+
 class MultiDropCarryOverTests(unittest.TestCase):
     def test_each_drop_is_independent_of_the_previous_rest_pose(self):
         """Drop k+1 re-fixtures to the configured orientation (with seeded
-        jitter) instead of inheriting drop k's resting pose."""
+        variation) instead of inheriting drop k's resting pose."""
         result = run_multi(4)
         drops = result["drops"]
         self.assertEqual(len(drops), 4)
+        # Every drop starts with its LOWEST supported vertex at the release
+        # height — the initial pose is the configured release, NOT the
+        # previous rest pose (and not the previous rest position).
         for drop in drops:
-            # Every drop starts from the release height: the initial position
-            # is the configured release pose, NOT the previous rest pose.
-            self.assertAlmostEqual(drop["starting_pose_m"][2], 0.75, delta=0.02)
-            # Drop 0 is the pristine reference (no tilt, no lateral drift).
-            self.assertEqual(drops[0]["tilt_deg"], 0.0)
-            self.assertEqual(drops[0]["lateral_offset_m"], [0.0, 0.0])
-        # Drops 1+ re-fixture to the configured orientation with seeded jitter:
-        # their release quaternions differ from the pristine drop-0 quaternion.
+            self.assertAlmostEqual(_support_min_world_z(drop), 0.75, delta=0.02)
+        # Drop 0 is the pristine reference (no tilt, no lateral drift).
+        self.assertEqual(drops[0]["tilt_deg"], 0.0)
+        self.assertEqual(drops[0]["lateral_offset_m"], [0.0, 0.0])
         self.assertEqual(drops[0]["orientation_quaternion_wxyz"], [1.0, 0.0, 0.0, 0.0])
-        for drop in drops[1:]:
-            self.assertNotEqual(
-                drop["orientation_quaternion_wxyz"], [1.0, 0.0, 0.0, 0.0]
-            )
+        # Drops 1+ re-fixture to the configured orientation with seeded
+        # variation: release quaternions differ from the pristine drop 0
+        # AND from each other (varied poses, no collapse).
+        quats = [tuple(drop["orientation_quaternion_wxyz"]) for drop in drops[1:]]
+        self.assertNotEqual(quats[0], (1.0, 0.0, 0.0, 0.0))
+        self.assertEqual(len(set(quats)), len(quats))
+        # Campaign variation is active for the multi-drop drop/test run.
+        self.assertTrue(result["model"]["jitter"]["campaign_random_orientation"])
 
     def test_no_plastic_strain_crack_accumulation_across_drops(self):
         """The backend integrator does not carry plastic strain or micro-crack
         state between drops: every drop simulates the same pristine body, so
-        peak impact speeds/energies are statistically similar, and the energy
-        ledger shows no monotonic degradation trend."""
+        every drop releases from the same height and peak impact speeds stay
+        statistically similar — the ledger shows no monotonic degradation."""
         result = run_multi(5)
         peak_speeds = [d["peak_impact_speed_m_s"] for d in result["drops"]]
         self.assertGreater(min(peak_speeds), 0.0)
-        # Jitter is a few degrees / mm: peak speeds stay within 20% of drop 0.
+        # Start pose does not change the CM drop speed: peak impact speeds
+        # stay within 20% of drop 0 (free-fall dominated).
         for speed in peak_speeds[1:]:
             self.assertAlmostEqual(speed / peak_speeds[0], 1.0, delta=0.2)
-        # Release energy is identical across drops (the body is re-fixtured,
-        # never degraded): drift stays in the numeric-noise band.
+        # Floor-relative release energy is identical across drops (constant
+        # release height): no degradation trend, no monotonic drift.  The
+        # ledger's release_j is origin-PE so a tilted start shifts it within
+        # the pose band; the constant contract is the release clearance.
+        clearances = [_support_min_world_z(drop) for drop in result["drops"]]
+        for clearance in clearances[1:]:
+            self.assertAlmostEqual(clearance / clearances[0], 1.0, delta=0.02)
         releases = [d["energy"]["release_j"] for d in result["drops"]]
-        for release in releases[1:]:
-            self.assertAlmostEqual(release / releases[0], 1.0, delta=0.01)
+        drift = [release / releases[0] - 1.0 for release in releases]
+        self.assertLess(max(drift), 0.05)  # pose-bounded, no run-away
 
     def test_impact_test_is_a_homogeneous_corner_campaign(self):
         """An 'impact' test forces the corner orientation for EVERY drop."""
@@ -163,10 +198,13 @@ class MultiDropTimelineTests(unittest.TestCase):
         # are never lost, duplicated, or left outside the schedule).
         self.assertGreaterEqual(assigned, len(result["trajectory"]) - 20)
 
-    def test_max_duration_clamp_keeps_single_drop_bounded(self):
+    def test_max_duration_clamp_keeps_each_drop_bounded(self):
+        # Whatever the start pose (including widely-tilted campaign drops
+        # that tumble and rock), every drop settles or is duration-clamped
+        # within MAX_DURATION_S — the sim is never unbounded.
         result = run_multi(4)
         for drop in result["drops"]:
-            self.assertLess(drop["settled_s"], 2.5)
+            self.assertLess(drop["settled_s"], MAX_DURATION_S + 1e-6)
 
 
 if __name__ == "__main__":

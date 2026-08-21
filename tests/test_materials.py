@@ -28,10 +28,10 @@ from mouse_sim.materials import (
 class MaterialCatalogTests(unittest.TestCase):
     def test_builtin_catalog_contains_mouse_materials_in_si(self):
         catalog = builtin_materials()
-        self.assertEqual(len(catalog), 17)
+        self.assertEqual(len(catalog), 18)
         self.assertEqual(
             set(catalog),
-            {"ABS", "PC", "PC/ABS", "POM", "nylon", "TPU", "FR4", "LiPo", "steel", "PTFE", "magnesium/aluminum", "SLA_8001", "SLA_9000HE", "MJF_PA12_HP", "MJF_PA11_HP", "MJF_PA12S_HP", "default"},
+            {"ABS", "PC", "PC/ABS", "POM", "nylon", "TPU", "FR4", "LiPo", "steel", "PTFE", "magnesium/aluminum", "SLA_8001", "SLA_9000HE", "ECO_RESIN", "MJF_PA12_HP", "MJF_PA11_HP", "MJF_PA12S_HP", "default"},
         )
         self.assertIn("ABS", catalog)
         self.assertIn("pc/abs", catalog)

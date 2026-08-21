@@ -26,6 +26,8 @@ import {
   updateFeaUniforms,
   feaFieldMaxDamage,
   impactPulseFor,
+  yieldNormFor,
+  FEA_DENT_THRESHOLD,
   type FeaUniforms,
   type FeaPlateConfig,
 } from './feaStressShader';
@@ -34,6 +36,7 @@ import { createPicker } from './picking';
 import { createOverlayLayer, type OverlaySpec } from './overlays';
 import {
   applyFeaPlateField,
+  applyDropPlateField,
   buildInstancedBatches,
   createObjectGroup,
   worldBoundsForGeometry,
@@ -44,6 +47,11 @@ import {
   type InstancedBatchGroup,
   type ObjectSceneEntry,
 } from './geometryFactory';
+import {
+  computeDropDamage,
+  activeDropIndexAt,
+  type DropImpactDamage,
+} from '../lib/dropFea';
 import { disposeObject3D, disposeSceneResources } from './disposal';
 
 export interface RenderStats {
@@ -687,6 +695,18 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
   // decorated {material, uniforms} pairs updated every frame.
   let currentRenderMode: RenderMode = 'default';
   let currentFeaResult: FeaResult | null = null;
+  /**
+   * Per-drop impact severities computed once per drop simulation
+   * (`web/src/lib/dropFea.ts`). When no structural FEA ran, these drive the
+   * heat/yield map so it ALWAYS recalculates from the actual drop impact.
+   */
+  let dropImpactByIndex: DropImpactDamage[] | null = null;
+  /** Peak damage (0..1) of the drop currently being inspected/played. */
+  let currentDropImpact: DropImpactDamage | null = null;
+  /** Active drop index whose field was last written (avoids repeated writes). */
+  let lastFeaDropIndex = -1;
+  /** Force refresh of the drop-driven field on the next render frame. */
+  let feaFieldDirty = false;
   const feaMaterialCache = new FeaMaterialCache();
   const feaDecorated: { material: THREE.Material; uniforms: FeaUniforms }[] = [];
   const feaFrameOpts = {
@@ -715,6 +735,45 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       return first.end_s * 0.38;
     }
     return 0;
+  };
+
+  /**
+   * Build the per-drop impact severity table from the loaded drop
+   * simulation, using the drop's yield override when a structural FEA
+   * result is present. Deterministic and cheap (O(drops)).
+   */
+  const buildDropImpactTable = (simulation: DropSimulationResult | null): void => {
+    dropImpactByIndex = null;
+    currentDropImpact = null;
+    lastFeaDropIndex = -1;
+    feaFieldDirty = false;
+    if (!simulation || simulation.drops.length === 0) return;
+    const yieldOverride = currentFeaResult?.computed === true ? currentFeaResult.yield_stress_pa : undefined;
+    const table: DropImpactDamage[] = [];
+    for (let i = 0; i < simulation.drops.length; i += 1) {
+      const damage = computeDropDamage(simulation, i, yieldOverride ?? undefined);
+      table.push(damage ?? { peakDamage: 0, peakStressPa: 0, yieldPa: 0, peakForceN: 0, impactSpeedMs: 0, kineticEnergyJ: 0, method: 'drop_unavailable' });
+    }
+    dropImpactByIndex = table.length > 0 ? table : null;
+  };
+
+  /**
+   * Refresh the heat/yield field for a specific drop index and re-decorate
+   * when a drop-driven map is active. This is the "recalculate on every
+   * drop" entry point: each drop change rewrites the per-vertex field from
+   * that drop's real impact severity.
+   */
+  const refreshDropFeaField = (dropIndex: number): void => {
+    if (currentRenderMode === 'default') return;
+    if (!dropImpactByIndex || dropIndex < 0 || dropIndex >= dropImpactByIndex.length) return;
+    const damage = dropImpactByIndex[dropIndex];
+    if (!damage) return;
+    currentDropImpact = damage;
+    if (lastFeaDropIndex !== dropIndex || feaFieldDirty) {
+      lastFeaDropIndex = dropIndex;
+      feaFieldDirty = false;
+      if (objectsGroup.children.length > 0) applyModeDecoration();
+    }
   };
 
   /**
@@ -759,40 +818,83 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
 
   /**
    * Decorate every mesh with the FEA yield/heatmap material when the current
-   * mode is fea/yield and a computed fea result exists; no-op in default
-   * mode. Called after every rebuild so objects created by setObjects /
-   * setTheme / setQuality stay in sync with the active mode.
+   * mode is fea/yield. Two data sources:
+   *   - a computed structural FEA result (authoritative backend per-vertex /
+   *     plate field), OR
+   *   - the drop-impact severity table when no structural FEA ran — the
+   *     heat/yield map then ALWAYS recalculates from the actual drop impact.
+   * No-op in default mode and when neither source is available. Called after
+   * every rebuild so objects created by setObjects / setTheme / setQuality
+   * stay in sync with the active mode.
    */
   const applyModeDecoration = (): void => {
     feaDecorated.length = 0;
-    if (currentRenderMode === 'default' || !currentFeaResult?.computed) return;
-    const fea = currentFeaResult;
-    // Continuous plate-layer peak: min(1, shell peak / yield) — the field
-    // maximum the contour is normalized against.
+    if (currentRenderMode === 'default') return;
+    const dropPeak = currentDropImpact?.peakDamage ?? null;
+    const hasDropField = dropPeak != null && dropPeak >= 0;
+    if (!currentFeaResult?.computed && !hasDropField) return;
+    const fea = currentFeaResult?.computed === true ? currentFeaResult : null;
+    const dropOnly = fea === null && hasDropField;
+    // Continuous plate-layer peak: with a drop-driven map it is the drop severity.
     const rawPeak =
-      typeof fea.peak?.stress_pa === 'number' &&
-      Number.isFinite(fea.peak.stress_pa) &&
-      fea.peak.stress_pa > 0 &&
-      typeof fea.yield_stress_pa === 'number' &&
-      Number.isFinite(fea.yield_stress_pa) &&
-      fea.yield_stress_pa > 0
-        ? Math.min(1, fea.peak.stress_pa / fea.yield_stress_pa)
-        : feaFieldMaxDamage(fea);
-    const platePeakDamage = rawPeak > 0 ? rawPeak : 0.45;
+      currentDropSimulation && dropPeak != null
+        ? dropPeak
+        : fea &&
+          typeof fea.peak?.stress_pa === 'number' &&
+          Number.isFinite(fea.peak.stress_pa) &&
+          fea.peak.stress_pa > 0 &&
+          typeof fea.yield_stress_pa === 'number' &&
+          Number.isFinite(fea.yield_stress_pa) &&
+          fea.yield_stress_pa > 0
+          ? Math.min(1, fea.peak.stress_pa / fea.yield_stress_pa)
+          : fea
+            ? feaFieldMaxDamage(fea)
+            : dropPeak ?? 0;
+    const platePeakDamage = rawPeak != null && rawPeak > 0 ? rawPeak : 0.45;
+
+    // Contact location and normal for the active drop:
+    const activeDropIdx = lastFeaDropIndex >= 0 ? lastFeaDropIndex : (liveDropIndex >= 0 ? liveDropIndex : 0);
+    const activeImpact = currentDropSimulation?.impacts?.find((imp) => imp.drop === activeDropIdx) ?? currentDropSimulation?.impacts?.[0] ?? null;
+
     for (const outer of objectsGroup.children) {
       const objectId = outer.userData.objectId;
       if (typeof objectId !== 'string') continue;
-      const field = fea.objects.find((o) => o.object_id === objectId) ?? null;
-      const procedural = fea.procedural.find((p) => p.object_id === objectId) ?? null;
+      const field = fea ? (fea.objects.find((o) => o.object_id === objectId) ?? null) : null;
+      const procedural = fea
+        ? (fea.procedural.find((p) => p.object_id === objectId) ?? null)
+        : null;
       // Per-object procedural uniforms: createFeaUniforms bakes procedural[0],
       // so feed it the object's own entry when one exists.
       // The continuous plate layer is baked from the object's first mesh
       // bounding box (local frame), mirroring the backend bbox->panel map.
       const plate = plateConfigForObject(outer, platePeakDamage);
       const uniforms = createFeaUniforms(
-        procedural ? { ...fea, procedural: [procedural] } : fea,
+        procedural ? { ...(fea as FeaResult), procedural: [procedural] } : fea,
         plate,
       );
+      if (activeImpact?.contact_location && activeImpact.contact_location.length >= 3) {
+        uniforms.uImpactPointModel.value.set(
+          activeImpact.contact_location[0],
+          activeImpact.contact_location[1],
+          activeImpact.contact_location[2],
+        );
+      }
+      if (activeImpact?.contact_normal && activeImpact.contact_normal.length >= 3) {
+        const norm = new THREE.Vector3(
+          activeImpact.contact_normal[0],
+          activeImpact.contact_normal[1],
+          activeImpact.contact_normal[2],
+        );
+        if (norm.lengthSq() > 0) norm.normalize();
+        uniforms.uImpactNormalModel.value.copy(norm);
+      }
+      if (dropOnly || currentDropSimulation) {
+        // Drop-driven map: normalize the ramp to the drop severity and feed
+        // the plate layer peak so the heatmap always spans this drop's field.
+        uniforms.uDamageScale.value = platePeakDamage > 0 ? Math.min(1 / platePeakDamage, 1e6) : 1;
+        uniforms.uYieldNorm.value = yieldNormFor(platePeakDamage, FEA_DENT_THRESHOLD);
+        uniforms.uPeakDamage.value = platePeakDamage;
+      }
       // Dent safety: cap the visual dent depth to 2% of the model so a
       // pathological backend compression can never push the mesh off-screen.
       const rawCompression = uniforms.uMaxCompression.value as number;
@@ -801,13 +903,18 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
           ? Math.min(rawCompression, maxDimension * 0.02)
           : 0;
       for (const mesh of objectMeshesFor(outer)) {
-        // Backend per-vertex field wins; primitives (and meshes whose field
-        // did not apply) get the frontend plate-field fill so the heatmap
-        // always covers the whole model.
-        if (field) {
-          if (!applyFeaObjectField(mesh, field)) applyFeaPlateField(mesh, fea);
-        } else {
+        // Backend per-vertex field wins when no drop simulation is active;
+        // during drop simulation the per-drop plate fill is written every drop
+        // (the "always recalculates" path); primitives/large meshes whose
+        // vertex fill does not apply are fully covered by the fragment plate layer.
+        if (currentDropSimulation) {
+          applyDropPlateField(mesh, platePeakDamage);
+        } else if (field) {
+          if (!applyFeaObjectField(mesh, field)) applyFeaPlateField(mesh, fea as FeaResult);
+        } else if (fea) {
           applyFeaPlateField(mesh, fea);
+        } else if (dropOnly) {
+          applyDropPlateField(mesh, platePeakDamage);
         }
         const material = mesh.material as THREE.MeshStandardMaterial;
         if (!mesh.userData.baseMaterial) {
@@ -1045,6 +1152,19 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
                 // per-vertex normals are used, and push the face back
                 // slightly so the edge lines can sit on top.
                 m.flatShading = false;
+                // The STL material is a light gray (baseColor ~0.82) with a
+                // shiny 0.35 roughness; under the strong key light the
+                // specular sweep during a rotating drop clips to PURE WHITE
+                // (the "model turns white while spinning" artifact).  Raise
+                // the roughness and add a touch of metalness so the specular
+                // highlight spreads and stays below the clipping threshold,
+                // while the at-rest FreeCAD look is unchanged to the eye.
+                if ((m as THREE.MeshStandardMaterial).roughness < 0.55) {
+                  (m as THREE.MeshStandardMaterial).roughness = 0.55;
+                }
+                if ((m as THREE.MeshStandardMaterial).metalness < 0.15) {
+                  (m as THREE.MeshStandardMaterial).metalness = 0.15;
+                }
                 m.needsUpdate = true;
                 m.polygonOffset = true;
                 m.polygonOffsetFactor = 1;
@@ -1525,6 +1645,14 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
           lastFrameTime = null;
           opts.onDropEnded?.();
         }
+        // Keep the active-drop index in sync with the replay time so the
+        // HUD ("Drop 2/3") and a mid-play Restart target the drop actually
+        // on screen (the live Rapier path tracks this itself).
+        const sampleDropIndex = activeDropIndexAt(currentDropSimulation, dropTime);
+        if (sampleDropIndex !== liveDropIndex) {
+          liveDropIndex = sampleDropIndex;
+          liveDropRestTime = 0;
+        }
       }
     } else {
       lastFrameTime = null;
@@ -1545,27 +1673,54 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
 
     applyDropTransform();
 
+    // Drop-driven heat/yield map: whenever the active drop changes during
+    // playback (each new impact), recompute the per-vertex field from that
+    // drop's real impact severity — "always recalculate when the model
+    // drops".
+    if (
+      currentRenderMode !== 'default' &&
+      currentDropSimulation &&
+      dropImpactByIndex &&
+      dropImpactByIndex.length > 0
+    ) {
+      const activeIndex = rapierSim
+        ? liveDropIndex
+        : activeDropIndexAt(currentDropSimulation, dropTime);
+      if (activeIndex !== lastFeaDropIndex || feaFieldDirty) {
+        refreshDropFeaField(activeIndex);
+      }
+    }
+
     // FEA dent window: the localized plastic displacement ramps in over the
-    // 300 ms impact window starting at the first impact, then stays fully
-    // deployed (persistent dent). Before the first impact the window is 0
-    // (no dent); without a drop simulation the dent is static.
+    // 300 ms impact window starting at this drop's impact, then stays deployed.
+    // Before the impact the window is 0 (clean un-stressed model); without a drop
+    // simulation the display is static inspection.
     if (currentRenderMode !== 'default' && feaDecorated.length > 0) {
       const windowS = currentFeaResult?.impact_window_s ?? 0.3;
       let window01 = 1;
       let active = false;
       let impactPulse = 0;
       let impactTime = 0;
-      if (currentDropSimulation) {
+      if (currentDropSimulation && currentDropSimulation.drops.length > 0) {
         const total = currentDropSimulation.trajectory[currentDropSimulation.trajectory.length - 1]?.[0] ?? 1.5;
         if (dropPlaying || dropTime < total) {
           active = true;
-          const impactTimeCandidates = currentDropSimulation.impacts?.[0]?.t_s;
+          const activeIndex = rapierSim
+            ? liveDropIndex
+            : activeDropIndexAt(currentDropSimulation, dropTime);
+          const activeDrop = currentDropSimulation.drops[activeIndex];
+          const activeImpact = currentDropSimulation.impacts?.find((imp) => imp.drop === activeIndex);
           impactTime =
-            typeof impactTimeCandidates === 'number'
-              ? impactTimeCandidates
-              : feaImpactTimeFor(currentDropSimulation);
-          window01 = impactWindowProgress(dropTime, impactTime, windowS > 0 ? windowS : 0.3);
-          impactPulse = impactPulseFor(dropTime, impactTime, windowS > 0 ? windowS : 0.3);
+            typeof activeImpact?.t_s === 'number'
+              ? activeImpact.t_s
+              : (activeDrop ? activeDrop.start_s + (activeDrop.end_s - activeDrop.start_s) * 0.38 : feaImpactTimeFor(currentDropSimulation));
+          if (dropTime < impactTime) {
+            window01 = 0;
+            impactPulse = 0;
+          } else {
+            window01 = impactWindowProgress(dropTime, impactTime, windowS > 0 ? windowS : 0.3);
+            impactPulse = impactPulseFor(dropTime, impactTime, windowS > 0 ? windowS : 0.3);
+          }
         }
       }
       feaFrameOpts.mode = currentRenderMode;
@@ -1740,11 +1895,25 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       dropTime = 0;
       liveDropIndex = 0;
       liveDropRestTime = 0;
+      lastFeaDropIndex = -1;
+      feaFieldDirty = true;
       // Do not start playing until Rapier simulation is loaded and initialized at t=0
       dropPlaying = false;
       lastFrameTime = null;
       lastLiveState = null;
       rapierCurrentDrop = -1;
+      // Always derive the heat/yield severity table from the loaded drop so
+      // the map "recalculates when we drop" (refreshDeault fields).
+      buildDropImpactTable(simulation);
+      if (simulation) refreshDropFeaField(0);
+      const firstImp = simulation?.impacts?.[0]?.t_s ?? (simulation?.drops[0] ? simulation.drops[0].start_s + (simulation.drops[0].end_s - simulation.drops[0].start_s) * 0.38 : 0);
+      feaFrameOpts.impactWindow01 = 0;
+      feaFrameOpts.impactPulse = 0;
+      feaFrameOpts.dropTime = 0;
+      feaFrameOpts.impactTime = firstImp;
+      for (const pair of feaDecorated) {
+        updateFeaUniforms(pair.uniforms, feaFrameOpts);
+      }
       // Tear down any previous live sim; build the new one asynchronously
       // (Rapier WASM init is async). Generation guards against a newer
       // simulation arriving while init is in flight.
@@ -1844,18 +2013,48 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
 
     restartDropPlayback() {
       if (disposed) return;
+      const sim = currentDropSimulation;
+      if (!sim || sim.drops.length === 0) {
+        dropPlaying = false;
+        return;
+      }
+      // True restart: the whole sequence plays again from drop 0, exactly
+      // the motion the user just watched — not a per-drop replay of drop N.
+      // Replaying was the fix's first semantics (keep the current drop's
+      // varied pose), but it broke the visible multi-drop replay: after a
+      // Restart the HUD advanced to Drop 2/3 while the model replayed drop 2,
+      // the camera framed the new drop's start, and the engine hash kept the
+      // same deterministic sequence. A full-sequence replay keeps every drop
+      // precisely the same as the original run — which is why we also started
+      // injecting a fresh seed per run (above): a *new* Run gives new drops,
+      // the Restart button gives the same run again.
       liveDropIndex = 0;
       liveDropRestTime = 0;
       dropTime = 0;
-      if (rapierSim && currentDropSimulation?.drops[0]) {
-        rapierSim.reset(currentDropSimulation.drops[0], currentDropSimulation.model);
+      lastFeaDropIndex = -1;
+      feaFieldDirty = true;
+      if (rapierSim) {
+        // Rewind the live Rapier world; the sample path needs no pre-reset
+        // (it interpolates the trajectory by dropTime).
+        rapierSim.reset(sim.drops[0], sim.model);
         rapierCurrentDrop = 0;
         lastLiveState = rapierSim.getState();
       } else {
         rapierCurrentDrop = -1;
       }
+      if (currentRenderMode !== 'default') {
+        refreshDropFeaField(0);
+      }
+      const firstImp = sim.impacts?.[0]?.t_s ?? (sim.drops[0] ? sim.drops[0].start_s + (sim.drops[0].end_s - sim.drops[0].start_s) * 0.38 : 0);
+      feaFrameOpts.impactWindow01 = 0;
+      feaFrameOpts.impactPulse = 0;
+      feaFrameOpts.dropTime = 0;
+      feaFrameOpts.impactTime = firstImp;
+      for (const pair of feaDecorated) {
+        updateFeaUniforms(pair.uniforms, feaFrameOpts);
+      }
       lastFrameTime = performance.now();
-      dropPlaying = currentDropSimulation !== null;
+      dropPlaying = sim.drops.length > 0;
       applyDropTransform();
     },
 
@@ -1972,6 +2171,9 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
           for (const pair of feaDecorated) {
             pair.uniforms.uFeaMode.value = targetVal;
           }
+          // Re-apply the drop-driven field on the next frame so toggling the
+          // shader always shows the CURRENT drop (not a stale one).
+          feaFieldDirty = true;
         } else {
           // Entering FEA mode disables instancing: rebuild first so every
           // part exists as an individual mesh to decorate.
@@ -1979,7 +2181,16 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
             rebuildObjects();
             return;
           }
+          if (dropImpactByIndex && currentDropSimulation) {
+            const active = rapierSim ? liveDropIndex : activeDropIndexAt(currentDropSimulation, dropTime);
+            const severity = dropImpactByIndex[active];
+            if (severity) {
+              currentDropImpact = severity;
+              lastFeaDropIndex = active;
+            }
+          }
           applyModeDecoration();
+          feaFieldDirty = true;
         }
       }
     },
@@ -1988,6 +2199,9 @@ export function createSceneRuntime(opts: SceneRuntimeOptions): SceneRuntime {
       if (disposed) return;
       currentFeaResult = fea;
       feaMaterialCache.clear();
+      // A yield reference from a structural FEA refines the drop-driven
+      // severity table (same material yield the backend would use).
+      if (currentDropSimulation) buildDropImpactTable(currentDropSimulation);
       if (currentRenderMode !== 'default') {
         // A new FEA result may flip the batching boundary (a null result
         // re-enables instancing; a computed result disables it). Rebuild so

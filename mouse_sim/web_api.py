@@ -922,8 +922,9 @@ def handle_analyze(config, cache, payload):
         pipeline_request["options"] = pipeline_options
     if cache is None and config.cache_dir is not None:
         from .cache import ArtifactCache
+        from .pipeline import ENGINE_VERSION as _ENGINE_VERSION
 
-        cache = ArtifactCache(config.cache_dir)
+        cache = ArtifactCache(config.cache_dir, _ENGINE_VERSION)
     # Bounded analysis concurrency prevents several large pipelines from
     # exhausting memory simultaneously; excess requests queue.
     with _ANALYZE_SEMAPHORE:
@@ -954,8 +955,9 @@ def _cache_for(config):
     if config.cache_dir is None:
         return None
     from .cache import ArtifactCache
+    from .pipeline import ENGINE_VERSION as _ENGINE_VERSION
 
-    return ArtifactCache(config.cache_dir)
+    return ArtifactCache(config.cache_dir, _ENGINE_VERSION)
 
 
 class WebApiHandler(BaseHTTPRequestHandler):

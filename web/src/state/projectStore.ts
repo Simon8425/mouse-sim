@@ -15,6 +15,7 @@ import type {
   FeaResult,
   RenderMode,
   AiClassification,
+  DropSimulationConfig,
 } from '../api/contracts';
 import { isGeometryJson, isRecord } from '../api/contracts';
 
@@ -428,12 +429,21 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
       // Mark stale only when the request that produced the current result
       // differs from the request being run: re-running the SAME request
       // (e.g. RUN_STUDY) must not label its own fresh result stale.
+      // A RESTART re-runs the same drop test with a fresh seed, so the keys
+      // differ while the test itself is identical — the sameDropTestConfig
+      // exemption keeps the "Inputs changed" nag from flashing during the
+      // reload.
       return {
         ...state,
-        renderMode: 'default',
         requestVersion: action.version,
         runStatus: 'running',
-        stale: state.lastResult != null && action.requestKey !== state.resultRequestKey,
+        stale:
+          state.lastResult != null &&
+          action.requestKey !== state.resultRequestKey &&
+          !sameDropTestConfig(
+            state.lastResult.drop_simulation?.config,
+            state.draft?.drop_simulation ?? {},
+          ),
         runError: null,
         inflightRequestKey: action.requestKey,
         playbackDismissed: false,
@@ -587,6 +597,21 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
       }
       if (action.config.seed !== undefined && action.config.seed !== null) {
         config.seed = action.config.seed;
+      } else {
+        // No explicit seed: a rapid double-click relaunch of the SAME test
+        // that is already running must reuse the in-flight run's seed so the
+        // dedup comparison below matches (a fresh seed would change the
+        // request key and double-run).  Any other launch gets a fresh random
+        // seed so repeated "Run" clicks produce visibly different drop poses
+        // instead of the same deterministic sequence (the backend is fully
+        // seeded and deterministic for a fixed seed; without this every
+        // 3-drop run looked identical on every click).
+        const draftSeed = state.draft?.drop_simulation?.seed ?? null;
+        const inFlightReuse =
+          state.runStatus === 'running' &&
+          state.inflightRequestKey !== null &&
+          typeof draftSeed === 'number';
+        config.seed = inFlightReuse ? draftSeed : Math.floor(Math.random() * 0xffffffff);
       }
       if (
         action.config.pause_between_drops_s !== undefined &&
@@ -614,8 +639,18 @@ export function reducer(state: ProjectState, action: ProjectAction): ProjectStat
         ...state,
         explode: 0,
         mode: 'exploration',
-        renderMode: 'default',
-        stale: state.lastResult != null,
+        renderMode: state.renderMode,
+        // A restart re-runs the SAME test (identical config, fresh seed):
+        // the previous result is not stale, it is being refreshed — the
+        // "Inputs changed" nag must not appear while the new run loads.
+        // Only a genuinely different test (height/surface/count/orientation/
+        // spin changed vs the last completed run) marks the old result stale.
+        stale:
+          state.lastResult != null &&
+          !sameDropTestConfig(
+            state.lastResult.drop_simulation?.config,
+            config,
+          ),
         runStatus:
           state.project !== null || state.preview?.supported === true ? 'loading' : 'idle',
         runError: null,
@@ -1174,6 +1209,56 @@ export function createAnalysisRequest(state: ProjectState): PipelineRequest | nu
 export function createAnalysisRequestKey(request: PipelineRequest | null): string {
   if (request === null) return 'null';
   return canonicalStringify(request) ?? 'null';
+}
+
+/**
+ * Whether two drop-test configs describe the SAME test (ignoring the seed:
+ * a restart deliberately draws a fresh seed for new random drops).  Used to
+ * distinguish a restart (same test -> previous result is not stale) from a
+ * genuinely changed test (different height/surface/count/orientation/spin ->
+ * the old result is stale).
+ *
+ * Only the user-chosen parameters are compared.  Fields the backend FILLS
+ * IN on the echoed config (computed mass_kg, unit_seed, spin_rps: 0,
+ * pause_between_drops_s: 0.5) or that a restart deliberately changes
+ * (seed) never make a restart look like a different test.
+ */
+function sameDropTestConfig(
+  previous: DropSimulationConfig | null | undefined,
+  next: Record<string, unknown>,
+): boolean {
+  if (!previous) return false;
+  for (const key of [
+    'test',
+    'height_m',
+    'surface',
+    'drop_count',
+    'orientation',
+    'spin_rps',
+    'pause_between_drops_s',
+  ] as const) {
+    const a = previous[key];
+    const b = next[key];
+    // The backend echoes DEFAULTS (spin_rps: 0, pause_between_drops_s: 0.5)
+    // that the launch config leaves undefined; a missing field and the
+    // backend's default for it are the same choice.
+    const normalizedA = a === undefined || a === null ? _dropConfigDefault(key) : a;
+    const normalizedB = b === undefined || b === null ? _dropConfigDefault(key) : b;
+    if (normalizedA !== normalizedB) return false;
+  }
+  return true;
+}
+
+/** Backend defaults the echoed drop config applies for absent fields. */
+function _dropConfigDefault(key: string): unknown {
+  switch (key) {
+    case 'spin_rps':
+      return 0;
+    case 'pause_between_drops_s':
+      return 0.5;
+    default:
+      return undefined;
+  }
 }
 
 /** Canonical JSON serialization: object keys sorted, geometry fingerprinted. */

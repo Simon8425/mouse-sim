@@ -136,7 +136,7 @@ class HashingDeterminismTests(unittest.TestCase):
         from mouse_sim import manifest_hash
         manifest = {
             "schema_id": "gms.run-manifest/1",
-            "engine_version": "0.1.0",
+            "engine_version": "0.1.1",
             "mode": "exploration",
             "inputs": {"objects": [{"id": "a", "size": [1, 2, 3]}]},
             "input_hashes": {"objects": "abc"},

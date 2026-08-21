@@ -23,6 +23,7 @@ import json
 import math
 import os
 import re
+import socket
 import struct
 import threading
 import time
@@ -34,6 +35,14 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .classification import CANONICAL_COMPONENT_TYPES, canonical_component_type
+
+# Endpoints that recently refused a connection are remembered (process-local)
+# so subsequent analyses skip the doomed retry loop entirely instead of
+# stalling every drop test for seconds.  Entries expire after this many
+# seconds so a recovered local model is picked up again.
+_ENDPOINT_DOWN_CACHE: Dict[str, float] = {}
+_ENDPOINT_DOWN_LOCK = threading.Lock()
+_ENDPOINT_DOWN_TTL_S = 60.0
 
 # ---------------------------------------------------------------------------
 # Constants & environment configuration
@@ -988,6 +997,16 @@ def call_openrouter(
     parts = list(parts)
     if not parts:
         return []
+    # Fail fast on a dead endpoint: retrying a refused connection with
+    # exponential backoff turns every analysis into a 6+ s stall (the local
+    # LM Studio endpoint from a stray sk-lm- key is commonly down).  The
+    # pipeline falls back to the deterministic rule classification, so a
+    # drop test must never wait on an unreachable AI service.
+    if _ENDPOINT_DOWN_CACHE is not None:
+        with _ENDPOINT_DOWN_LOCK:
+            down_since = _ENDPOINT_DOWN_CACHE.get(target_endpoint)
+            if down_since is not None and time.monotonic() - down_since < _ENDPOINT_DOWN_TTL_S:
+                return []
     chosen_model = model or model_name()
     chosen_provider = provider or provider_name()
     results: List[Optional[Mapping[str, Any]]] = [None] * len(parts)
@@ -1033,6 +1052,17 @@ def call_openrouter(
                     response = _http_post_json(target_endpoint, payload, key, timeout)
                 else:
                     raise
+            except (urllib.error.URLError, ConnectionError) as conn_err:
+                # Connection refused / DNS failure / reset: the endpoint is
+                # unreachable — retrying cannot help.  Record it and fall back
+                # to rule classification immediately.
+                reason = getattr(conn_err, "reason", None)
+                if isinstance(reason, (ConnectionRefusedError, ConnectionResetError, socket.gaierror)):
+                    if _ENDPOINT_DOWN_CACHE is not None:
+                        with _ENDPOINT_DOWN_LOCK:
+                            _ENDPOINT_DOWN_CACHE[target_endpoint] = time.monotonic()
+                    break
+                raise
 
             text = (
                 response.get("choices", [{}])[0]

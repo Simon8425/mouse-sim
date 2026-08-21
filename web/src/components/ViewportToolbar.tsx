@@ -30,7 +30,16 @@ export function ViewportToolbar({ stats, viewportRef }: ViewportToolbarProps) {
       state.draft?.population != null) &&
     !state.stale;
   const feaAvailable = state.lastResult?.fea?.computed === true && !state.stale;
-  const showFeaSwitch = feaAvailable && !testModeActive;
+  // The heat/yield map is also available from the drop impact alone: the
+  // field is recomputed from every drop's real impact (speed/energy/force
+  // → stress → yield), so it always renders even without a structural FEA.
+  const dropAvailable = state.lastResult?.drop_simulation != null && !state.stale;
+  const showFeaSwitch = (feaAvailable || dropAvailable) && !testModeActive;
+  const fieldBasis = feaAvailable
+    ? 'structural FEA field'
+    : dropAvailable
+      ? 'drop-derived impact field (recomputed each drop)'
+      : '';
 
   const renderModeButtons: Array<{ mode: RenderMode; label: string }> = [
     { mode: 'fea', label: 'FEA Heatmap' },
@@ -70,7 +79,7 @@ export function ViewportToolbar({ stats, viewportRef }: ViewportToolbarProps) {
                   title={
                     active
                       ? 'Return to default material'
-                      : `Render the model in ${label} mode`
+                      : `${label} — ${fieldBasis}`
                   }
                   onClick={() =>
                     dispatch({ type: 'SET_RENDER_MODE', mode: active ? 'default' : mode })

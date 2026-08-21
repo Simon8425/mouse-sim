@@ -122,14 +122,20 @@ function computeVerdict(result: PipelineResult): Verdict {
     result.structural !== null;
   if (!hasData) return 'none';
 
-  const rows = buildIssueRows(result);
+  const rows = buildIssueRows(result, result.drop_simulation !== null);
   if (rows.some((row) => row.severity === 'error' || row.severity === 'blocker')) return 'fail';
   if (rows.some((row) => row.severity === 'warning' || row.severity === 'warn')) return 'warn';
   return 'pass';
 }
 
-/** Collect warnings and worse from validation findings, issues, and errors. */
-function buildIssueRows(result: PipelineResult): IssueRow[] {
+/** Collect warnings and worse from validation findings, issues, and errors.
+
+ * ``dropTest`` gates the two geometry-certification aggregates (unverified
+ * self-intersection sweep, draft material approval): they disclose shell /
+ * qualification confidence, not drop physics — a drop test result would
+ * otherwise show the same two WARN badges on every single run.
+ */
+function buildIssueRows(result: PipelineResult, dropTest = false): IssueRow[] {
   const rows: IssueRow[] = [];
   const push = (severity: string, message: string, code?: string) => {
     const normalized = severity.toLowerCase();
@@ -185,10 +191,10 @@ function buildIssueRows(result: PipelineResult): IssueRow[] {
   if (openMeshCount > 0) {
     push('warning', `${openMeshCount} parts have open mesh boundaries (tessellation approximation)`);
   }
-  if (selfIntersectionCount > 0) {
+  if (selfIntersectionCount > 0 && !dropTest) {
     push('warning', `${selfIntersectionCount} parts exceed self-intersection limit (geometry approximated)`);
   }
-  if (draftMaterialCount > 0) {
+  if (draftMaterialCount > 0 && !dropTest) {
     push('warning', `${draftMaterialCount} material properties are in draft state (provisional qualification)`);
   }
 
@@ -538,7 +544,7 @@ function ResultPanel({
   const verdict = computeVerdict(result);
   const metrics = buildMetrics(result, liveDropData);
   const feaMetrics = buildFeaMetrics(result);
-  const issues = buildIssueRows(result);
+  const issues = buildIssueRows(result, result.drop_simulation !== null);
   const configLine = buildConfigLine(result);
   const material = resultMaterial(result, state.defaultMaterialKey);
   const stale = selectHasStaleResult(state);

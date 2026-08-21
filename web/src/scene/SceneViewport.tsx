@@ -84,6 +84,13 @@ export interface SceneViewportProps {
   onPlaybackStateChange?: (playing: boolean) => void;
   onLiveDropData?: (data: LiveDropData | null) => void;
   onWebGLUnsupported?: (reason: string) => void;
+  /**
+   * Optional "restart the test" action.  When provided, the Restart button
+   * starts a NEW random run (fresh seed -> new drops) instead of replaying
+   * the recorded sequence, matching the user's expectation that restarting
+   * the test produces a fresh test.
+   */
+  onRestart?: () => void;
 }
 
 export function useDetectedQuality(): QualityTier {
@@ -419,12 +426,19 @@ export const SceneViewport = React.forwardRef<
   }, [dropPlaying]);
 
   const handleRestart = React.useCallback(() => {
+    // When the host wires an onRestart action (a NEW random run), prefer it:
+    // restarting the test must give a fresh test, not a replay of the same
+    // recorded motion.  Without the prop the runtime replays the sequence.
+    if (props.onRestart) {
+      props.onRestart();
+      return;
+    }
     // The runtime restarts and resumes playing; keep the React play state in
     // sync so the control bar shows PAUSE after a restart.
     setDropPlaying(true);
     setDropTime(0);
     runtimeRef.current?.restartDropPlayback();
-  }, []);
+  }, [props.onRestart]);
 
   const handleSpeedChange = React.useCallback((speed: number) => {
     setPlaybackSpeed(speed);

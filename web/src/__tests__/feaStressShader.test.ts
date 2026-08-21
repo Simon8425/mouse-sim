@@ -511,13 +511,13 @@ describe('createFeaUniforms / updateFeaUniforms (no per-frame allocation)', () =
       shader as unknown as THREE.WebGLProgramParametersWithUniforms,
     );
 
-    // Heatmap mode must replace the base material color entirely with the gradient contour...
+    // Heatmap mode blends from base material to gradient based on impact progress (feaProg)
     expect(shader.fragmentShader).toContain(
-      'diffuseColor.rgb = feaGradientColorFrag( feaVisDithered );',
+      'vec3 feaColor = feaGradientColorFrag( feaVisDithered );',
     );
-    // ...never blending with it, and no stale FEA_HEATMAP_MIX interpolation.
-    expect(shader.fragmentShader).not.toContain('mix( diffuseColor.rgb, feaGradientColorFrag');
-    expect(shader.fragmentShader).not.toContain('FEA_HEATMAP_MIX');
+    expect(shader.fragmentShader).toContain(
+      'diffuseColor.rgb = mix( baseColor, feaColor, feaProg );',
+    );
     expect(shader.fragmentShader).toContain('if ( uFeaMode > -0.5 ) {');
     // The continuous procedural Gaussian + plate-field layers keep the
     // heatmap visible on sparse meshes and edge-only primitives — and every
@@ -562,16 +562,36 @@ describe('createFeaUniforms / updateFeaUniforms (no per-frame allocation)', () =
     // The whitening and the tear cutout use TRUE damage, never the
     // auto-normalized contour, so a tiny field cannot white-out or tear
     // the whole model. The yield mask ramps from uYieldNorm to the peak.
-    expect(shader.fragmentShader).toContain('diffuseColor.rgb = vec3( 0.60, 0.62, 0.66 );');
+    expect(shader.fragmentShader).toContain('vec3 yieldColor = vec3( 0.60, 0.62, 0.66 );');
     expect(shader.fragmentShader).toContain('float feaYieldMask = smoothstep( uYieldNorm, 1.0, feaDamageVis );');
     expect(shader.fragmentShader).toContain('vec3( 1.0, 0.36, 0.05 )');
-    expect(shader.fragmentShader).toContain('if ( feaDamage > 0.92 ) {');
+    expect(shader.fragmentShader).toContain('if ( feaDamage > 0.92 && feaProg > 0.5 ) {');
     expect(shader.fragmentShader).toContain('discard;');
+    expect(shader.fragmentShader).toContain('diffuseColor.rgb = mix( baseColor, yieldColor, feaProg );');
     expect(shader.fragmentShader).toContain('float feaW = clamp( ( feaDamage - 0.7 )');
     // Micro-crack striations inside the plastic zone, flickered by the pulse.
     expect(shader.fragmentShader).toContain('float feaStripe = smoothstep( 0.45, 0.75, fract( vFeaPosition.y * 140.0 + feaNoise * 2.0 ) );');
     expect(shader.fragmentShader).toContain('float feaFlicker = 0.35 + 0.65 * feaPulse;');
     // The heatmap gradient is exclusive to the fea branch.
     expect(shader.fragmentShader).toContain('} else if ( uFeaMode > -0.5 ) {');
+  });
+
+  it('preserves clean base material pre-impact when feaProg is 0', () => {
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(9), 3));
+    const material = new THREE.MeshStandardMaterial({ color: 0x334455 });
+    const decorated = decorateForFea(material, geometry);
+    const shader = {
+      uniforms: {} as Record<string, THREE.IUniform>,
+      vertexShader: '#include <common>\n#include <begin_vertex>\n',
+      fragmentShader: '#include <common>\n#include <color_fragment>\n',
+    };
+    (decorated.onBeforeCompile as (shader: unknown) => void)(
+      shader as unknown as THREE.WebGLProgramParametersWithUniforms,
+    );
+    expect(shader.fragmentShader).toContain('vec3 baseColor = diffuseColor.rgb;');
+    expect(shader.fragmentShader).toContain('diffuseColor.rgb = mix( baseColor, feaColor, feaProg );');
+    expect(shader.fragmentShader).toContain('diffuseColor.rgb = mix( baseColor, yieldColor, feaProg );');
+    expect(shader.vertexShader).toContain('float feaProg = mix( 1.0, uImpactWindow01, uImpactWindowActive );');
   });
 });

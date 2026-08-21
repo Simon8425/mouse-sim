@@ -292,6 +292,7 @@ def _builtin_definition(
     continuous_use_temperature_min_k=293.15,
     continuous_use_temperature_max_k=293.15,
     anisotropy_supported=False,
+    citation="mouse_sim engineering reference catalog v1",
 ):
     properties = _properties(
         density,
@@ -321,7 +322,7 @@ def _builtin_definition(
     provenance = Provenance(
         source_type="catalog",
         source_id="mouse_sim_builtin_v1",
-        citation="mouse_sim engineering reference catalog v1",
+        citation=citation,
         condition=condition,
         temperature_k=293.15,
         confidence="low",
@@ -491,6 +492,30 @@ def builtin_materials():
             "shear_allowable": 28e6, "friction_coefficient": 0.35,
             "continuous_use_temperature_min_k": 233.15,
             "continuous_use_temperature_max_k": 323.15,
+        },
+        {
+            # 3DJAKE ecoResin Technical Data Sheet v1.1 (01.03.2024):
+            # density 1.21 g/cm3; Young's modulus 3100 MPa (bending) /
+            # 6400 MPa (pull), both cited to ISO 527 — the LOWER bending
+            # value is used as the primary modulus (conservative for impact
+            # contact force and deflection, and consistent with the
+            # photopolymer family scale); tensile strength 50 MPa at 5%
+            # elongation (brittle resin: yield taken just below ultimate);
+            # Charpy 17 kJ/m2 and HDT B 65.3 C have no direct schema slot —
+            # continuous use is capped at 45 C, safely below HDT B (the
+            # SLA_8001 precedent maps a ~60 C HDT to the same 45 C cap).
+            # Poisson ratio is not on the datasheet: 0.40 sits between the
+            # two neighboring photopolymer entries (0.38 / 0.42).
+            "key": "ECO_RESIN",
+            "name": "3DJAKE ecoResin",
+            "family": "photopolymer",
+            "density": 1210, "young_modulus": 3.1e9, "poissons_ratio": 0.40,
+            "yield_strength": 47e6, "ultimate_strength": 50e6,
+            "tensile_allowable": 23e6, "compressive_allowable": 58e6,
+            "shear_allowable": 26e6, "friction_coefficient": 0.35,
+            "continuous_use_temperature_min_k": 233.15,
+            "continuous_use_temperature_max_k": 318.15,
+            "citation": "3DJAKE ecoResin Technical Data Sheet v1.1 (01.03.2024)",
         },
         {
             "key": "MJF_PA12_HP",

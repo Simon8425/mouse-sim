@@ -77,7 +77,7 @@ class WebApiTests(unittest.TestCase):
         payload = json.loads(data)
         self.assertEqual(payload["schema_id"], "gms.web-health/1")
         self.assertEqual(payload["api_version"], "1")
-        self.assertEqual(payload["engine_version"], "0.1.0")
+        self.assertEqual(payload["engine_version"], "0.1.1")
         for fmt in ("json", "obj", "stl", "step"):
             self.assertIn(fmt, payload["supported_formats"])
         self.assertTrue(payload["solver_capabilities"])
@@ -175,7 +175,7 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(response.status, 200, data.decode("utf-8"))
         payload = json.loads(data)
         self.assertEqual(payload["schema_id"], "gms.web-analysis-response/1")
-        self.assertEqual(payload["engine_version"], "0.1.0")
+        self.assertEqual(payload["engine_version"], "0.1.1")
         direct = run_pipeline(dict(document, options={"strict": False}))
         self.assertEqual(payload["run_id"], direct["run_id"])
         self.assertEqual(
